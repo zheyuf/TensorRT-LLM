@@ -1,4 +1,5 @@
 import threading
+import os
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -101,7 +102,10 @@ class DecodingCUDAGraphRunner:
         set_piecewise_cuda_graph_flag(False)
         for _ in range(2):
             forward_fn(inputs)
-        with torch.cuda.graph(self._graph, pool=pool):
+        # Allow experiment to force separate pools by ignoring the provided pool
+        force_separate = os.environ.get("TLLM_FORCE_SEPARATE_CUDA_GRAPH_POOLS", "0") == "1"
+        effective_pool = None if force_separate else pool
+        with torch.cuda.graph(self._graph, pool=effective_pool):
             output = forward_fn(inputs)
         set_graph_capturing(False)
         set_piecewise_cuda_graph_flag(True)
