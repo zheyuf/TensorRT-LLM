@@ -33,6 +33,11 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RESULTS_DIR="$ROOT_DIR/memory_profile/results"
 mkdir -p "$RESULTS_DIR"
 
+# Create model-specific directory and set permissions for Docker container access
+MODEL_RESULTS_DIR="$RESULTS_DIR/${MODEL_NAME}"
+mkdir -p "$MODEL_RESULTS_DIR"
+chmod 777 "$MODEL_RESULTS_DIR"
+
 echo "Root dir: $ROOT_DIR"
 echo "Results dir: $RESULTS_DIR"
 echo "Model: $MODEL_NAME @ $MODEL_PATH"
@@ -51,7 +56,7 @@ run_single() {
     sepTag="sepPools1"; sepArg="--force_separate_pools"
   fi
   local ts="$(timestamp)"
-  local out="$RESULTS_DIR/${MODEL_NAME}_bs${bs}_draft${draft}_mc${mc}_${sepTag}_${ts}.json"
+  local out="$RESULTS_DIR/${MODEL_NAME}/bs${bs}_draft${draft}_mc${mc}_${sepTag}_${ts}.json"
 
   echo "\n=== Running: bs=$bs draft=$draft mc=$mc $sepTag ==="
   python memory_profile/profile_cuda_graph_memory_single.py \
