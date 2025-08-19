@@ -1,0 +1,6 @@
+# Ignore all result files to avoid committing large JSON outputs
+*.json
+*.log
+
+# But keep this directory in git
+!.gitignore
