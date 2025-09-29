@@ -167,7 +167,8 @@ class NGramDrafter(Drafter):
         spec_config: NGramDecodingConfig,
         ngram_pool_manager: NGramPoolManager = None,
     ):
-        super().__init__(spec_config.max_concurrency)
+        super().__init__(spec_config.max_concurrency,
+                         getattr(spec_config, 'draft_len_schedule', None))
         assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
         self.spec_config = spec_config
         self.max_draft_tokens = spec_config.max_draft_len
@@ -178,6 +179,12 @@ class NGramDrafter(Drafter):
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
+        # Adjust allocated draft pages per scheduled generation batch size
+        scheduled_gen_size = len(scheduled_requests.generation_requests)
+        effective_len = self._effective_draft_len(scheduled_gen_size,
+                                                  self.max_draft_tokens)
+        for req in scheduled_requests.generation_requests:
+            req.py_draft_pages_allocated = effective_len
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
         # before forward_step, so py_batch_idx is not assigned.

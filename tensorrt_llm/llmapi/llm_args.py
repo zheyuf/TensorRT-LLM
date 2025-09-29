@@ -357,6 +357,10 @@ class DecodingBaseConfig(StrictBaseModel):
     # this value. Otherwise, speculation will always be on.
     max_concurrency: Optional[int] = None
     load_format: Optional[str] = None
+    # Optional schedule to ramp down draft length as scheduled generation batch size grows.
+    # Format: {threshold_effective_requests: draft_len_value, ...}
+    # Example: {1: 4, 4: 3, 8: 2, 16: 1, 32: 0}
+    draft_len_schedule: Optional[dict[int, int]] = None
 
     @classmethod
     def from_dict(cls, data: dict):

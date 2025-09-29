@@ -9,8 +9,16 @@ from ..pyexecutor.scheduler import ScheduledRequests
 class Drafter(ABC):
     """Abstract base class for all drafter implementations."""
 
-    def __init__(self, max_concurrency: Optional[int] = None) -> None:
+    def __init__(self,
+                 max_concurrency: Optional[int] = None,
+                 draft_len_schedule: Optional[dict[int, int]] = None) -> None:
         self.max_concurrency = max_concurrency
+        # Store schedule as a sorted list of (threshold, value)
+        if draft_len_schedule:
+            self._draft_len_schedule = sorted(draft_len_schedule.items(),
+                                              key=lambda kv: kv[0])
+        else:
+            self._draft_len_schedule = None
 
     @abstractmethod
     def prepare_draft_tokens(
@@ -67,3 +75,21 @@ class Drafter(ABC):
             num_draft_tokens = get_draft_token_length(req)
             req.py_draft_tokens.extend(
                 0 for _ in range(max_draft_tokens - num_draft_tokens))
+
+    # Helper to compute effective draft len from schedule, given current scheduled generation size
+    def _effective_draft_len(self, scheduled_gen_size: int,
+                             base_max_draft_len: int) -> int:
+        if self._draft_len_schedule is None:
+            return base_max_draft_len
+        # Find first threshold >= scheduled_gen_size
+        draft_len = self._draft_len_schedule[-1][1]
+        for threshold, value in self._draft_len_schedule:
+            if scheduled_gen_size <= threshold:
+                draft_len = value
+                break
+        # Clamp to [0, base_max_draft_len]
+        if draft_len < 0:
+            draft_len = 0
+        if draft_len > base_max_draft_len:
+            draft_len = base_max_draft_len
+        return draft_len

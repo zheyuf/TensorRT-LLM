@@ -50,7 +50,8 @@ class ModelDrafter(Drafter):
         spec_resource_manager: Optional[BaseResourceManager] = None,
         guided_decoder: Optional[GuidedDecoder] = None,
     ):
-        super().__init__(spec_config.max_concurrency)
+        super().__init__(spec_config.max_concurrency,
+                         getattr(spec_config, 'draft_len_schedule', None))
 
         # Validate required parameters
         if draft_model_engine is None:
@@ -468,6 +469,14 @@ class ModelDrafter(Drafter):
             Tuple of (draft_batch, req_id_to_old_request) or (None, None) if no batch
         """
 
+        # Adjust per-step effective draft length based on scheduled generation size
+        scheduled_gen_size = len(scheduled_batch.generation_requests)
+        effective_len = self._effective_draft_len(scheduled_gen_size,
+                                                  self.max_draft_tokens)
+        # Update allocated pages for target requests this step
+        for req in scheduled_batch.generation_requests:
+            req.py_draft_pages_allocated = effective_len
+
         draft_batch = self._prepare_draft_batch(scheduled_batch)
         if draft_batch.batch_size == 0:
             return None, None
@@ -500,8 +509,11 @@ class ModelDrafter(Drafter):
                     continue
 
                 target_req = req_id_to_old_request[req.py_request_id]
-                target_req.py_draft_tokens.append(
-                    outputs_host[token_idx][req_idx])
+                # Respect per-iteration cap for static path as well
+                if len(target_req.py_draft_tokens
+                       ) < target_req.py_draft_pages_allocated:
+                    target_req.py_draft_tokens.append(
+                        outputs_host[token_idx][req_idx])
 
         # Clean up draft resources
         for req in draft_batch.all_requests():
@@ -703,9 +715,21 @@ class ModelDrafter(Drafter):
 
             # Initial forward pass. May do the complete drafting loop
             # if use_static_draft_loop is set.
-            outputs = self.forward_draft_model(draft_batch,
-                                               resource_manager,
-                                               is_first_draft_token=True)
+            # For static loop, allow per-iteration graph selection by effective draft length
+            # Compute effective_len from scheduled generation size
+            scheduled_gen_size = len(draft_batch.generation_requests)
+            effective_len = self._effective_draft_len(scheduled_gen_size,
+                                                      self.max_draft_tokens)
+            # Update per-request caps to match
+            for req in scheduled_requests.generation_requests:
+                req.py_draft_pages_allocated = effective_len
+
+            # Select/capture CUDA graph keyed by (batch_size, effective_len)
+            with self.draft_model_engine.cuda_graph_runner.override_draft_len(
+                    effective_len):
+                outputs = self.forward_draft_model(draft_batch,
+                                                   resource_manager,
+                                                   is_first_draft_token=True)
 
             if self.use_static_draft_loop:
                 self.process_static_draft_outputs(outputs, draft_batch,

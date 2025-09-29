@@ -47,6 +47,8 @@ class CUDAGraphRunner:
         self.graph_metadata: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self.memory_pool = engine._cuda_graph_mem_pool
         self.padding_dummy_request: Optional["Request"] = None
+        # Optional per-call override for draft_len (used by static draft path)
+        self._draft_len_override: Optional[int] = None
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
         if self.enabled:
@@ -88,6 +90,8 @@ class CUDAGraphRunner:
 
     @property
     def draft_len(self):
+        if self._draft_len_override is not None:
+            return self._draft_len_override
         return self.spec_config.max_draft_len if self.enable_spec_decode else 0
 
     @property
@@ -166,6 +170,19 @@ class CUDAGraphRunner:
         else:
             spec_metadata = None
         return True, attn_metadata, spec_metadata
+
+    @contextlib.contextmanager
+    def override_draft_len(self, effective_len: int):
+        """
+        Temporarily override draft_len for graph keying/capture/replay.
+        Use to select/capture graphs per effective_len in the static draft path.
+        """
+        old = self._draft_len_override
+        self._draft_len_override = effective_len
+        try:
+            yield
+        finally:
+            self._draft_len_override = old
 
     def needs_capture(self, batch_size: int):
         return (batch_size, self.draft_len) not in self.graph_outputs
