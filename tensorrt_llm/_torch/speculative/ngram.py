@@ -26,7 +26,7 @@ class NGramPoolManager(BaseResourceManager):
 
     Arguments:
         max_draft_tokens: int
-            The length maximum of draft tokens (can be understood as length maximum of output draft tokens).
+            The length maximum of draft tokens (can be understood as length maximum of output draft tokens). If dynamic draft length based on batch size is enabled, this value will be overridden by the dynamic draft_len each step.
 
         max_matching_ngram_size: int
             The length maximum of searching tokens (can be understood as length maximum of input tokens to search).
@@ -51,7 +51,8 @@ class NGramPoolManager(BaseResourceManager):
 
     def __init__(self, spec_config: "NGramDecodingConfig",
                  max_num_requests: int):
-        self.max_draft_tokens = spec_config.max_draft_len
+        self.max_draft_tokens = spec_config.max_draft_len  # Dynamic, can be updated during execution
+        self._static_max_draft_tokens = spec_config.max_draft_len  # Static, never changes
         self.max_matching_ngram_size = spec_config.max_matching_ngram_size
         self.is_keep_all = spec_config.is_keep_all
         self.is_use_oldest = spec_config.is_use_oldest  # TODO: remove this if updating strategy is supported
@@ -167,10 +168,16 @@ class NGramDrafter(Drafter):
         spec_config: NGramDecodingConfig,
         ngram_pool_manager: NGramPoolManager = None,
     ):
-        super().__init__(spec_config.max_concurrency)
+
+        super().__init__(
+            max_draft_tokens=spec_config.max_draft_len,
+            _static_max_draft_tokens=spec_config.max_draft_len,
+            max_concurrency=spec_config.max_concurrency,
+            draft_len_schedule=spec_config.draft_len_schedule,
+        )
+
         assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
         self.spec_config = spec_config
-        self.max_draft_tokens = spec_config.max_draft_len
         self.spec_resource_manager = ngram_pool_manager
 
     def prepare_draft_tokens(
@@ -178,6 +185,14 @@ class NGramDrafter(Drafter):
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
+        # # Override max_draft_tokens if dynamic draft_len is provided
+        # if self.draft_len_schedule is not None and hasattr(self, '_current_batch_draft_len'):
+        #     # Use pre-determined value from executor (set BEFORE scheduling)
+        #     self.max_draft_tokens = self._current_batch_draft_len
+        #     # CRITICAL: Also update the pool manager's max_draft_tokens
+        #     # This ensures pool building and start_index calculation use the correct dynamic length
+        #     self.spec_resource_manager.max_draft_tokens = self._current_batch_draft_len
+
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
         # before forward_step, so py_batch_idx is not assigned.
@@ -197,3 +212,8 @@ class NGramDrafter(Drafter):
                 request.py_max_new_tokens,
             )
             request.py_draft_tokens = draft_tokens
+
+    def update_max_draft_tokens(self, new_max_draft_tokens: int) -> None:
+        """Override to propagate to NGramPoolManager."""
+        super().update_max_draft_tokens(new_max_draft_tokens)
+        self.spec_resource_manager.max_draft_tokens = new_max_draft_tokens
