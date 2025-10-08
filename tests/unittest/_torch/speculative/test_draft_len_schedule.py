@@ -28,9 +28,7 @@ from utils.llm_data import llm_models_root
 from utils.util import similar
 
 
-# ============================================================================
-# P0-1: Correctness check - generation quality doesn't change
-# ============================================================================
+# Generation correctness check
 @pytest.mark.parametrize("drafter_type,schedule", [
     ("ngram", {
         1: 3,

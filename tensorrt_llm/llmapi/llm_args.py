@@ -364,14 +364,13 @@ class DecodingBaseConfig(StrictBaseModel):
     # this value. Otherwise, speculation will always be on.
     max_concurrency: Optional[int] = None
 
-    # Developer interface: dynamically adjust draft length based on pre-scheduled batch size in runtime.
+    # Developer interface: dynamically adjust draft length based on active batch size in runtime.
     # Maps batch size to draft lengths. For example:
     # {1: 4, 4: 2, 8: 0} means:
     # - batch_size >= 1: use draft_len=4
     # - batch_size >= 4: use draft_len=2
     # - batch_size >= 8: use draft_len=0 (disable speculation)
-    # If not specified, this feature is disabled and will use max_draft_len for all batch sizes.
-    # draft_len_schedule is enforced to contain batch_size=1 and draft_len=max_draft_len for consistency
+    # draft_len_schedule is enforced to contain batch_size=1 and its according draft_len equals max_draft_len for consistency
     # for example, if max_draft_len=4, the schedule must contain {1: 4}
     draft_len_schedule: Optional[dict[int, int]] = None
 

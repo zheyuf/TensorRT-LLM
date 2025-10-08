@@ -192,8 +192,8 @@ class PyExecutor:
         # enqueue and _fetch_new_requests used data
         self.active = True
         self.max_beam_width = max_beam_width
-        self.max_draft_len = max_draft_len  # Dynamic, if dynamic draft length is enabled (it will be dynamically updated before each scheduling step). Otherwise, it will be static.
-        self._static_max_draft_len = max_draft_len  # Static, never changes
+        self.max_draft_len = max_draft_len  # It's dynamic if draft_len_schedule is provided in spec_config (dynamic draft length based on runtime batch size is enabled). It's static in other cases.
+        self._static_max_draft_len = max_draft_len  # It's always static
         self.max_num_tokens = model_engine.pytorch_backend_config.max_num_tokens
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
@@ -1023,13 +1023,14 @@ class PyExecutor:
                 batch_size_input = len(self.active_requests)
 
                 self.max_draft_len = self.drafter.get_draft_len_for_batch_size(
-                    batch_size_input,
-                    self.model_engine.spec_config.max_draft_len)
+                    batch_size_input)
 
                 self.drafter.update_max_draft_tokens(self.max_draft_len)
 
             # Check if draft_len=0 → immediately disable
-            if self.max_draft_len == 0:
+            # max_draft_len==0 is only possible when draft_len_schedule is provided
+            # for example, draft_len_schedule = {1:4, 4:2, 8:0}, batch_size >= 8 will set self.max_draft_len = 0
+            if self.drafter.draft_len_schedule is not None and self.max_draft_len == 0:
                 self.use_spec_decode = False
                 self.model_engine.enable_spec_decode = False
             else:

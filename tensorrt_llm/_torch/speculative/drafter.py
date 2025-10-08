@@ -22,9 +22,9 @@ class Drafter(ABC):
         self.max_concurrency = max_concurrency
         # Schedule is already validated and sorted by config validator
         self.draft_len_schedule = draft_len_schedule
-        # It will be updated before each scheduling step by the executor if dynamic draft length is enabled, otherwise it stays the same as the static value
+        # It's dynamic if draft_len_schedule is provided in spec_config (dynamic draft length based on runtime batch size is enabled). It's static in other cases.
         self.max_draft_tokens = max_draft_tokens
-        # original max_draft_tokens value from decode config
+        # It's always static
         self._static_max_draft_tokens = max_draft_tokens
 
     @abstractmethod
@@ -42,20 +42,16 @@ class Drafter(ABC):
         raise NotImplementedError
 
     @final
-    def get_draft_len_for_batch_size(self, batch_size: int,
-                                     max_draft_len: int) -> int:
+    def get_draft_len_for_batch_size(self, batch_size: int) -> int:
         """
-        Get the appropriate draft length for the given batch size.
+        Get the appropriate draft length for the given batch size using binary search.
 
         Args:
-            batch_size: Current batch size
-            max_draft_len: Maximum draft length (fallback if schedule not provided)
+            batch_size: Current batch size (has been sorted by config validator)
 
         Returns:
             The draft length to use for this batch size
         """
-        if self.draft_len_schedule is None:
-            return max_draft_len
 
         # Binary search to find the largest threshold <= batch_size
         # draft_len_schedule is already sorted by config validator
@@ -139,7 +135,7 @@ class Drafter(ABC):
 
     def update_max_draft_tokens(self, new_max_draft_tokens: int) -> None:
         """
-        Used when dynamic draft length based on batch size is enabled.
+        Used when draft_len_schedule is provided in spec_config (dynamic draft length based on runtime batch size is enabled)
         Update max_draft_tokens in drafter and propagate to any dependent components.
         Subclasses can override to propagate to their resource managers if needed.
 
