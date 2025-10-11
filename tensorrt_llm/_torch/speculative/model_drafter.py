@@ -60,7 +60,6 @@ class ModelDrafter(Drafter):
 
         super().__init__(
             max_draft_tokens=spec_config.max_draft_len,
-            _static_max_draft_tokens=spec_config.max_draft_len,
             max_concurrency=spec_config.max_concurrency,
             draft_len_schedule=spec_config.draft_len_schedule,
         )
@@ -794,17 +793,6 @@ class ModelDrafter(Drafter):
 
         if resource_manager is None:
             raise ValueError("Resource manager is required")
-
-        # # Use pre-determined draft_len (set by executor BEFORE scheduling)
-        # if self.draft_len_schedule is not None and hasattr(self, '_current_batch_draft_len'):
-        #     # Use pre-determined value from executor
-        #     dynamic_draft_len = self._current_batch_draft_len
-
-        #     # Override max_draft_tokens to the dynamic value
-        #     self.max_draft_tokens = dynamic_draft_len
-
-        #     # Note: If draft_len=0, this method won't be called anyway
-        #     # (executor sets use_spec_decode=False and clears py_draft_tokens)
 
         try:
             draft_batch, req_id_to_old_request = self._setup_draft_batch_and_resources(

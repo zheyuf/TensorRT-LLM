@@ -410,6 +410,15 @@ class DecodingBaseConfig(StrictBaseModel):
                     f"Got schedule[1]={v[1]}, but max_draft_len={max_draft_len}. "
                     f"batch_size=1 should use maximum draft length.")
 
+            # Enforce all draft lengths <= max_draft_len
+            if max_draft_len is not None:
+                for batch_size, draft_len in v.items():
+                    if draft_len > max_draft_len:
+                        raise ValueError(
+                            f"draft_len_schedule: all draft lengths must be <= max_draft_len. "
+                            f"Got draft_len={draft_len} for batch_size={batch_size}, "
+                            f"but max_draft_len={max_draft_len}.")
+
             # Return sorted dict (by batch size thresholds)
             # This ensures efficient lookup
             return dict(sorted(v.items(), key=lambda x: x[0]))

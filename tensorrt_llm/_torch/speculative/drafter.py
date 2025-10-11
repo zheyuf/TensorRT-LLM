@@ -15,7 +15,6 @@ class Drafter(ABC):
     def __init__(
         self,
         max_draft_tokens: int,
-        _static_max_draft_tokens: int,
         max_concurrency: Optional[int] = None,
         draft_len_schedule: Optional[Dict[int, int]] = None,
     ) -> None:

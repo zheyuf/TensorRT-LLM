@@ -52,7 +52,6 @@ class NGramPoolManager(BaseResourceManager):
     def __init__(self, spec_config: "NGramDecodingConfig",
                  max_num_requests: int):
         self.max_draft_tokens = spec_config.max_draft_len  # It's dynamic if draft_len_schedule is provided in spec_config (dynamic draft length based on runtime batch size is enabled). It's static in other cases.
-        self._static_max_draft_tokens = spec_config.max_draft_len  # It's always static
         self.max_matching_ngram_size = spec_config.max_matching_ngram_size
         self.is_keep_all = spec_config.is_keep_all
         self.is_use_oldest = spec_config.is_use_oldest  # TODO: remove this if updating strategy is supported
@@ -171,7 +170,6 @@ class NGramDrafter(Drafter):
 
         super().__init__(
             max_draft_tokens=spec_config.max_draft_len,
-            _static_max_draft_tokens=spec_config.max_draft_len,
             max_concurrency=spec_config.max_concurrency,
             draft_len_schedule=spec_config.draft_len_schedule,
         )
