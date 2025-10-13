@@ -58,6 +58,7 @@ def enforce_single_worker():
     }),
 ])
 @pytest.mark.high_cuda_memory
+@pytest.mark.no_xdist
 def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     """
     Test output correctness with various schedules and batch sizes.
@@ -193,6 +194,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     )),
 ])
 @pytest.mark.high_cuda_memory
+@pytest.mark.no_xdist
 def test_draft_len_schedule_functionality(drafter_type: str,
                                           spec_config_factory):
     """
