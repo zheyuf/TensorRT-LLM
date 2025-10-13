@@ -705,16 +705,6 @@ class ModelDrafter(Drafter):
                 - Updated target inputs or None
                 - Draft sample state or None
         """
-        # # Use pre-determined draft_len (set by executor BEFORE scheduling)
-        # if self.draft_len_schedule is not None and hasattr(self, '_current_batch_draft_len'):
-        #     # Use pre-determined value from executor
-        #     dynamic_draft_len = self._current_batch_draft_len
-
-        #     # Override max_draft_tokens to the dynamic value
-        #     self.max_draft_tokens = dynamic_draft_len
-
-        #     # Note: If draft_len=0, this method won't be called anyway
-        #     # (executor sets use_spec_decode=False and clears py_draft_tokens)
 
         draft_batch, req_id_to_old_request = self._setup_draft_batch_and_resources(
             scheduled_batch)

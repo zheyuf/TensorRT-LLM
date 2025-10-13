@@ -1,18 +1,3 @@
-"""
-test_draft_len_schedule.py
-
-Tests for dynamic draft length (draft_len_schedule) feature - Stage 1.
-
-Stage 1 covers:
-- NGramDrafter with dynamic draft_len
-- ModelDrafter (2-model) with dynamic draft_len
-- Draft-side compute savings only (target model still processes padded tokens)
-
-Not covered in Stage 1:
-- ChainDrafter/Eagle3 static loops (Stage 3)
-- Target model compute savings (Stage 2)
-"""
-
 import os
 import sys
 
@@ -251,8 +236,6 @@ def test_draft_len_schedule_functionality(drafter_type: str,
 
     # 1. Mock should_use_spec_decode to always return True
     # This isolates draft_len_schedule testing from max_concurrency logic
-    drafter.should_use_spec_decode
-
     def mock_should_use_spec_decode(*args, **kwargs):
         return True  # Always allow speculation (draft_len_schedule controls it)
 
@@ -331,7 +314,6 @@ def test_draft_len_schedule_functionality(drafter_type: str,
         assert drafter_tokens == expected, \
             f"Iter {idx}: batch_size_gen={bs} → expected {expected} tokens, got {drafter_tokens}"
 
-        # Critical verification: draft_len=0 MUST disable speculation
         if drafter_tokens == 0:
             assert not it['use_spec_decode'], \
                 f"Iter {idx}: drafter_max_draft_tokens=0 but use_spec_decode={it['use_spec_decode']}"
