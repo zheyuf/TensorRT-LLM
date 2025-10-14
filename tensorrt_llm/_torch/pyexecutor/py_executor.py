@@ -1033,13 +1033,13 @@ class PyExecutor:
             # for example, draft_len_schedule = {1:4, 4:2, 8:0}, batch_size >= 8 will set self.max_draft_len = 0
             if self.drafter.draft_len_schedule is not None and self.max_draft_len == 0:
                 self.use_spec_decode = False
-                self.model_engine.enable_spec_decode = False
+            elif getattr(self, 'speculation_permanently_disabled', False):
+                self.use_spec_decode = False
             else:
-                # Check should_use_spec_decode (max_concurrency logic)
                 self.use_spec_decode = self.drafter.should_use_spec_decode(
                     self.active_requests, self.max_batch_size,
                     self.model_engine.max_num_tokens, self.max_draft_len)
-                self.model_engine.enable_spec_decode = self.use_spec_decode
+            self.model_engine.enable_spec_decode = self.use_spec_decode
 
             for request in self.active_requests:
                 if request.state not in (

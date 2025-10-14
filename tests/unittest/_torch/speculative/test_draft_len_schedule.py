@@ -98,6 +98,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
                 draft_model),  # Use smaller 1B model as draft
             draft_len_schedule=schedule,
         )
+        spec_config._allow_chain_drafter = False
 
     prompts = [
         "The capital of France is",
@@ -209,6 +210,7 @@ def test_draft_len_schedule_functionality(drafter_type: str,
         max_num_tokens=2048,
     )
     spec_config = spec_config_factory()
+    spec_config._allow_chain_drafter = False
     prompts = [f"Prompt {i}: The answer is" for i in range(8)]
     # Give each request different max_tokens so they finish at different times
     # This creates batch size transitions: 8 -> 7 -> 6 -> 5 -> 4 -> 3 -> 2 -> 1
