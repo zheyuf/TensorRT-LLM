@@ -236,6 +236,11 @@ def test_draft_len_schedule_functionality(drafter_type: str,
 
     iteration_data = []
 
+    # Store original methods for cleanup before shutdown
+    original_should_use_spec_decode = drafter.should_use_spec_decode
+    original_update_max_draft_tokens = drafter.update_max_draft_tokens
+    original_prepare_draft = drafter.prepare_draft_tokens
+
     # 1. Mock should_use_spec_decode to always return True
     # This isolates draft_len_schedule testing from max_concurrency logic
     def mock_should_use_spec_decode(*args, **kwargs):
@@ -244,8 +249,6 @@ def test_draft_len_schedule_functionality(drafter_type: str,
     drafter.should_use_spec_decode = mock_should_use_spec_decode
 
     # 2. Instrument update_max_draft_tokens to capture when draft_len changes
-    original_update_max_draft_tokens = drafter.update_max_draft_tokens
-
     def instrumented_update_max_draft_tokens(new_max_draft_tokens: int):
         batch_size_active = len(executor.active_requests)
 
@@ -263,8 +266,6 @@ def test_draft_len_schedule_functionality(drafter_type: str,
     drafter.update_max_draft_tokens = instrumented_update_max_draft_tokens
 
     # 3. Instrument prepare_draft_tokens - where actual draft tokens are produced
-    original_prepare_draft = drafter.prepare_draft_tokens
-
     def instrumented_prepare_draft(scheduled_batch, resource_manager):
         result = original_prepare_draft(scheduled_batch, resource_manager)
 
@@ -291,6 +292,13 @@ def test_draft_len_schedule_functionality(drafter_type: str,
     # Generate with 8 prompts (batch_size starts at 8, decreases as requests finish)
     results_spec = llm_spec.generate(prompts, sampling_params_list)
     [result.outputs[0].text for result in results_spec]
+
+    # CRITICAL: Restore original methods before verification and shutdown
+    # This prevents race conditions where background threads access instrumented closures
+    # that capture references to executor/engine objects during shutdown
+    drafter.should_use_spec_decode = original_should_use_spec_decode
+    drafter.update_max_draft_tokens = original_update_max_draft_tokens
+    drafter.prepare_draft_tokens = original_prepare_draft
 
     # ========================================================================
     # Verification Rule 1: batch_size_active → drafter_max_draft_tokens mapping
