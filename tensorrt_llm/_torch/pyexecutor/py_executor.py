@@ -194,8 +194,8 @@ class PyExecutor:
         # enqueue and _fetch_new_requests used data
         self.active = True
         self.max_beam_width = max_beam_width
-        self.max_draft_len = max_draft_len  # It's dynamic if draft_len_schedule is provided in spec_config (dynamic draft length based on runtime batch size is enabled). It's static in other cases.
-        self._static_max_draft_len = max_draft_len  # It's always static
+        self.max_draft_len = max_draft_len
+        self._static_max_draft_len = max_draft_len
         self.max_num_tokens = model_engine.pytorch_backend_config.max_num_tokens
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
