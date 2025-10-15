@@ -5,7 +5,6 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.executor import GenerationExecutorWorker
 from tensorrt_llm.llmapi import (DraftTargetDecodingConfig, KvCacheConfig,
                                  NGramDecodingConfig)
 
@@ -98,7 +97,6 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
                 draft_model),  # Use smaller 1B model as draft
             draft_len_schedule=schedule,
         )
-        spec_config._allow_chain_drafter = False
 
     prompts = [
         "The capital of France is",
@@ -210,7 +208,6 @@ def test_draft_len_schedule_functionality(drafter_type: str,
         max_num_tokens=2048,
     )
     spec_config = spec_config_factory()
-    spec_config._allow_chain_drafter = False
     prompts = [f"Prompt {i}: The answer is" for i in range(8)]
     # Give each request different max_tokens so they finish at different times
     # This creates batch size transitions: 8 -> 7 -> 6 -> 5 -> 4 -> 3 -> 2 -> 1
@@ -226,18 +223,13 @@ def test_draft_len_schedule_functionality(drafter_type: str,
     ]
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
-    # Ensure we're in single-worker mode so we can access the engine directly
-    assert isinstance(llm_spec._executor, GenerationExecutorWorker), \
-        f"Expected GenerationExecutorWorker but got {type(llm_spec._executor)}. " \
-        "Make sure enforce_single_worker fixture is applied."
-
     drafter = llm_spec._executor.engine.drafter
     executor = llm_spec._executor.engine
 
     iteration_data = []
 
     # Store original methods for cleanup before shutdown
-    original_should_use_spec_decode = drafter.should_use_spec_decode
+    drafter.should_use_spec_decode
     original_update_max_draft_tokens = drafter.update_max_draft_tokens
     original_prepare_draft = drafter.prepare_draft_tokens
 
@@ -290,15 +282,8 @@ def test_draft_len_schedule_functionality(drafter_type: str,
     drafter.prepare_draft_tokens = instrumented_prepare_draft
 
     # Generate with 8 prompts (batch_size starts at 8, decreases as requests finish)
-    results_spec = llm_spec.generate(prompts, sampling_params_list)
-    [result.outputs[0].text for result in results_spec]
-
-    # CRITICAL: Restore original methods before verification and shutdown
-    # This prevents race conditions where background threads access instrumented closures
-    # that capture references to executor/engine objects during shutdown
-    drafter.should_use_spec_decode = original_should_use_spec_decode
-    drafter.update_max_draft_tokens = original_update_max_draft_tokens
-    drafter.prepare_draft_tokens = original_prepare_draft
+    llm_spec.generate(prompts, sampling_params_list)
+    llm_spec.shutdown()
 
     # ========================================================================
     # Verification Rule 1: batch_size_active → drafter_max_draft_tokens mapping
@@ -350,5 +335,3 @@ def test_draft_len_schedule_functionality(drafter_type: str,
                     # total_drafts += 1
                     assert actual_len == drafter_tokens, \
                         f"Iter {idx}, req {req_idx}: ModelDrafter produced {actual_len} != max_draft_tokens {drafter_tokens}"
-
-    llm_spec.shutdown()

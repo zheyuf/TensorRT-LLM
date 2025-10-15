@@ -1625,7 +1625,7 @@ class PyExecutor:
                 request_ids=[0],
                 is_gen=True,
                 prepare_resource=True,
-                max_num_draft_tokens=self.static_max_draft_len,
+                max_num_draft_tokens=self._static_max_draft_len,
             )[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
