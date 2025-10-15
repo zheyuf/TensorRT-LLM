@@ -228,8 +228,7 @@ def test_draft_len_schedule_functionality(drafter_type: str,
 
     iteration_data = []
 
-    # Store original methods for cleanup before shutdown
-    drafter.should_use_spec_decode
+    # Store original methods
     original_update_max_draft_tokens = drafter.update_max_draft_tokens
     original_prepare_draft = drafter.prepare_draft_tokens
 
