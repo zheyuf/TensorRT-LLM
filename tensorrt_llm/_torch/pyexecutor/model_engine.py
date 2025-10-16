@@ -18,6 +18,8 @@ from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
+from tensorrt_llm.inputs.registry import (create_input_processor,
+                                          create_input_processor_with_hash)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
@@ -34,6 +36,7 @@ from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import MPIDist
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
+from ..memory_buffer_utils import with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
@@ -171,7 +174,9 @@ class PyTorchModelEngine(ModelEngine):
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
-
+        self.input_processor = create_input_processor(model_path, None)
+        self.input_processor_with_hash = create_input_processor_with_hash(
+            self.input_processor)
         if model is None:
             loader = ModelLoader(
                 pytorch_backend_config=pytorch_backend_config,
@@ -1223,6 +1228,7 @@ class PyTorchModelEngine(ModelEngine):
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.cached_tokens = num_cached_tokens_per_seq[-1]
 
             # Multimodal
             py_multimodal_runtime = MultimodalRuntimeData(
@@ -1333,6 +1339,7 @@ class PyTorchModelEngine(ModelEngine):
                         range(past_seen_token_num,
                               past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(past_seen_token_num)
+                request.cached_tokens = num_cached_tokens_per_seq[-1]
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
             else:
@@ -1366,6 +1373,7 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     num_cached_tokens_per_seq.append(past_seen_token_num +
                                                      self.runtime_draft_len + 1)
+                request.cached_tokens = num_cached_tokens_per_seq[-1]
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend):
                     prompt_lengths.append(1 + self.runtime_draft_len)
@@ -1426,6 +1434,7 @@ class PyTorchModelEngine(ModelEngine):
                     position_id = sum(past_seen_token_nums)
                 position_ids.append(position_id)
                 num_cached_tokens_per_seq.append(past_seen_token_num)
+                request.cached_tokens = num_cached_tokens_per_seq[-1]
                 prompt_lengths.append(request.py_prompt_len)
                 draft_lens.append(0)
                 sequence_lengths.append(1)
@@ -1948,6 +1957,7 @@ class PyTorchModelEngine(ModelEngine):
             sequence_lengths.append(len(input_id))
             block_ids_per_seq.extend([all_cache_indices])
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.cached_tokens = num_cached_tokens_per_seq[-1]
         num_contexts = len(sequence_lengths)
         for request in scheduled_requests.context_requests:
             ctx_iter = request.ctx_iters
@@ -1987,6 +1997,7 @@ class PyTorchModelEngine(ModelEngine):
             sequence_lengths.append(len(input_id))
             block_ids_per_seq.extend([all_cache_indices])
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.cached_tokens = num_cached_tokens_per_seq[-1]
         num_queries = len(sequence_lengths) - num_contexts
 
         # Requests with draft tokens are treated like extend requests.
@@ -2044,6 +2055,7 @@ class PyTorchModelEngine(ModelEngine):
             position_ids.append(last_query_pos_id + request.gen_iters + 1)
             block_ids_per_seq.extend([all_cache_indices])
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            request.cached_tokens = num_cached_tokens_per_seq[-1]
 
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
@@ -2280,35 +2292,35 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device, cache_indirection_buffer)
 
             self.iter_counter += 1
-
-            if not maybe_graph:
-                # Fallback to eager execution if graph was not used
-                with MoeLoadBalancerIterContext(moe_load_balancer):
-                    outputs = self._forward_step(inputs, gather_ids,
-                                                 gather_context_logits)
-            else:
-                if self.cuda_graph_runner.needs_capture(key):
-
-                    def capture_forward_fn(inputs: Dict[str, Any]):
-                        with MoeLoadBalancerIterContext(moe_load_balancer):
-                            return self._forward_step(
-                                inputs,
-                                gather_ids=gather_ids,
-                                gather_context_logits=gather_context_logits)
-
-                    def capture_postprocess_fn(inputs: Dict[str, Any]):
-                        self._postprocess_inputs(inputs)
-
-                    self.cuda_graph_runner.capture(key, capture_forward_fn,
-                                                   inputs,
-                                                   capture_postprocess_fn)
-
-                    # here we don't need to use context since cuda graph capture didn't run kernel.
-                    # maybe we need a cleaner way to do this.
-                    outputs = self.cuda_graph_runner.replay(key, inputs)
-                else:
+            with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
+                if not maybe_graph:
+                    # Fallback to eager execution if graph was not used
                     with MoeLoadBalancerIterContext(moe_load_balancer):
+                        outputs = self._forward_step(inputs, gather_ids,
+                                                     gather_context_logits)
+                else:
+                    if self.cuda_graph_runner.needs_capture(key):
+
+                        def capture_forward_fn(inputs: Dict[str, Any]):
+                            with MoeLoadBalancerIterContext(moe_load_balancer):
+                                return self._forward_step(
+                                    inputs,
+                                    gather_ids=gather_ids,
+                                    gather_context_logits=gather_context_logits)
+
+                        def capture_postprocess_fn(inputs: Dict[str, Any]):
+                            self._postprocess_inputs(inputs)
+
+                        self.cuda_graph_runner.capture(key, capture_forward_fn,
+                                                       inputs,
+                                                       capture_postprocess_fn)
+
+                        # here we don't need to use context since cuda graph capture didn't run kernel.
+                        # maybe we need a cleaner way to do this.
                         outputs = self.cuda_graph_runner.replay(key, inputs)
+                    else:
+                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                            outputs = self.cuda_graph_runner.replay(key, inputs)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
