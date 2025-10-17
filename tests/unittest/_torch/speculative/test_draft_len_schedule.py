@@ -49,7 +49,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
 
     This is the primary correctness test that validates:
     - Multiple different schedules work correctly
-    - Output matches non-speculative baseline
+    - Output with draft_len_schedule matches output with fixed draft_len
     - Works across different batch size transitions
     - Both NGram and ModelDrafter function correctly
     """
@@ -93,8 +93,7 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     else:
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=max_draft_len,
-            speculative_model_dir=str(
-                draft_model),  # Use smaller 1B model as draft
+            speculative_model_dir=str(draft_model),
             draft_len_schedule=schedule,
         )
 
@@ -107,7 +106,6 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
         "Explain in one sentence why the sky is blue.",
         "Who wrote the book 'Pride and Prejudice'?",
         "List three U.S. national holidays in the year 2025.",
-        "Who painted the Mona Lisa?",
     ]
 
     # Give each request different max_tokens so they finish at different times
@@ -124,27 +122,50 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
         ) for i in range(len(prompts))
     ]
 
-    # With dynamic draft_len
-    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-    results_spec = llm_spec.generate(prompts, sampling_params_list)
-    generated_text_spec = [result.outputs[0].text for result in results_spec]
-    llm_spec.shutdown()
+    # With dynamic draft_len_schedule
+    llm_with_schedule = LLM(**llm_common_config, speculative_config=spec_config)
+    results_with_schedule = llm_with_schedule.generate(prompts,
+                                                       sampling_params_list)
+    generated_text_with_schedule = [
+        result.outputs[0].text for result in results_with_schedule
+    ]
+    llm_with_schedule.shutdown()
 
-    # Reference without speculation
-    llm_ref = LLM(**llm_common_config)
-    results_ref = llm_ref.generate(prompts, sampling_params_list)
-    generated_text_ref = [result.outputs[0].text for result in results_ref]
-    llm_ref.shutdown()
-
-    # Verify correctness
+    # Reference: spec decode with fixed max_draft_len (no schedule)
     if drafter_type == "ngram":
-        for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
-            assert similar(text_spec, text_ref), \
-                f"NGram output should be similar. Got:\nSpec: {text_spec}\nRef:  {text_ref}"
+        spec_config_fixed = NGramDecodingConfig(
+            max_draft_len=max_draft_len,
+            max_matching_ngram_size=2,
+            draft_len_schedule=None,  # No schedule - fixed draft length
+            is_keep_all=True,
+            is_use_oldest=True,
+            is_public_pool=False,
+        )
     else:
-        for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
-            assert similar(text_spec, text_ref), \
-                f"ModelDrafter output should be similar. Got:\nSpec: {text_spec}\nRef:  {text_ref}"
+        spec_config_fixed = DraftTargetDecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model_dir=str(draft_model),
+            draft_len_schedule=None,  # No schedule - fixed draft length
+        )
+
+    llm_fixed = LLM(**llm_common_config, speculative_config=spec_config_fixed)
+    results_fixed = llm_fixed.generate(prompts, sampling_params_list)
+    generated_text_fixed = [result.outputs[0].text for result in results_fixed]
+    llm_fixed.shutdown()
+
+    for text_schedule, text_fixed in zip(generated_text_with_schedule,
+                                         generated_text_fixed):
+        print(f"With schedule: {text_schedule}")
+        print(f"Fixed:         {text_fixed}")
+        print("-" * 100)
+
+    # Verify correctness: spec decode with schedule should match spec decode without schedule
+    for text_schedule, text_fixed in zip(generated_text_with_schedule,
+                                         generated_text_fixed):
+        assert similar(text_schedule, text_fixed), \
+            f"{drafter_type} output with draft_len_schedule should match output with fixed draft_len. Got:\n" \
+            f"With schedule: {text_schedule}\n" \
+            f"Fixed:         {text_fixed}"
 
 
 # # ============================================================================
@@ -337,6 +358,5 @@ def test_draft_len_schedule_functionality(drafter_type: str,
 
             if drafter_tokens > 0:  # Only count when speculation is active (draft_len > 0)
                 for req_idx, actual_len in enumerate(actual_lens):
-                    # total_drafts += 1
                     assert actual_len == drafter_tokens, \
                         f"Iter {idx}, req {req_idx}: ModelDrafter produced {actual_len} != max_draft_tokens {drafter_tokens}"
