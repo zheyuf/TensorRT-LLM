@@ -231,6 +231,7 @@ def test_draft_len_schedule_functionality(drafter_type: str,
     # Store original methods
     original_update_max_draft_tokens = drafter.update_max_draft_tokens
     original_prepare_draft = drafter.prepare_draft_tokens
+    original_should_use_spec_decode = drafter.should_use_spec_decode
 
     # 1. Mock should_use_spec_decode to always return True
     # This isolates draft_len_schedule testing from max_concurrency logic
@@ -280,9 +281,14 @@ def test_draft_len_schedule_functionality(drafter_type: str,
 
     drafter.prepare_draft_tokens = instrumented_prepare_draft
 
-    # Generate with 8 prompts (batch_size starts at 8, decreases as requests finish)
-    llm_spec.generate(prompts, sampling_params_list)
-    llm_spec.shutdown()
+    try:
+        llm_spec.generate(prompts, sampling_params_list)
+    finally:
+        # Restore methods in finally block to ensure cleanup even if generate() fails
+        drafter.update_max_draft_tokens = original_update_max_draft_tokens
+        drafter.prepare_draft_tokens = original_prepare_draft
+        drafter.should_use_spec_decode = original_should_use_spec_decode
+        llm_spec.shutdown()
 
     # ========================================================================
     # Verification Rule 1: batch_size_active → drafter_max_draft_tokens mapping
