@@ -153,12 +153,6 @@ def test_correctness_across_batch_sizes(drafter_type: str, schedule: dict):
     generated_text_fixed = [result.outputs[0].text for result in results_fixed]
     llm_fixed.shutdown()
 
-    for text_schedule, text_fixed in zip(generated_text_with_schedule,
-                                         generated_text_fixed):
-        print(f"With schedule: {text_schedule}")
-        print(f"Fixed:         {text_fixed}")
-        print("-" * 100)
-
     # Verify correctness: spec decode with schedule should match spec decode without schedule
     for text_schedule, text_fixed in zip(generated_text_with_schedule,
                                          generated_text_fixed):
