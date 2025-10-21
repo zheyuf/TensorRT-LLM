@@ -1042,6 +1042,10 @@ class PyExecutor:
                     batch_size_input)
 
                 self.drafter.update_max_draft_tokens(self.max_draft_len)
+                # Stage 2: Update target model_engine.max_draft_len to match the runtime value
+                # This ensures model_engine.runtime_draft_len returns the correct dynamic value
+                # Note: draft_model_engine.max_draft_len is always 0 and doesn't need updating
+                self.model_engine.max_draft_len = self.max_draft_len
 
             # Check if draft_len=0 → immediately disable
             # max_draft_len==0 is only possible when draft_len_schedule is provided

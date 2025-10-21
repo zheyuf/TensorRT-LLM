@@ -98,14 +98,38 @@ class CUDAGraphRunner:
     def get_graph_key(
             self,
             batch_size,
-            spec_resource_manager: Optional[BaseResourceManager] = None):
+            spec_resource_manager: Optional[BaseResourceManager] = None,
+            runtime_draft_len: Optional[int] = None):
+        """
+        Get the CUDA graph key for the given batch and draft configuration.
+
+        Stage 2 Dynamic Draft Length: When runtime_draft_len is provided and
+        a draft_len_schedule exists, use the runtime draft length instead of
+        max_draft_len. This enables selecting the appropriate CUDA graph for
+        the current draft length.
+
+        Args:
+            batch_size: Batch size for the graph
+            spec_resource_manager: Optional resource manager for spec decoding
+            runtime_draft_len: Optional runtime draft length (Stage 2 feature)
+
+        Returns:
+            Tuple of (batch_size, draft_len, is_first_draft)
+        """
         engine = self._get_engine()
         if engine.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
             draft_len = engine.original_max_draft_len if spec_resource_manager.is_first_draft else 0
             key = (batch_size, draft_len, spec_resource_manager.is_first_draft)
         else:
-            draft_len = self.spec_config.max_draft_len if self.enable_spec_decode else 0
+            # Stage 2: Use runtime draft length if provided and schedule exists
+            if (runtime_draft_len is not None and self.spec_config
+                    and hasattr(self.spec_config, 'draft_len_schedule')
+                    and self.spec_config.draft_len_schedule is not None):
+                draft_len = runtime_draft_len
+            else:
+                # Legacy behavior: use max_draft_len
+                draft_len = self.spec_config.max_draft_len if self.enable_spec_decode else 0
             key = (batch_size, draft_len, False)
         return key
 
@@ -135,9 +159,13 @@ class CUDAGraphRunner:
     def maybe_get_cuda_graph(
             self,
             batch: ScheduledRequests,
-            spec_resource_manager: Optional[BaseResourceManager] = None):
+            spec_resource_manager: Optional[BaseResourceManager] = None,
+            runtime_draft_len: Optional[int] = None):
         """
         Determines if the current batch can be run with a CUDA graph.
+
+        Stage 2 Dynamic Draft Length: When runtime_draft_len is provided,
+        selects the CUDA graph corresponding to that draft length.
 
         Returns a tuple containing:
         - A boolean indicating if a graph can be used.
@@ -168,7 +196,8 @@ class CUDAGraphRunner:
 
         if not self.enabled or not can_run_cuda_graph:
             return False, None, None, None
-        key = self.get_graph_key(batch_size, spec_resource_manager)
+        key = self.get_graph_key(batch_size, spec_resource_manager,
+                                 runtime_draft_len)
 
         if key in self.graphs:
             return True, self.graph_metadata[key][
@@ -351,10 +380,13 @@ class CUDAGraphRunner:
             if available_blocks < 1:
                 return 0
 
+            # Stage 2: Padding dummy request is created once and reused across iterations.
+            # It must be sized for the STATIC maximum draft length, not the runtime value,
+            # since runtime_draft_len changes per iteration.
             self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
                 [CUDA_GRAPH_DUMMY_REQUEST_ID],
                 is_gen=True,
-                max_num_draft_tokens=engine.runtime_draft_len,
+                max_num_draft_tokens=engine.original_max_draft_len,
                 use_mrope=engine.use_mrope,
                 max_beam_width=engine.max_beam_width)[0]
             self.padding_dummy_request.is_cuda_graph_dummy = True

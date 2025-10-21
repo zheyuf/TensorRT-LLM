@@ -104,21 +104,40 @@ class Drafter(ABC):
     def pad_draft_tokens_for_cuda_graph(
             self, scheduled_requests: ScheduledRequests) -> None:
         """
-        Pad draft tokens to the max draft length for CUDA graph compatibility.
+        Pad draft tokens for CUDA graph compatibility.
 
-        Note: Always pads to the STATIC max_draft_len (not dynamic) because
-        CUDA graphs are compiled with fixed tensor shapes based on max_draft_len.
+        CUDA graphs require all requests in a batch to have the same tensor shape.
+        Individual requests may generate fewer draft tokens (e.g., NGram mismatches,
+        early stopping), but all must be padded to the same length.
+
+        Stage 1 (No schedule): Pads to STATIC max_draft_tokens
+        - Single CUDA graph captured with max_draft_len
+        - All requests padded to _static_max_draft_tokens regardless of actual generation
+
+        Stage 2 (With schedule): Pads to DYNAMIC max_draft_tokens (self.max_draft_tokens)
+        - Multiple CUDA graphs captured for each unique draft length
+        - All requests padded to current max_draft_tokens (which varies by batch size)
+        - Example: With batch_size=4, max_draft_tokens=2, all requests padded to 2
+          (even if some requests only generated 1 or 0 tokens)
 
         Args:
             scheduled_requests: The scheduled requests to pad
         """
         for req in scheduled_requests.generation_requests:
-            # Use static max_draft_tokens for CUDA graph compatibility
-            # CUDA graphs are sized for the maximum, even if we generate fewer tokens dynamically
             num_draft_tokens = get_draft_token_length(req)
-            req.py_draft_tokens.extend(
-                0 for _ in range(self._static_max_draft_tokens -
-                                 num_draft_tokens))
+
+            if self.draft_len_schedule is not None:
+                # Stage 2: Pad to current (dynamic) max_draft_tokens
+                # This is the draft length for the current batch size
+                target_len = self.max_draft_tokens
+            else:
+                # Stage 1: Pad to static max_draft_tokens
+                target_len = self._static_max_draft_tokens
+
+            # Pad if needed
+            if num_draft_tokens < target_len:
+                req.py_draft_tokens.extend(
+                    0 for _ in range(target_len - num_draft_tokens))
 
     def run_drafter_post(
         self,
@@ -134,11 +153,18 @@ class Drafter(ABC):
 
     def update_max_draft_tokens(self, new_max_draft_tokens: int) -> None:
         """
-        Used when draft_len_schedule is provided in spec_config (dynamic draft length based on runtime batch size is enabled)
-        Update max_draft_tokens in drafter and propagate to any dependent components.
+        Update the dynamic max_draft_tokens based on current batch size.
+
+        Used when draft_len_schedule is provided in spec_config (dynamic draft length
+        based on runtime batch size is enabled). This updates the drafter's max_draft_tokens
+        which determines how many draft tokens to generate and pad to.
+
+        Note: This is the DYNAMIC value that changes per iteration. The STATIC maximum
+        is stored in _static_max_draft_tokens and never changes.
+
         Subclasses can override to propagate to their resource managers if needed.
 
         Args:
-            new_max_draft_tokens: The new max draft tokens
+            new_max_draft_tokens: The new max draft tokens for the current batch size
         """
         self.max_draft_tokens = new_max_draft_tokens
