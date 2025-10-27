@@ -639,16 +639,20 @@ class PyTorchModelEngine(ModelEngine):
         Returns:
             Set of (batch_size, draft_len) tuples
         """
-        from ..speculative.drafter import Drafter
-
         graphs_needed = set()
         schedule = self.spec_config.draft_len_schedule
 
         # For each possible actual batch size
         for actual_bs in range(1, self.batch_size + 1):
             # Determine draft_len for this actual batch size using same logic as drafter
-            draft_len = Drafter.get_draft_len_for_batch_size.__func__(
-                None, actual_bs, schedule)
+            # Use bisect_right to find the largest threshold <= actual_bs
+            from bisect import bisect_right
+            thresholds = list(schedule.keys())
+            idx = bisect_right(thresholds, actual_bs)
+            if idx == 0:
+                draft_len = 0  # Defensive - shouldn't happen with valid schedules
+            else:
+                draft_len = schedule[thresholds[idx - 1]]
 
             # Determine padded batch size
             padded_bs = self._round_up_to_graph_size(actual_bs)
