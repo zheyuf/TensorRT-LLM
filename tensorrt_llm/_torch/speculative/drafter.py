@@ -68,16 +68,24 @@ class Drafter(ABC):
     def pad_draft_tokens_for_cuda_graph(
             self, scheduled_requests: ScheduledRequests) -> None:
         """
-        Pad draft tokens to the static max total draft tokens for CUDA graph compatibility.
+        Pad draft tokens for CUDA graph compatibility.
+        CUDA graphs require all requests in a batch to have the same tensor shape.
+        Individual requests may generate fewer draft tokens (e.g., NGram mismatches,
+        early stopping), but all must be padded to the same length.
 
         Args:
             scheduled_requests: The scheduled requests to pad
         """
         for req in scheduled_requests.generation_requests:
             num_draft_tokens = get_draft_token_length(req)
-            req.py_draft_tokens.extend(
-                0 for _ in range(self._static_max_total_draft_tokens -
-                                 num_draft_tokens))
+            if self.draft_len_schedule is not None:
+                # Pad to current iteration's (dynamic) max_draft_tokens if dynamic draft length is enabled
+                target_len = self.max_total_draft_tokens
+            else:
+                target_len = self._static_max_total_draft_tokens
+            if num_draft_tokens < target_len:
+                req.py_draft_tokens.extend(
+                    0 for _ in range(target_len - num_draft_tokens))
 
     def get_draft_len_for_batch_size(self, batch_size: int) -> int:
         """

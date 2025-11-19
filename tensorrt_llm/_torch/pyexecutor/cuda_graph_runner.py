@@ -99,7 +99,8 @@ class CUDAGraphRunner:
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
-        self.padding_dummy_request: Optional["Request"] = None
+        self.padding_dummy_requests: Dict[int, "Request"] = {
+        }  # draft_len -> dummy_request
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
         if self.enabled:
@@ -166,6 +167,7 @@ class CUDAGraphRunner:
         batch: ScheduledRequests,
         iter_counter: int,
         enable_spec_decode: bool,
+        runtime_draft_len: int,
         attn_metadata: Any,
         spec_metadata: Optional[Any] = None,
         draft_tokens_cuda: Optional[torch.Tensor] = None,
@@ -372,26 +374,31 @@ class CUDAGraphRunner:
         # No padding if it would create too many concurrent requests.
         # This is not strictly required, but we should probably
         # respect the requirement just in case that changes in the future.
-        if self.padding_dummy_request is None:
+        if runtime_draft_len not in self.padding_dummies:
             available_blocks = kv_cache_manager.get_num_free_blocks()
             # No padding if not enough KV cache space
             if available_blocks < 1:
                 return 0
-
-            self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
-                [CUDA_GRAPH_DUMMY_REQUEST_ID],
+            # Create dummy for this specific draft_len (happens once per unique draft_len)
+            # Use unique request ID per draft_len to avoid conflicts
+            dummy_req_id = CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len
+            dummy = kv_cache_manager.add_dummy_requests(
+                [dummy_req_id],
                 is_gen=True,
                 max_num_draft_tokens=runtime_draft_len,
                 use_mrope=self.config.use_mrope,
                 max_beam_width=self.config.max_beam_width)[0]
-            self.padding_dummy_request.is_cuda_graph_dummy = True
+            dummy.is_cuda_graph_dummy = True
             spec_res_mgr = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_res_mgr:
-                spec_res_mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
+                spec_res_mgr.add_dummy_requests([dummy_req_id])
 
-        batch.generation_requests.extend([self.padding_dummy_request] *
-                                         padding_size)
+            # Store for reuse
+            self.padding_dummies[runtime_draft_len] = dummy
+
+        padding_dummy = self.padding_dummies[runtime_draft_len]
+        batch.generation_requests.extend([padding_dummy] * padding_size)
         return padding_size
 
     def _round_up_batch_size(self, batch_size: int) -> int:
@@ -426,7 +433,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
-        self.padding_dummy_request = None
+        self.padding_dummies.clear()
         del self.memory_pool
         self.memory_pool = None
         torch.cuda.empty_cache()
