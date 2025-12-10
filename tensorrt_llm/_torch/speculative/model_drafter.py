@@ -35,7 +35,8 @@ def get_draft_model_prompt(spec_dec_mode: SpeculativeDecodingMode,
     before drafting.
     """
     draft_input_tokens = request.get_tokens(0)
-    if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
+    if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle(
+    ) or spec_dec_mode.is_eagle_ngram():
         # EAGLE3 always throws away the first token when processing draft inputs
         if not disable_overlap_scheduler:
             # Add a fake golden token here since the real one has not been generated.
@@ -203,7 +204,8 @@ class ModelDrafter(Drafter):
                                               self.disable_overlap_scheduler)
 
         is_eagle_style = self.spec_config.spec_dec_mode.is_eagle3(
-        ) or self.spec_config.spec_dec_mode.is_mtp_eagle()
+        ) or self.spec_config.spec_dec_mode.is_mtp_eagle(
+        ) or self.spec_config.spec_dec_mode.is_eagle_ngram()
 
         # First time seeing this request - context request
         num_overlap_tokens = 0 if self.disable_overlap_scheduler else 1

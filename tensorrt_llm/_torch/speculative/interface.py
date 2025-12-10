@@ -43,6 +43,8 @@ class SpeculativeDecodingMode(IntEnum):
     DRAFT_TARGET = auto()
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
+    EAGLE_NGRAM = auto(
+    )  # Eagle + N-gram (Eagle for thinking, N-gram for generation)
     NONE = auto()
     AUTO = auto()
 
@@ -82,6 +84,9 @@ class SpeculativeDecodingMode(IntEnum):
     def is_save_hidden_states(self):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
+    def is_eagle_ngram(self):
+        return self == SpeculativeDecodingMode.EAGLE_NGRAM
+
     def without_logits(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model()
 
@@ -100,7 +105,8 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp_one_model() or self.is_eagle3_one_model()
 
     def has_draft_model(self):
-        return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
+        return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle(
+        ) or self.is_eagle_ngram()
 
     def needs_kv_cache_recompute(self):
         """
@@ -108,7 +114,7 @@ class SpeculativeDecodingMode(IntEnum):
         If true, the 1st draft model forward will recompute the kv cache for
         the accepted draft tokens.
         """
-        return self.is_eagle3() or self.is_mtp_eagle()
+        return self.is_eagle3() or self.is_mtp_eagle() or self.is_eagle_ngram()
 
     def need_load_draft_weights(self):
         """
@@ -122,9 +128,9 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_eagle3_one_model()
 
     def has_spec_drafter(self):
-        return self.is_eagle3(
-        ) or self.is_draft_target() or self.is_ngram() or self.is_user_provided(
-        ) or self.is_mtp_eagle() or self.is_save_hidden_states()
+        return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
+        ) or self.is_user_provided() or self.is_mtp_eagle(
+        ) or self.is_save_hidden_states() or self.is_eagle_ngram()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """

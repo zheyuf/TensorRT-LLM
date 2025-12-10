@@ -964,6 +964,87 @@ class NGramDecodingConfig(DecodingBaseConfig):
         return backend == "pytorch"
 
 
+class EagleNgramDecodingConfig(DecodingBaseConfig):
+    # Composed configs - use composition pattern for easier maintenance
+    # These are required and must be provided when creating EagleNgramDecodingConfig
+    eagle_config: EagleDecodingConfig = None
+    ngram_config: NGramDecodingConfig = None
+
+    # Phase detection config (EagleNgram-specific)
+    generation_start_token_ids: Optional[List[int]] = None
+    model_type: str = "gptoss"  # "gptoss" or "deepseek"
+
+    def __init__(self,
+                 eagle_config: EagleDecodingConfig,
+                 ngram_config: NGramDecodingConfig,
+                 generation_start_token_ids: Optional[List[int]] = None,
+                 model_type: str = "gptoss",
+                 **kwargs):
+        super().__init__(**kwargs)
+
+        self.eagle_config = eagle_config
+        self.ngram_config = ngram_config
+        self.generation_start_token_ids = generation_start_token_ids
+        self.model_type = model_type
+
+        # # EAGLE_NGRAM always uses a separate draft model engine, not one-model mode
+        # # Force eagle3_one_model=False regardless of what user passed
+        # self.eagle_config.eagle3_one_model = False
+
+        # Inherit speculative_model_dir from eagle_config
+        if self.speculative_model_dir is None and eagle_config.speculative_model_dir is not None:
+            self.speculative_model_dir = eagle_config.speculative_model_dir
+
+        # Set max_draft_len to the larger of the two for resource allocation
+        self.max_draft_len = max(self.eagle_config.max_draft_len,
+                                 self.ngram_config.max_draft_len)
+        self.max_total_draft_tokens = self.max_draft_len
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "Eagle_Ngram"
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.EAGLE_NGRAM
+
+    @functools.cached_property
+    def num_capture_layers(self) -> int:
+        """
+        Returns the number of layers to capture of the target model.
+        Delegates to eagle_config for consistency.
+        """
+        return self.eagle_config.num_capture_layers
+
+    # # Convenience properties for backward compatibility and easy access
+    # @property
+    # def eagle3_one_model(self) -> bool:
+    #     return self.eagle_config.eagle3_one_model
+
+    # @property
+    # def eagle3_layers_to_capture(self) -> Optional[Set[int]]:
+    #     return self.eagle_config.eagle3_layers_to_capture
+
+    # @property
+    # def num_eagle_layers(self) -> Optional[int]:
+    #     return self.eagle_config.num_eagle_layers
+
+    # @property
+    # def eagle_choices(self) -> Optional[List[List[int]]]:
+    #     return self.eagle_config.eagle_choices
+
+    # @property
+    # def use_dynamic_tree(self) -> bool:
+    #     return self.eagle_config.use_dynamic_tree
+
+
 class DraftTargetDecodingConfig(DecodingBaseConfig):
 
     def __init__(self, **kwargs):
@@ -1416,6 +1497,7 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
 SpeculativeConfig: TypeAlias = Optional[Union[
     DraftTargetDecodingConfig,
     EagleDecodingConfig,
+    EagleNgramDecodingConfig,
     LookaheadDecodingConfig,
     MedusaDecodingConfig,
     MTPDecodingConfig,
@@ -2790,6 +2872,10 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified."
             elif isinstance(self.speculative_config, NGramDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0 and self.speculative_config.max_matching_ngram_size > 0
+            elif isinstance(self.speculative_config, EagleNgramDecodingConfig):
+                assert self.speculative_config.eagle_config.max_draft_len > 0
+                assert self.speculative_config.ngram_config.max_draft_len > 0
+                assert self.speculative_config.speculative_model_dir is not None, "Path to EAGLE3 weights must be specified for EagleNgram mode."
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model_dir is not None, "Path to draft model must be specified."

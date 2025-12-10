@@ -349,7 +349,11 @@ def create_py_executor(
     if has_draft_model_engine:
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT,
                               RestoreMode.PINNED):
-            draft_spec_config = copy.copy(spec_config)
+            # For EAGLE_NGRAM mode, use the composed eagle_config for the draft model
+            if spec_config.spec_dec_mode.is_eagle_ngram():
+                draft_spec_config = copy.copy(spec_config.eagle_config)
+            else:
+                draft_spec_config = copy.copy(spec_config)
 
             use_chain_drafter = (
                 guided_decoding_config is None

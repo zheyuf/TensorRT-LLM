@@ -3,6 +3,8 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
@@ -10,6 +12,7 @@ from ..speculative.interface import SpecMetadata
 from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
+from .eagle_ngram_drafter import EagleNgramDrafter
 from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
@@ -23,6 +26,11 @@ def get_spec_metadata(spec_config,
                       max_num_tokens,
                       spec_resource_manager=None,
                       is_draft_model=False):
+    # Debug: trace which path is taken
+    logger.warning(
+        f"[SPEC_METADATA_DEBUG] get_spec_metadata called: is_draft_model={is_draft_model}, spec_dec_mode={spec_config.spec_dec_mode}, num_hidden_layers={model_config.num_hidden_layers}"
+    )
+
     if spec_config.spec_dec_mode.is_mtp_one_model():
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -48,6 +56,9 @@ def get_spec_metadata(spec_config,
             is_mtp_eagle=True,
         )
     if spec_config.spec_dec_mode.is_eagle3():
+        logger.warning(
+            f"[SPEC_METADATA_DEBUG] Creating Eagle3SpecMetadata for EAGLE3: is_draft_model={is_draft_model}, num_layers={model_config.num_hidden_layers}"
+        )
         return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.max_total_draft_tokens,
@@ -105,6 +116,33 @@ def get_spec_metadata(spec_config,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
         )
+    if spec_config.spec_dec_mode.is_eagle_ngram():
+        # Eagle+Ngram mode uses Eagle3SpecMetadata for the Eagle component
+        # Must include all Eagle3-specific fields for proper operation
+        # Access Eagle-specific fields from the composed eagle_config
+        eagle_config = spec_config.eagle_config
+        logger.warning(
+            f"[SPEC_METADATA_DEBUG] Creating Eagle3SpecMetadata for EAGLE_NGRAM: is_draft_model={is_draft_model}, num_layers={model_config.num_hidden_layers}"
+        )
+        return Eagle3SpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            num_layers=model_config.num_hidden_layers,
+            hidden_size=model_config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            dtype=model_config.torch_dtype,
+            is_draft_model=is_draft_model,
+            eagle3_resource_manager=spec_resource_manager,
+            layers_to_capture=eagle_config.eagle3_layers_to_capture,
+            is_mtp_eagle=False,
+            eagle_choices=eagle_config.eagle_choices,
+            is_spec_dec_tree=eagle_config.eagle_choices is not None
+            or eagle_config.use_dynamic_tree,
+            is_spec_dec_dynamic_tree=eagle_config.use_dynamic_tree,
+        )
+
     return None
 
 
@@ -155,6 +193,17 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         )
     if spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)
+    if spec_dec_mode.is_eagle_ngram():
+        # Eagle+Ngram mode uses Eagle3ResourceManager for the Eagle drafter
+        assert draft_model_engine is not None, "Draft model engine is required for Eagle+Ngram mode."
+        return Eagle3ResourceManager(
+            spec_config,
+            draft_model_engine.model.config.torch_dtype,
+            model_config.hidden_size,
+            max_num_requests,
+            max_seq_len,
+            max_num_tokens,
+        )
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
     return None
@@ -166,7 +215,8 @@ def get_spec_decoder(sampler_args: TorchSampler.Args,
         return MTPSampler(sampler_args,
                           nextn=spec_config.num_nextn_predict_layers)
     if spec_config.spec_dec_mode.is_eagle3(
-    ) or spec_config.spec_dec_mode.is_mtp_eagle():
+    ) or spec_config.spec_dec_mode.is_mtp_eagle(
+    ) or spec_config.spec_dec_mode.is_eagle_ngram():
         # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process
         return TorchSampler(sampler_args)
     if spec_config.spec_dec_mode.is_eagle3_one_model():
@@ -205,6 +255,11 @@ def get_spec_drafter(model_engine,
 
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesDrafter(spec_config, spec_resource_manager)
+
+    if spec_config.spec_dec_mode.is_eagle_ngram():
+        return _create_eagle_ngram_drafter(spec_config, draft_model_engine,
+                                           sampler, spec_resource_manager,
+                                           max_num_requests, guided_decoder)
 
     return None
 
@@ -262,3 +317,62 @@ class SpecDecodingTensor:
     position_offsets: torch.Tensor
     packed_mask: torch.Tensor
     generation_lengths: Optional[torch.Tensor] = None
+
+
+def _create_eagle_ngram_drafter(
+    spec_config,
+    draft_model_engine,
+    sampler,
+    spec_resource_manager,
+    max_num_requests: int,
+    guided_decoder: Optional[GuidedDecoder] = None,
+):
+    """
+    Create an EagleNgramDrafter that uses Eagle for thinking phase and N-gram for generation phase.
+
+    Args:
+        spec_config: EagleNgramDecodingConfig (uses composition with eagle_config and ngram_config)
+        draft_model_engine: Draft model engine for Eagle
+        sampler: Sampler for Eagle drafter
+        spec_resource_manager: Resource manager (Eagle3ResourceManager)
+        max_num_requests: Maximum number of concurrent requests
+        guided_decoder: Optional guided decoder
+
+    Returns:
+        EagleNgramDrafter instance
+    """
+    # Get the composed configs
+    eagle_config = spec_config.eagle_config
+    ngram_config = spec_config.ngram_config
+
+    # Create Eagle drafter using the embedded eagle_config
+    eagle_drafter = ModelDrafter(
+        eagle_config,  # Pass full config for compatibility
+        draft_model_engine,
+        eagle_config.max_draft_len,
+        eagle_config.max_total_draft_tokens,
+        SeqSlotManager(max_num_requests),
+        sampler,
+        spec_resource_manager=spec_resource_manager,
+        guided_decoder=guided_decoder)
+
+    # Create N-gram pool manager using the embedded ngram_config
+    ngram_pool_manager = NGramPoolManager(ngram_config, max_num_requests)
+
+    # Create N-gram drafter using the embedded ngram_config
+    ngram_drafter = NGramDrafter(ngram_config, ngram_pool_manager)
+
+    # Get generation start token IDs
+    generation_start_token_ids = spec_config.generation_start_token_ids
+    if generation_start_token_ids is None:
+        # Use default based on model type
+        # These will need to be set by the user or detected from tokenizer
+        generation_start_token_ids = []
+
+    # Create Eagle+Ngram drafter
+    return EagleNgramDrafter(
+        spec_config=spec_config,
+        eagle_drafter=eagle_drafter,
+        ngram_drafter=ngram_drafter,
+        generation_start_token_ids=generation_start_token_ids,
+    )
