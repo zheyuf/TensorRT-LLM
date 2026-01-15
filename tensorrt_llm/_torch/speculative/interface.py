@@ -109,6 +109,9 @@ class SpeculativeDecodingMode(IntEnum):
     def support_capturable_guided_decoder(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model()
 
+    def support_dynamic_draft_len(self):
+        return self.is_mtp_one_model() or self.is_eagle3_one_model()
+
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
 
@@ -241,6 +244,12 @@ class SpecMetadata:
     is_spec_dec_tree: bool = False
     # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
+
+    # Dynamic draft length support for one-model path.
+    # This is set by the executor/model_engine BEFORE forward based on batch size,
+    # and read by the spec_worker to determine how many draft iterations to run.
+    # None means "use max_draft_len" (default/unset).
+    effective_draft_len: Optional[int] = None
 
     # For non-greedy sampling on 1-model.
     allow_advanced_sampling: bool = False

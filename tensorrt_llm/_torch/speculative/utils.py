@@ -1,5 +1,6 @@
+from bisect import bisect_left
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -263,3 +264,79 @@ class SpecDecodingTensor:
     position_offsets: torch.Tensor
     packed_mask: torch.Tensor
     generation_lengths: Optional[torch.Tensor] = None
+
+
+def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
+                                 batch_size: int, max_draft_len: int) -> int:
+    """
+    Get the appropriate draft length for the given batch size using binary search.
+
+    This is a standalone function that can be used by both the drafter (two-model path)
+    and the model engine / spec workers (one-model path).
+
+    New semantics: Keys represent specific batch sizes (transition points).
+    Values represent draft_len to use for batch sizes UP TO that key.
+
+    Args:
+        draft_len_schedule: Mapping from batch size thresholds to draft lengths.
+                            Example: {4: 4, 8: 2, 32: 1} means:
+                            - batch size 1-4:   use draft_len=4 (up to key 4)
+                            - batch size 5-8:   use draft_len=2 (up to key 8)
+                            - batch size 9-32:  use draft_len=1 (up to key 32)
+                            - batch size 33+:   use draft_len=0 (speculation disabled, implicit)
+        batch_size: Current batch size.
+        max_draft_len: Maximum draft length to use if no schedule is provided.
+
+    Returns:
+        The draft length to use for this batch size.
+    """
+    if draft_len_schedule is None:
+        return max_draft_len
+
+    # Binary search to find the first threshold >= batch_size
+    # draft_len_schedule is already sorted by config validator
+    schedule_batch_sizes = list(draft_len_schedule.keys())
+
+    # bisect_left finds where to insert batch_size to keep list sorted
+    # This gives us the index of the first key >= batch_size
+    idx = bisect_left(schedule_batch_sizes, batch_size)
+
+    if idx < len(schedule_batch_sizes):
+        return draft_len_schedule[schedule_batch_sizes[idx]]
+
+    # batch_size > all batch sizes in draft_len_schedule: speculation disabled (implicit)
+    return 0
+
+
+def get_cuda_graph_batch_size_draft_len_pairs(draft_len_schedule: Dict[int,
+                                                                       int],
+                                              cuda_graph_batch_sizes: list,
+                                              max_draft_len: int) -> list:
+    """
+    Generate the list of (batch_size, draft_len) pairs to capture for CUDA graphs.
+
+    Following the two-model path design, we only capture the specific (batch_size, draft_len)
+    pairs defined by the schedule, rather than the full Cartesian product.
+
+    Example:
+        cuda_graph_batch_sizes = [1,2,3,4,5,6,7,8,16,24,32,64], max_draft_len = 4
+        draft_len_schedule = {4:4, 8:2, 32:1, 64:0}
+        Returns: [(1,4),(2,4),(3,4),(4,4),(5,2),(6,2),(7,2),(8,2),(16,1),(24,1),(32,1),(64,0)]
+
+    Args:
+        draft_len_schedule: Mapping from batch size thresholds to draft lengths.
+        cuda_graph_batch_sizes: List of batch sizes to capture CUDA graphs for.
+        max_draft_len: Maximum draft length (used when schedule is None).
+
+    Returns:
+        List of (batch_size, draft_len) tuples to capture.
+    """
+    if draft_len_schedule is None:
+        # Legacy behavior: capture all batch sizes with max_draft_len
+        return [(bs, max_draft_len) for bs in cuda_graph_batch_sizes]
+
+    pairs = []
+    for bs in cuda_graph_batch_sizes:
+        dl = get_draft_len_for_batch_size(draft_len_schedule, bs, max_draft_len)
+        pairs.append((bs, dl))
+    return pairs
