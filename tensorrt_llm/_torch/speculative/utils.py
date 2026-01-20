@@ -306,37 +306,3 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
 
     # batch_size > all batch sizes in draft_len_schedule: speculation disabled (implicit)
     return 0
-
-
-def get_cuda_graph_batch_size_draft_len_pairs(draft_len_schedule: Dict[int,
-                                                                       int],
-                                              cuda_graph_batch_sizes: list,
-                                              max_draft_len: int) -> list:
-    """
-    Generate the list of (batch_size, draft_len) pairs to capture for CUDA graphs.
-
-    Following the two-model path design, we only capture the specific (batch_size, draft_len)
-    pairs defined by the schedule, rather than the full Cartesian product.
-
-    Example:
-        cuda_graph_batch_sizes = [1,2,3,4,5,6,7,8,16,24,32,64], max_draft_len = 4
-        draft_len_schedule = {4:4, 8:2, 32:1, 64:0}
-        Returns: [(1,4),(2,4),(3,4),(4,4),(5,2),(6,2),(7,2),(8,2),(16,1),(24,1),(32,1),(64,0)]
-
-    Args:
-        draft_len_schedule: Mapping from batch size thresholds to draft lengths.
-        cuda_graph_batch_sizes: List of batch sizes to capture CUDA graphs for.
-        max_draft_len: Maximum draft length (used when schedule is None).
-
-    Returns:
-        List of (batch_size, draft_len) tuples to capture.
-    """
-    if draft_len_schedule is None:
-        # Legacy behavior: capture all batch sizes with max_draft_len
-        return [(bs, max_draft_len) for bs in cuda_graph_batch_sizes]
-
-    pairs = []
-    for bs in cuda_graph_batch_sizes:
-        dl = get_draft_len_for_batch_size(draft_len_schedule, bs, max_draft_len)
-        pairs.append((bs, dl))
-    return pairs

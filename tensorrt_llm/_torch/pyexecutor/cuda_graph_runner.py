@@ -437,9 +437,6 @@ class CUDAGraphRunner:
 
         if batch_size == padded_batch_size:
             return 0
-        if padded_batch_size == 0:
-            # No suitable graph found
-            return 0
 
         padding_size = padded_batch_size - batch_size
         if padding_size + batch.batch_size > self.config.batch_size:
@@ -490,14 +487,7 @@ class CUDAGraphRunner:
 
     def _round_up_batch_size_with_draft_len(self, batch_size: int,
                                             draft_len: int) -> int:
-        """Finds the smallest graph batch size >= batch_size that also matches the given draft_len.
-
-        For dynamic draft length, we need to find a batch size that:
-        1. Is >= the current batch size
-        2. Has a graph captured with the matching draft_len
-
-        Uses the dynamic_draft_len_mapping to find valid (batch_size, draft_len) pairs.
-        """
+        """Finds the smallest graph batch size >= batch_size that also matches the given draft_len."""
         if not self.dynamic_draft_len_mapping:
             # Fallback to regular round up if no mapping
             return self._round_up_batch_size(batch_size)

@@ -367,92 +367,18 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
-    def get_effective_draft_len(
-            self, spec_metadata: Eagle3OneModelSpecMetadata) -> int:
-        """
-        Get the effective draft length for this forward pass.
-
-        The effective draft length is determined by:
-        1. spec_metadata.effective_draft_len if set (not None)
-        2. Otherwise, use max_draft_len
-
-        Args:
-            spec_metadata: The speculative decoding metadata
-
-        Returns:
-            The number of draft iterations to run
-        """
-        if spec_metadata.effective_draft_len is not None:
-            return spec_metadata.effective_draft_len
-        return self.max_draft_len
-
-    def skip_forward(
-        self,
-        input_ids,
-        position_ids,
-        hidden_states,
-        logits,
-        attn_metadata,
-        spec_metadata,
-        draft_model,
-    ):
-        """
-        When effective_draft_len == 0, skip draft iterations but still sample from target model.
-        Used when speculation is disabled (e.g., large batch size).
-        """
-        batch_size = attn_metadata.num_seqs
-        num_contexts = attn_metadata.num_contexts
-        max_draft_len = self.max_draft_len
-
-        if self.guided_decoder is not None:
-            self.guided_decoder.execute(logits)
-
-        # When draft_len=0, all requests should have empty draft_tokens
-        # Just sample from target model, no verification needed
-        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
-                                                      num_contexts, batch_size)
-
-        # Create accepted_tokens with only target tokens (no drafts accepted)
-        accepted_tokens = torch.zeros((batch_size, (max_draft_len + 1)),
-                                      dtype=torch.int,
-                                      device=logits.device)
-        accepted_tokens[:, 0] = target_tokens
-
-        num_accepted_tokens = torch.ones(batch_size,
-                                         dtype=torch.int,
-                                         device=logits.device)
-
-        # No draft tokens generated (all zeros)
-        next_draft_tokens = torch.zeros((batch_size, max_draft_len),
-                                        dtype=torch.int,
-                                        device=logits.device)
-
-        # Next iteration input: only the accepted target token
-        next_new_tokens = torch.zeros((batch_size, (max_draft_len + 1)),
-                                      dtype=torch.int,
-                                      device=logits.device)
-        next_new_tokens[:, 0] = target_tokens
-
-        return {
-            'logits': logits,
-            'new_tokens': accepted_tokens,
-            'new_tokens_lens': num_accepted_tokens,
-            'next_draft_tokens': next_draft_tokens,
-            'next_new_tokens': next_new_tokens
-        }
-
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
     def forward(self, input_ids, position_ids, hidden_states, logits,
                 attn_metadata, spec_metadata, draft_model):
-        # Get the effective draft length for this forward pass (supports dynamic draft length)
-        effective_draft_len = self.get_effective_draft_len(spec_metadata)
 
-        # If effective_draft_len is 0, skip the draft forward entirely
+        # override the draft length if dynamic draft length is enabled
+        effective_draft_len = spec_metadata.effective_draft_len if spec_metadata.effective_draft_len is not None else self.max_draft_len
+        # skip the draft forward if the effective draft length is 0
         if effective_draft_len == 0:
-            return self.skip_forward(input_ids, position_ids, hidden_states,
-                                     logits, attn_metadata, spec_metadata,
-                                     draft_model)
+            return self.skip_drafting(input_ids, position_ids, hidden_states,
+                                      logits, attn_metadata, spec_metadata,
+                                      draft_model)
 
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
