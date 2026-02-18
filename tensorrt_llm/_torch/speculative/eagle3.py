@@ -427,7 +427,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             resource_manager)
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            for i in range(self.max_draft_len):
+            for i in range(runtime_draft_len):
                 if i == 0:
                     start_ids_gen = (
                         spec_metadata.batch_indices_cuda[:num_gens] *

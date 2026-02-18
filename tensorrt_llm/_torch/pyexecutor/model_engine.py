@@ -1061,7 +1061,7 @@ class PyTorchModelEngine(ModelEngine):
 
         available_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=num_tokens,
-            max_num_draft_tokens=self.self.original_max_draft_len)
+            max_num_draft_tokens=self.max_total_draft_tokens)
         available_blocks = kv_cache_manager.get_num_free_blocks()
         if num_tokens > self.max_num_tokens or num_tokens > available_tokens:
             return None
