@@ -333,9 +333,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                      pin_memory=True)
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
-        runtime_draft_len = (self.runtime_draft_len if self.runtime_draft_len
-                             is not None else self.max_draft_len)
-        self.num_tokens -= (self.num_generations) * runtime_draft_len
+        self.num_tokens -= (self.num_generations) * self.runtime_draft_len
 
     def maybe_capture_hidden_states(
             self,
@@ -385,8 +383,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 draft_model,
                 resource_manager=None):
 
-        # override the draft length if dynamic draft length is enabled
-        runtime_draft_len = spec_metadata.runtime_draft_len if spec_metadata.runtime_draft_len is not None else self.max_draft_len
+        runtime_draft_len = spec_metadata.runtime_draft_len
         # skip the draft forward if the runtime draft length is 0
         if runtime_draft_len == 0:
             return self.skip_drafting(input_ids, position_ids, hidden_states,
@@ -539,11 +536,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        runtime_draft_len = (spec_metadata.runtime_draft_len
-                             if spec_metadata.runtime_draft_len is not None else
-                             self.max_draft_len)
         draft_tokens = spec_metadata.draft_tokens.reshape(
-            num_gens, runtime_draft_len)
+            num_gens, spec_metadata.runtime_draft_len)
         return self._sample_and_accept_draft_tokens_base(
             logits, draft_tokens, num_contexts, batch_size, spec_metadata)
 
@@ -600,11 +594,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             accepted_tokens, num_contexts)
 
         # generation
-        runtime_draft_len = (spec_metadata.runtime_draft_len
-                             if spec_metadata.runtime_draft_len is not None else
-                             self.max_draft_len)
-        input_ids_gen = accepted_tokens[num_contexts:, :runtime_draft_len +
-                                        1].flatten()
+        input_ids_gen = accepted_tokens[
+            num_contexts:, :spec_metadata.runtime_draft_len + 1].flatten()
 
         # get draft inputs
         input_ids = torch.concat([input_ids_ctx, input_ids_gen], dim=0)

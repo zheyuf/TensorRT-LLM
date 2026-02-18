@@ -258,10 +258,11 @@ class SpecMetadata:
     # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
 
-    # If dynamic draft length is enabled(draft_len_schedule being set in spec_config)
-    # runtime_draft_len will be set at each iteration based on the batch size.
-    # If dynamic draft length is disabled, runtime_draft_len will always be None.
-    runtime_draft_len: Optional[int] = None
+    # The draft length used for the current iteration.
+    # With dynamic draft length enabled, this varies per batch based on
+    # draft_len_schedule.  Otherwise it equals max_draft_len (the static max).
+    # Always set by model_engine.forward() before any downstream code reads it.
+    runtime_draft_len: int = 0
 
     # For non-greedy sampling on 1-model.
     allow_advanced_sampling: bool = False
@@ -332,8 +333,6 @@ class SpecMetadata:
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
         DISABLE_TOPP_VAL = 1.0
 
-        runtime_draft_len = (self.runtime_draft_len if self.runtime_draft_len
-                             is not None else self.max_draft_len)
         for request in requests:
             sampling_config = request.sampling_config
             temp = sampling_config.temperature
@@ -346,7 +345,7 @@ class SpecMetadata:
             tp_val = tp[0] if tp is not None and len(tp) > 0 else None
 
             # Context requests have no draft tokens yet.
-            num_tokens = 1 + runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+            num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
 
             is_greedy = SamplingParams.params_imply_greedy_decoding(
                 temperature=temp_val,
@@ -530,12 +529,9 @@ class SpecWorkerBase(nn.Module, ABC):
             For Eagle3OneModelWorker, self.max_draft_len equals spec_config.max_draft_len.
         """
         if self.force_num_accepted_tokens != 0:
-            runtime_draft_len = (spec_metadata.runtime_draft_len
-                                 if spec_metadata.runtime_draft_len is not None
-                                 else self.max_draft_len)
             # total tokens per iteration = accepted draft tokens + 1 target token
             force_total_tokens = min(self.force_num_accepted_tokens + 1,
-                                     runtime_draft_len + 1)
+                                     spec_metadata.runtime_draft_len + 1)
             num_accepted_tokens[num_contexts:] = force_total_tokens
         return num_accepted_tokens
 
@@ -565,9 +561,7 @@ class SpecWorkerBase(nn.Module, ABC):
             accepted_tokens: [batch_size, runtime_draft_len + 1] - Accepted tokens (padded)
             num_accepted_tokens: [batch_size] - Number of accepted tokens per request
         """
-        runtime_draft_len = (spec_metadata.runtime_draft_len
-                             if spec_metadata.runtime_draft_len is not None else
-                             self.max_draft_len)
+        runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
 
         if logits.dim() == 1:
@@ -750,10 +744,8 @@ class SpecWorkerBase(nn.Module, ABC):
             from .one_model_sampler import sampling_batch_spec_dec_one_model
 
             num_gens = batch_size - num_contexts
-            runtime_draft_len = (spec_metadata.runtime_draft_len
-                                 if spec_metadata.runtime_draft_len is not None
-                                 else self.max_draft_len)
-            num_tokens = num_contexts + num_gens * (runtime_draft_len + 1)
+            num_tokens = num_contexts + num_gens * (
+                spec_metadata.runtime_draft_len + 1)
 
             temperatures = spec_metadata.temperatures[:num_tokens]
             top_ks = spec_metadata.top_ks[:num_tokens]

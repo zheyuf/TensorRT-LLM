@@ -1581,9 +1581,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 # Dynamic draft length needs position offsets and packed mask to be shaped for each runtime draft length.
                 # So we create cache for position offsets and packed mask for each draft length to avoid reallocation.
                 assert max_draft_len == max_total_draft_tokens, "max_draft_len should be equal to max_total_draft_tokens for linear tree"
-                runtime_draft_len = getattr(spec_metadata, 'runtime_draft_len',
-                                            None)
-                runtime_draft_len = max_draft_len if runtime_draft_len is None else runtime_draft_len
+                runtime_draft_len = spec_metadata.runtime_draft_len
                 self.generate_spec_decoding_generation_length(
                     runtime_draft_len=runtime_draft_len)
                 self.spec_decoding_position_offsets = self._position_offsets_for_dynamic_draft_len(
