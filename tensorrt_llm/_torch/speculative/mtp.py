@@ -267,11 +267,13 @@ class MTPSampler(Sampler[SampleStateMTP]):
         )
 
     def _request_common_handling(self, request: LlmRequest,
-                                 next_draft_tokens: list[list[int]]):
+                                 next_draft_tokens: list[list[int]],
+                                 runtime_draft_len: Optional[int]):
         assert not request.py_return_context_logits, "return_context_logits not implemented for MTPSampler"
         assert not request.py_return_generation_logits, "return_generation_logits not implemented for MTPSampler"
         assert not request.py_return_log_probs, "return_log_probs not implemented for MTPSampler"
-        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot]
+        request.py_draft_tokens = next_draft_tokens[
+            request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 
     def update_requests(
@@ -286,6 +288,7 @@ class MTPSampler(Sampler[SampleStateMTP]):
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
+        runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
@@ -294,7 +297,8 @@ class MTPSampler(Sampler[SampleStateMTP]):
                                                new_token,
                                                max_seq_len=self.max_seq_len,
                                                beam_idx=beam_idx)
-            self._request_common_handling(req, next_draft_tokens_list)
+            self._request_common_handling(req, next_draft_tokens_list,
+                                          runtime_draft_len)
 
         for req in state.scheduled_requests.generation_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
@@ -312,22 +316,18 @@ class MTPSampler(Sampler[SampleStateMTP]):
                         beam_idx=beam_idx):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
-            req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
-            self._request_common_handling(req, next_draft_tokens_list)
+            req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
+            self._request_common_handling(req, next_draft_tokens_list,
+                                          runtime_draft_len)
 
     def sample_async(
             self, scheduled_requests: ScheduledRequests,
             outputs: dict[str, torch.Tensor],
             num_context_logits_prefix_sum: list[int]) -> SampleStateMTP:
-        # new_tokens_device: accepted tokens, device tensor, shape: batch_size, nextn + 1
-        # new_tokens_lens_device: accepted lengths, device tensor, shape: batch_size
-        # next_draft_tokens_device: predicted draft tokens, device tensor, shape: batch_size, nextn
-        # next_new_tokens_device: input tokens for the next iteration, device tensor, shape: batch_size, nextn + 1
 
         requests = scheduled_requests.all_requests()
         slots = torch.as_tensor([r.py_seq_slot for r in requests])
         slots = slots.to(device="cuda", non_blocking=True)
-
         o_new_tokens = outputs['new_tokens'][:len(requests)]
         o_new_tokens_lens = outputs['new_tokens_lens'][:len(requests)]
         o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)]
@@ -337,6 +337,21 @@ class MTPSampler(Sampler[SampleStateMTP]):
         next_new_tokens = self.store.next_new_tokens
         new_tokens_lens = self.store.new_tokens_lens
         next_draft_tokens = self.store.next_draft_tokens
+
+        runtime_draft_len = o_next_draft_tokens.shape[1]
+
+        # Pad to match fixed-size store buffers for index_copy_.
+        if o_new_tokens.shape[1] < (self.draft_len + 1):
+            o_new_tokens = torch.nn.functional.pad(
+                o_new_tokens, (0, (self.draft_len + 1) - o_new_tokens.shape[1]))
+        if o_next_draft_tokens.shape[1] < self.draft_len:
+            o_next_draft_tokens = torch.nn.functional.pad(
+                o_next_draft_tokens,
+                (0, self.draft_len - o_next_draft_tokens.shape[1]))
+        if o_next_new_tokens.shape[1] < (self.draft_len + 1):
+            o_next_new_tokens = torch.nn.functional.pad(
+                o_next_new_tokens,
+                (0, (self.draft_len + 1) - o_next_new_tokens.shape[1]))
 
         new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
         next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
@@ -362,7 +377,8 @@ class MTPSampler(Sampler[SampleStateMTP]):
         return SampleStateMTP(scheduled_requests=scheduled_requests,
                               device=device,
                               host=host,
-                              sampler_event=sampler_event)
+                              sampler_event=sampler_event,
+                              runtime_draft_len=runtime_draft_len)
 
 
 class MTPWorker(SpecWorkerBase):
@@ -1217,6 +1233,7 @@ class MTPEagleWorker(MTPWorker):
         draft_model,
         resource_manager=None,
     ):
+
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts

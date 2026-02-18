@@ -1290,6 +1290,9 @@ class PyExecutor:
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
 
+                    runtime_draft_len = self._adjust_py_draft_tokens_for_dynamic_draft_length(
+                        scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     # The generation requests that are do not have batch_idx,
@@ -1322,7 +1325,9 @@ class PyExecutor:
                                 self.guided_decoder.add_batch(scheduled_batch)
                                 self.guided_decoder.init_disagg_gen_requests()
 
-                            batch_outputs = self._forward_step(scheduled_batch)
+                            batch_outputs = self._forward_step(
+                                scheduled_batch,
+                                runtime_draft_len=runtime_draft_len)
 
                             guided_decoder_failed_requests = None
                             if self.guided_decoder is not None:
@@ -1589,6 +1594,43 @@ class PyExecutor:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
 
+    def _adjust_py_draft_tokens_for_dynamic_draft_length(
+            self, scheduled_batch: ScheduledRequests) -> Optional[int]:
+        """
+        Adjust draft token lengths for dynamic draft length feature.
+        Must be called BEFORE prepare_resources to ensure correct KV cache allocation.
+
+        Returns:
+            runtime_draft_len if dynamic draft length is enabled, self.model_engine.max_total_draft_tokens otherwise
+        """
+        if (self.model_engine.spec_config is not None
+                and self.model_engine.spec_config.draft_len_schedule is not None
+                and self.model_engine.spec_config.spec_dec_mode.
+                support_dynamic_draft_len()):
+            from tensorrt_llm._torch.speculative.utils import \
+                get_draft_len_for_batch_size
+            runtime_draft_len = get_draft_len_for_batch_size(
+                self.model_engine.spec_config.draft_len_schedule,
+                scheduled_batch.batch_size,
+                self.model_engine.max_total_draft_tokens)
+
+            PADDING_TOKEN = 0
+
+            for i, request in enumerate(scheduled_batch.generation_requests):
+                current_draft_len = len(request.py_draft_tokens)
+                if current_draft_len < runtime_draft_len:
+                    padding_needed = runtime_draft_len - current_draft_len
+                    request.py_draft_tokens.extend([PADDING_TOKEN] *
+                                                   padding_needed)
+
+                elif current_draft_len > runtime_draft_len:
+                    request.py_draft_tokens = request.py_draft_tokens[:
+                                                                      runtime_draft_len]
+
+            return runtime_draft_len
+
+        return self.model_engine.max_total_draft_tokens
+
     def _can_queue(self, scheduled_batch):
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
@@ -1740,6 +1782,10 @@ class PyExecutor:
 
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
+
+                    runtime_draft_len = self._adjust_py_draft_tokens_for_dynamic_draft_length(
+                        scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     self._kv_connector_start_batch(scheduled_batch)
@@ -1773,7 +1819,8 @@ class PyExecutor:
                             if hasattr(self.drafter, "guided_decoder"):
                                 self.guided_decoder.rollback_draft_tokens()
 
-                    batch_outputs = self._forward_step(scheduled_batch)
+                    batch_outputs = self._forward_step(
+                        scheduled_batch, runtime_draft_len=runtime_draft_len)
 
                     guided_decoder_failed_requests = None
                     if self.guided_decoder is not None:
@@ -1973,6 +2020,9 @@ class PyExecutor:
                             for request in scheduled_batch.all_requests():
                                 request.py_draft_tokens = []
 
+                    runtime_draft_len = self._adjust_py_draft_tokens_for_dynamic_draft_length(
+                        scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     self._kv_connector_start_batch(scheduled_batch)
@@ -2033,7 +2083,7 @@ class PyExecutor:
 
                     batch_outputs = self._forward_step(
                         scheduled_batch, previous_tensors_device,
-                        num_accepted_tokens_device)
+                        num_accepted_tokens_device, runtime_draft_len)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
@@ -2814,11 +2864,11 @@ class PyExecutor:
         self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
         self._check_cache_transfer_errors("generation requests")
 
-    def _forward_step(
-            self,
-            scheduled_requests: ScheduledRequests,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            num_accepted_tokens_device: Optional[torch.Tensor] = None):
+    def _forward_step(self,
+                      scheduled_requests: ScheduledRequests,
+                      new_tensors_device: Optional[SampleStateTensors] = None,
+                      num_accepted_tokens_device: Optional[torch.Tensor] = None,
+                      runtime_draft_len: Optional[int] = None):
         ExpertStatistic.set_iter(self.iter_counter)
 
         @nvtx_range(
@@ -2833,7 +2883,8 @@ class PyExecutor:
                 new_tensors_device,
                 gather_context_logits=gather_context_logits,
                 cache_indirection_buffer=cache_indirection_buffer,
-                num_accepted_tokens_device=num_accepted_tokens_device)
+                num_accepted_tokens_device=num_accepted_tokens_device,
+                runtime_draft_len=runtime_draft_len)
 
         try:
             gather_context_logits = any(
