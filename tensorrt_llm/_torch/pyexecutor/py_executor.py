@@ -1599,11 +1599,11 @@ class PyExecutor:
         uses the correct draft length.
 
         Two things happen here:
-        1. **Resolve** the runtime draft length from the draft_len_schedule
+        1. Determine the runtime draft length from the draft_len_schedule
            based on the current batch size, and store it on model_engine so
            that the rest of the forward path can read it.
-        2. **Pad / truncate** each request's py_draft_tokens to exactly match
-           the resolved length, ensuring uniform draft token counts across the
+        2. Pad / truncate each request's py_draft_tokens to exactly match
+           the determined draft length, ensuring uniform draft token counts across the
            batch (required by CUDA graph replay and the attention kernel).
 
         When dynamic draft length is not enabled, runtime_draft_len is simply

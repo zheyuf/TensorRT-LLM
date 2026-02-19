@@ -511,7 +511,7 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata.on_update()
 
     def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts,
-                                     spec_metadata):
+                                     runtime_draft_len: int):
         """
         Apply forced number of accepted tokens if environment variable is set.
         This is used for testing and debugging.
@@ -519,19 +519,15 @@ class SpecWorkerBase(nn.Module, ABC):
         Args:
             num_accepted_tokens: Tensor of shape [batch_size] with current accepted counts
             num_contexts: Number of context (prefill) requests
-            spec_metadata: Speculative decoding metadata containing runtime_draft_len
+            runtime_draft_len: The draft length for the current iteration.
 
         Returns:
             Modified num_accepted_tokens tensor
-
-        Note:
-            For MTPWorker, self.max_draft_len equals num_nextn_predict_layers (mtp_num_modules).
-            For Eagle3OneModelWorker, self.max_draft_len equals spec_config.max_draft_len.
         """
         if self.force_num_accepted_tokens != 0:
             # total tokens per iteration = accepted draft tokens + 1 target token
             force_total_tokens = min(self.force_num_accepted_tokens + 1,
-                                     spec_metadata.runtime_draft_len + 1)
+                                     runtime_draft_len + 1)
             num_accepted_tokens[num_contexts:] = force_total_tokens
         return num_accepted_tokens
 
@@ -596,7 +592,7 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Apply force override if set
         num_accepted_tokens = self._apply_force_accepted_tokens(
-            num_accepted_tokens, num_contexts, spec_metadata)
+            num_accepted_tokens, num_contexts, runtime_draft_len)
 
         return accepted_tokens, num_accepted_tokens
 

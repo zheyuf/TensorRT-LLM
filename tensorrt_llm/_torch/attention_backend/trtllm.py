@@ -1591,26 +1591,22 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def _position_offsets_for_dynamic_draft_len(self,
                                                 draft_len: int) -> torch.Tensor:
-        """Tensors are cached per draft_len to avoid repeated allocation
-        and to keep stable CUDA pointers for CUDA graph replay."""
-        cache = getattr(self, '_pos_offsets_cache', None)
-        if cache is None:
-            cache = self._pos_offsets_cache = {}
-        if draft_len not in cache:
+        """Tensors are cached per draft_len to avoid repeated allocation"""
+        if not hasattr(self, '_pos_offsets_cache'):
+            self._pos_offsets_cache = {}
+        if draft_len not in self._pos_offsets_cache:
             width = draft_len + 1
             row = torch.arange(width, dtype=torch.int, device='cuda')
-            cache[draft_len] = row.unsqueeze(0).expand(self.max_num_requests,
-                                                       -1).contiguous()
-        return cache[draft_len]
+            self._pos_offsets_cache[draft_len] = row.unsqueeze(0).expand(
+                self.max_num_requests, -1).contiguous()
+        return self._pos_offsets_cache[draft_len]
 
     def _packed_mask_for_dynamic_draft_len(self,
                                            draft_len: int) -> torch.Tensor:
-        """Tensors are cached per draft_len to avoid repeated allocation
-        and to keep stable CUDA pointers for CUDA graph replay."""
-        cache = getattr(self, '_packed_mask_cache', None)
-        if cache is None:
-            cache = self._packed_mask_cache = {}
-        if draft_len not in cache:
+        """Tensors are cached per draft_len to avoid repeated allocation"""
+        if not hasattr(self, '_packed_mask_cache'):
+            self._packed_mask_cache = {}
+        if draft_len not in self._packed_mask_cache:
             width = draft_len + 1
             num_blocks = math.ceil(width / 32)
             mask = torch.zeros([self.max_num_requests, width, num_blocks],
@@ -1624,8 +1620,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 vals = (torch.pow(2, torch.arange(n) + 1) - 1).int()
                 mask[:, blk * 32:blk * 32 + n, blk] = vals
                 remaining -= 32
-            cache[draft_len] = mask
-        return cache[draft_len]
+            self._packed_mask_cache[draft_len] = mask
+        return self._packed_mask_cache[draft_len]
 
     def generate_spec_decoding_generation_length(self, runtime_draft_len):
         self.spec_decoding_generation_lengths[:self.max_num_requests].fill_(

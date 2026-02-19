@@ -3812,11 +3812,13 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         max_draft_len = 4
         if enable_dynamic_draft_len:
             draft_len_schedule = {50: 4, 200: 3, 350: 2}
+            max_batch_size = 500
         else:
             draft_len_schedule = None
+            max_batch_size = None
         pytorch_config = dict(
             disable_overlap_scheduler=not eagle3_one_model,
-            cuda_graph_config=CudaGraphConfig(),
+            cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size),
         )
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,

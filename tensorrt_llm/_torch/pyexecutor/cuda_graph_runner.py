@@ -428,8 +428,7 @@ class CUDAGraphRunner:
         # When dynamic draft length is enabled (one-model path), we treat the determined runtime draft length
         # as the source of truth and pad the batch size up to the nearest existing graph
         # for that draft length.
-        if (self.spec_config and hasattr(self.spec_config, 'draft_len_schedule')
-                and self.spec_config.draft_len_schedule
+        if (self.spec_config and self.spec_config.draft_len_schedule
                 and self.spec_config.spec_dec_mode.support_dynamic_draft_len()):
             padded_batch_size = self._round_up_batch_size_with_draft_len(
                 new_batch_size, runtime_draft_len)

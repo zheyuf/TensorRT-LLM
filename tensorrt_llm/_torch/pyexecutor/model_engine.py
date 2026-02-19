@@ -788,9 +788,7 @@ class PyTorchModelEngine(ModelEngine):
         Returns: {1:4, 2:4, 3:4, 4:4, 5:2, 6:2, 7:2, 8:2, 16:1, 24:1, 32:1, 64:0}
         """
         # Dynamic draft length for CUDA graphs is only supported for one-model path
-        if (not self.spec_config
-                or not hasattr(self.spec_config, 'draft_len_schedule')
-                or not self.spec_config.draft_len_schedule or
+        if (not self.spec_config or not self.spec_config.draft_len_schedule or
                 not self.spec_config.spec_dec_mode.support_dynamic_draft_len()):
             return None
 
@@ -810,15 +808,6 @@ class PyTorchModelEngine(ModelEngine):
             mapping[graph_bs] = draft_len
         return mapping
 
-    def _graphs_for_dynamic_draft_length(self) -> list:
-        """Convert the dynamic draft_len mapping to list of (batch_size, draft_len) pairs."""
-        if not self._dynamic_draft_len_mapping:
-            return []
-        return [
-            (graph_bs, draft_len)
-            for graph_bs, draft_len in self._dynamic_draft_len_mapping.items()
-        ]
-
     def _get_graphs_to_capture(
         self, cuda_graph_batch_sizes: list[int],
         spec_resource_manager: Optional[BaseResourceManager]
@@ -830,56 +819,34 @@ class PyTorchModelEngine(ModelEngine):
         """
         # Case 1: Draft model (two-model speculative decoding)
         if self.is_draft_model:
-            draft_len = self._get_draft_model_draft_len(spec_resource_manager)
+            if self.model_is_wrapped and self.is_spec_decode and spec_resource_manager is not None and isinstance(
+                    spec_resource_manager, Eagle3ResourceManager):
+                # The CDL path uses draft_len > 0 for the number of iterations in the drafting loop.
+                draft_len = self.original_max_total_draft_tokens
+            else:
+                draft_len = self.max_total_draft_tokens
             return [(bs, draft_len) for bs in cuda_graph_batch_sizes]
 
         # Case 2: One-model with dynamic draft length
         if self.spec_config is not None and self.spec_config.draft_len_schedule is not None and self.spec_config.spec_dec_mode.support_dynamic_draft_len(
         ):
-            # Recompute at capture time so runtime resolver overrides (e.g.
-            # tests that patch get_draft_len_for_batch_size) are reflected in
-            # captured graph keys.
-            self._dynamic_draft_len_mapping = self._compute_dynamic_draft_len_mapping(
-            )
-            graphs = self._graphs_for_dynamic_draft_length()
+            graphs = [(graph_bs, draft_len) for graph_bs, draft_len in
+                      self._dynamic_draft_len_mapping.items()]
             logger.info(f"Dynamic draft length enabled for one-model path. "
                         f"Capturing {len(graphs)} graphs: {graphs}")
             return graphs
 
         # Case 3: Target model (two-model) or one-model without dynamic draft
-        return self._get_target_model_graphs(cuda_graph_batch_sizes)
-
-    def _get_draft_model_draft_len(
-            self, spec_resource_manager: Optional[BaseResourceManager]) -> int:
-        """Get draft_len for draft model CUDA graphs."""
-        # CDL (Chain Drafter Loop) path: need original draft tokens for loop iterations
-        is_cdl_eagle3 = (self.model_is_wrapped
-                         and self.is_spec_decode and isinstance(
-                             spec_resource_manager, Eagle3ResourceManager))
-        if is_cdl_eagle3:
-            return self.original_max_total_draft_tokens
-        # Non-CDL: draft model is called iteratively, doesn't receive draft tokens
-        return self.max_total_draft_tokens  # This is 0 for draft models
-
-    def _get_target_model_graphs(
-            self, cuda_graph_batch_sizes: list[int]) -> list[tuple[int, int]]:
-        """Get graphs for target model (two-model) or one-model without dynamic draft."""
-        graphs = []
-
-        # For two-model path: also capture draft_len=0 for runtime spec decode disable
-        # TODO: remove two-model path dynamic speculation support
+        draft_lengths = [self.max_total_draft_tokens]
         should_capture_no_spec = (
             self.max_total_draft_tokens > 0
             and not self.spec_config.spec_dec_mode.use_one_engine()
             # Assume speculation is always on if no max_concurrency set (saves memory)
             and self.spec_config.max_concurrency is not None)
         if should_capture_no_spec:
-            graphs.extend([(bs, 0) for bs in cuda_graph_batch_sizes])
-
-        # Always capture with max_total_draft_tokens
-        graphs.extend([(bs, self.max_total_draft_tokens)
-                       for bs in cuda_graph_batch_sizes])
-        return graphs
+            draft_lengths.append(0)
+        return [(bs, draft_len) for bs in cuda_graph_batch_sizes
+                for draft_len in draft_lengths]
 
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
         """Captures CUDA graphs for various batch sizes and draft lengths."""
@@ -3605,6 +3572,7 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device=new_tensors_device,
                 spec_resource_manager=spec_resource_manager,
             )
+
             can_run_graph = key is not None
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
@@ -3615,7 +3583,6 @@ class PyTorchModelEngine(ModelEngine):
                     spec_metadata = self.spec_metadata
                 else:
                     spec_metadata = None
-
             inputs, gather_ids = self._prepare_inputs(
                 padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
                 new_tensors_device, cache_indirection_buffer,

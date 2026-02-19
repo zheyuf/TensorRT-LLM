@@ -922,7 +922,8 @@ class MTPWorker(SpecWorkerBase):
 
             # Apply force override for relaxed acceptance path
             num_accepted_tokens = self._apply_force_accepted_tokens(
-                num_accepted_tokens, num_contexts)
+                num_accepted_tokens, num_contexts,
+                spec_metadata.runtime_draft_len)
 
         # Strict acceptance
         else:
@@ -938,7 +939,8 @@ class MTPWorker(SpecWorkerBase):
 
                 # Apply force override for THOP path
                 num_accepted_tokens = self._apply_force_accepted_tokens(
-                    num_accepted_tokens, num_contexts)
+                    num_accepted_tokens, num_contexts,
+                    spec_metadata.runtime_draft_len)
             else:
                 # Reshape draft tokens for base implementation
                 draft_tokens = spec_metadata.draft_tokens.reshape(
