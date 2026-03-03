@@ -694,11 +694,13 @@ class DecodingBaseConfig(StrictBaseModel):
         "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory."
     )
 
-    max_concurrency: Optional[NonNegativeInt] = Field(
+    max_concurrency: Optional[PositiveInt] = Field(
         default=None,
         description=
-        "When specified, speculation will be disabled at batch sizes above this value. Otherwise, "
-        "speculation will always be on. PyTorch backend only.")
+        "When specified (>0), speculation will be disabled at batch sizes above this value. Otherwise, "
+        "speculation will always be on. PyTorch backend only. "
+        "Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control."
+    )
 
     draft_len_schedule: Optional[dict[int, int]] = Field(
         default=None,
@@ -709,7 +711,8 @@ class DecodingBaseConfig(StrictBaseModel):
         " - Batch sizes 1-4:   use draft_len=4"
         " - Batch sizes 5-8:   use draft_len=2"
         " - Batch sizes 9-32:  use draft_len=1"
-        " - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled)"
+        " - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). "
+        "Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control."
     )
 
     load_format: Optional[str] = Field(
@@ -745,6 +748,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
     # If set, drafting will use separate KV cache in one-model speculative decoding.
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
+    # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
+    _translated_from_max_concurrency: bool = PrivateAttr(False)
 
     @field_validator('draft_len_schedule')
     @classmethod
@@ -786,6 +791,34 @@ class DecodingBaseConfig(StrictBaseModel):
             # This ensures efficient lookup
             return dict(sorted(v.items(), key=lambda x: x[0]))
         return v
+
+    @model_validator(mode='after')
+    # 1. Validate that max_concurrency and draft_len_schedule are mutually exclusive.
+    # 2. If max_concurrency is set, translate it to the corresponding draft_len_schedule.
+    def validate_max_concurrency_and_draft_len_schedule_mutually_exclusive(
+            self) -> "DecodingBaseConfig":
+        if self.max_concurrency is not None and self.draft_len_schedule is not None:
+            # Avoid ValueError during nested re-validation when only max_concurrency is set and draft_len_schedule is translated from max_concurrency
+            if self._translated_from_max_concurrency:
+                return self
+            raise ValueError(
+                "max_concurrency and draft_len_schedule are mutually exclusive. "
+                "Use max_concurrency for a simple speculation cutoff, or "
+                "draft_len_schedule for dynamic draft-length control.")
+
+        if self.max_concurrency is None:
+            return self
+
+        if (self.max_draft_len is None
+                or not self.spec_dec_mode.support_dynamic_draft_len()):
+            return self
+
+        self.draft_len_schedule = {
+            int(self.max_concurrency): int(self.max_draft_len)
+        }
+        self._translated_from_max_concurrency = True
+
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         """
