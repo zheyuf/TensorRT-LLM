@@ -1494,21 +1494,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         # Parameters can be fixed and not changed during runtime if the
         if self.is_spec_decoding_enabled:
-            # skip pre-allocating position_offsets and packed_mask when dynamic draft length is enabled
-            # We will use per-draft-len cached tensors for position_offsets and packed_mask instead
-            # Currently dynamic draft length is only supported for linear tree
-
-            is_linear_tree = not is_spec_dec_tree
+            # Skip pre-allocating position_offsets and packed_mask when dynamic draft length is enabled.
+            # We will use per-draft-len cached tensors for position_offsets and packed_mask instead.
+            # Currently dynamic draft length is only supported for linear tree (not is_spec_dec_tree).
 
             # These buffers are accessed more like removing input padding,
             # rather than using max_total_draft_tokens + 1 as the offset between different requests.
-            if not is_linear_tree and self.spec_decoding_position_offsets is None:
+            if not is_spec_dec_tree and self.spec_decoding_position_offsets is None:
                 self.spec_decoding_position_offsets = torch.empty(
                     [self.max_num_requests, max_total_draft_tokens + 1],
                     dtype=torch.int,
                     device='cuda',
                 )
-            if not is_linear_tree and self.spec_decoding_packed_mask is None:
+            if not is_spec_dec_tree and self.spec_decoding_packed_mask is None:
                 self.spec_decoding_packed_mask = torch.empty(
                     [
                         self.max_num_requests, max_total_draft_tokens + 1,

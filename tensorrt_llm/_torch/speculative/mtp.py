@@ -284,7 +284,7 @@ class MTPSampler(Sampler[SampleStateMTP], AsyncWorkerMixin):
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
-        runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
+        runtime_draft_len = state.runtime_draft_len if state.runtime_draft_len is not None else self.draft_len
         for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue

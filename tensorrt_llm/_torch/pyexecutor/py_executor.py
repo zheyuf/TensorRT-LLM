@@ -2378,6 +2378,7 @@ class PyExecutor:
         return self.sampler.SampleState(
             scheduled_requests=scheduled_batch,
             sampler_event=SamplerEvent(cuda_event=sampler_event),
+            runtime_draft_len=self.model_engine.runtime_draft_len,
         )
 
     def _validate_token_id_range(self, request: LlmRequest) -> None:

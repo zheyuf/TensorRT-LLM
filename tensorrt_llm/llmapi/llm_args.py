@@ -699,7 +699,7 @@ class DecodingBaseConfig(StrictBaseModel):
         description=
         "When specified (>0), speculation will be disabled at batch sizes above this value. Otherwise, "
         "speculation will always be on. PyTorch backend only. "
-        "Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control."
+        "Mutually exclusive with max_concurrency since draft_len_schedule implicitly supports max concurrency control."
     )
 
     draft_len_schedule: Optional[dict[int, int]] = Field(

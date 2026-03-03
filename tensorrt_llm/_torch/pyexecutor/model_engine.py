@@ -782,7 +782,7 @@ class PyTorchModelEngine(ModelEngine):
         )
         AutoTuner.get().print_profiling_cache()
 
-    def _compute_dynamic_draft_len_mapping(self) -> dict:
+    def _compute_dynamic_draft_len_mapping(self) -> Optional[Dict[int, int]]:
         """Compute graph_bs → draft_len mapping for dynamic draft length feature.
 
         Example: draft_len_schedule = {4:4, 8:2, 32:1}, cuda_graph_batch_sizes = [1,2,3,4,5,6,7,8,16,24,32,64]
