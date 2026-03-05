@@ -885,6 +885,7 @@ class PyTorchModelEngine(ModelEngine):
         graphs_to_capture = self._get_graphs_to_capture(cuda_graph_batch_sizes,
                                                         spec_resource_manager)
         graphs_to_capture = sorted(graphs_to_capture, reverse=True)
+        print(f"graphs_to_capture: {graphs_to_capture}")
         # Create CUDA graphs for short and long sequences separately for sparse attention.
         sparse_config = self.sparse_attention_config
         if sparse_config is not None and sparse_config.needs_separate_short_long_cuda_graphs(

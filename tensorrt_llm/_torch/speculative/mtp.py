@@ -226,7 +226,7 @@ class MTPSpecMetadata(SpecMetadata):
             num_contexts = num_seqs - self.num_generations
             gen_request_ids = self.request_ids[num_contexts:]
             if gen_request_ids:
-                self.sa_manager.prepare(gen_request_ids, self.max_draft_len)
+                self.sa_manager.prepare(gen_request_ids, self.runtime_draft_len)
 
 
 class MTPSampler(SpecSamplerBase):
@@ -341,7 +341,7 @@ class MTPWorker(SpecWorkerBase):
                 - hidden states: H_E, H_F, H_G, H_H (H_H is invalid)
             Draft model:
                 MTP1:
-                    # For generation request, `mtp_num_modules` of tokens will be used as input.
+                    # For generation request, `runtime_draft_len` tokens are used as input.
                     - input tokens: FGX
                     - input hidden states: H_E, H_F, H_G
                     - KV cache: (BCDE) + FGX
@@ -392,6 +392,13 @@ class MTPWorker(SpecWorkerBase):
                     - new generated draft tokens: UVQ
         '''
 
+        runtime_draft_len = spec_metadata.runtime_draft_len
+        # skip the draft forward if the runtime draft length is 0
+        if runtime_draft_len == 0:
+            return self.skip_drafting(input_ids, position_ids, hidden_states,
+                                      logits, attn_metadata, spec_metadata,
+                                      draft_model)
+
         batch_size = attn_metadata.num_seqs
 
         raw_logits = logits
@@ -422,7 +429,8 @@ class MTPWorker(SpecWorkerBase):
 
         # update attn metadata
         if attn_metadata is not None:
-            self.change_attn_metadata(num_accepted_tokens, attn_metadata)
+            self.change_attn_metadata(num_accepted_tokens, attn_metadata,
+                                      spec_metadata)
 
         # Run MTP layers to predict draft tokens
         next_draft_tokens = []
@@ -433,7 +441,8 @@ class MTPWorker(SpecWorkerBase):
             resource_manager)
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            for i, mtp_layer in enumerate(draft_model.mtp_layers):
+            for i, mtp_layer in enumerate(
+                    draft_model.mtp_layers[:runtime_draft_len]):
                 if self.guided_decoder is not None:
                     new_tokens = draft_inputs['input_ids'][last_tokens_idx]
                     self.guided_decoder.add_draft_batch(new_tokens,
@@ -497,17 +506,17 @@ class MTPWorker(SpecWorkerBase):
         resource_manager=None,
     ):
         batch_size = attn_metadata.num_seqs
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
-        accepted_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
+        runtime_draft_len = spec_metadata.runtime_draft_len
+        accepted_tokens = torch.empty((batch_size, (runtime_draft_len + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
         num_accepted_tokens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=logits.device)
-        next_draft_tokens = torch.empty((batch_size, mtp_num_modules),
+        next_draft_tokens = torch.empty((batch_size, runtime_draft_len),
                                         dtype=torch.int,
                                         device=logits.device)
-        next_new_tokens = torch.empty((batch_size, (mtp_num_modules + 1)),
+        next_new_tokens = torch.empty((batch_size, (runtime_draft_len + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
         return {
@@ -580,14 +589,15 @@ class MTPWorker(SpecWorkerBase):
         seq_lens = attn_metadata.seq_lens_cuda
         seq_lens_cpu = attn_metadata.seq_lens
         hidden_size = hidden_states.shape[-1]
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        runtime_draft_len = spec_metadata.runtime_draft_len
+        max_draft_len = self.spec_config.num_nextn_predict_layers
 
         if self.is_thop:
             _, _ = torch.ops.trtllm.mtp_update_hidden_states_op(
                 input_ids, seq_lens, hidden_states,
                 spec_metadata.mtp_hidden_states_ptrs,
                 spec_metadata.mtp_past_tokens_ptrs, num_accepted_tokens,
-                mtp_num_modules, batch_size, num_contexts, hidden_size)
+                runtime_draft_len, batch_size, num_contexts, hidden_size)
         else:
             assert len(spec_metadata.request_ids) == batch_size
             mtp_past_hidden_states_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_hidden_states_pool
@@ -616,7 +626,7 @@ class MTPWorker(SpecWorkerBase):
                     dim=1)
                 ctx_batch_idx = spec_metadata.batch_indices_cuda[:num_contexts]
                 row_indices_ctx = ctx_batch_idx.unsqueeze(1).expand(
-                    -1, mtp_num_modules)
+                    -1, max_draft_len)
                 col_indices_ctx = (seq_lens_ctx.unsqueeze(1) +
                                    spec_metadata.draft_token_indices_cuda)
                 new_mtp_past_tokens.append(cat_tokens_ctx[row_indices_ctx,
@@ -627,10 +637,10 @@ class MTPWorker(SpecWorkerBase):
             # generation
             if num_gens > 0:
                 unpacked_input_ids_gen = input_ids[num_ctx_tokens:].reshape(
-                    num_gens, mtp_num_modules + 1).int()
+                    num_gens, runtime_draft_len + 1).int()
                 hidden_states_gen = hidden_states[num_ctx_tokens:, :]
                 unpacked_hidden_states_gen = hidden_states_gen.reshape(
-                    num_gens, mtp_num_modules + 1, hidden_size)
+                    num_gens, runtime_draft_len + 1, hidden_size)
                 cat_tokens_gen = torch.cat(
                     (mtp_tokens[num_contexts:], unpacked_input_ids_gen), dim=1)
                 cat_hidden_states_gen = torch.cat(
@@ -639,10 +649,10 @@ class MTPWorker(SpecWorkerBase):
                     dim=1)
                 gen_batch_idx = spec_metadata.batch_indices_cuda[:num_gens]
                 row_indices_gen = gen_batch_idx.unsqueeze(1).expand(
-                    -1, mtp_num_modules)
+                    -1, max_draft_len)
                 col_indices_gen = (
                     num_accepted_tokens[num_contexts:].unsqueeze(1) +
-                    spec_metadata.draft_token_indices_cuda)
+                    spec_metadata.draft_token_indices_cuda[:max_draft_len])
                 new_mtp_past_tokens.append(cat_tokens_gen[row_indices_gen,
                                                           col_indices_gen])
                 new_mtp_past_hidden_states.append(
@@ -657,17 +667,17 @@ class MTPWorker(SpecWorkerBase):
                                                     new_mtp_past_hidden_states)
 
     @torch.compile(options={"max-autotune": True})
-    def topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules,
+    def topk_kernel(self, gen_logprobs, num_gens, runtime_draft_len,
                     spec_metadata):
         topk_value, topk_indices = torch.topk(gen_logprobs,
                                               k=self.spec_config.relaxed_topk,
                                               dim=-1)
-        topk_indices = topk_indices.reshape(num_gens, mtp_num_modules + 1,
+        topk_indices = topk_indices.reshape(num_gens, runtime_draft_len + 1,
                                             self.spec_config.relaxed_topk)
-        topk_value = topk_value.reshape(num_gens, mtp_num_modules + 1,
+        topk_value = topk_value.reshape(num_gens, runtime_draft_len + 1,
                                         self.spec_config.relaxed_topk)
         draft_tokens = spec_metadata.draft_tokens.reshape(
-            num_gens, mtp_num_modules)
+            num_gens, runtime_draft_len)
         return topk_value, topk_indices, draft_tokens
 
     @torch.compile(options={"max-autotune": True})
@@ -752,14 +762,14 @@ class MTPWorker(SpecWorkerBase):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        runtime_draft_len = spec_metadata.runtime_draft_len
 
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
 
         # The return buffer
         if self.spec_config.use_relaxed_acceptance_for_thinking or not self.is_thop:
-            accepted_tokens = torch.ones((batch_size, (mtp_num_modules + 1)),
+            accepted_tokens = torch.ones((batch_size, (runtime_draft_len + 1)),
                                          dtype=torch.int,
                                          device=logits.device)
             num_accepted_tokens = torch.ones(batch_size,
@@ -795,41 +805,40 @@ class MTPWorker(SpecWorkerBase):
             # generation
             gen_logprobs = self.process_generation_logits(logits, num_contexts)
             topk_value, topk_indices, draft_tokens = self.topk_kernel(
-                gen_logprobs, num_gens, mtp_num_modules, spec_metadata)
+                gen_logprobs, num_gens, runtime_draft_len, spec_metadata)
 
             accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_relaxed_acceptance_op(
                 spec_metadata.slot_ids, topk_value, topk_indices, draft_tokens,
                 mtp_relaxed_delta_pool, num_accepted_tokens, accepted_tokens,
-                mtp_num_modules, batch_size, num_contexts,
+                runtime_draft_len, batch_size, num_contexts,
                 self.spec_config.relaxed_topk, self.spec_config.relaxed_delta,
                 self.spec_config.begin_thinking_phase_token,
                 self.spec_config.end_thinking_phase_token)
 
             # Apply force override for relaxed acceptance path
             num_accepted_tokens = self._apply_force_accepted_tokens(
-                num_accepted_tokens, num_contexts,
-                spec_metadata.runtime_draft_len)
+                num_accepted_tokens, num_contexts, runtime_draft_len)
 
         # Strict acceptance
         else:
             if self.is_thop:
                 # Temporary buffer
                 target_tokens_cache = torch.zeros(batch_size *
-                                                  (mtp_num_modules + 1),
+                                                  (runtime_draft_len + 1),
                                                   dtype=torch.int,
                                                   device=logits.device)
                 accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_sampling_and_accepted_draft_tokens_op(
                     logits, spec_metadata.draft_tokens, target_tokens_cache,
-                    mtp_num_modules, batch_size, num_contexts, logits.shape[-1])
+                    runtime_draft_len, batch_size, num_contexts,
+                    logits.shape[-1])
 
                 # Apply force override for THOP path
                 num_accepted_tokens = self._apply_force_accepted_tokens(
-                    num_accepted_tokens, num_contexts,
-                    spec_metadata.runtime_draft_len)
+                    num_accepted_tokens, num_contexts, runtime_draft_len)
             else:
                 # Reshape draft tokens for base implementation
                 draft_tokens = spec_metadata.draft_tokens.reshape(
-                    num_gens, mtp_num_modules)
+                    num_gens, runtime_draft_len)
 
                 # Use base implementation for strict acceptance
                 accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
@@ -842,7 +851,7 @@ class MTPWorker(SpecWorkerBase):
             self.sa_match_len = torch.zeros((num_gens, ),
                                             dtype=torch.int32,
                                             device="cuda")
-            self.sa_draft_tokens = torch.zeros((num_gens, mtp_num_modules),
+            self.sa_draft_tokens = torch.zeros((num_gens, runtime_draft_len),
                                                dtype=torch.int32,
                                                device="cuda")
 
@@ -856,7 +865,7 @@ class MTPWorker(SpecWorkerBase):
                     gen_request_ids,
                     accepted_tokens[num_contexts:],
                     num_accepted_tokens[num_contexts:],
-                    mtp_num_modules,
+                    runtime_draft_len,
                 )
                 self.sa_match_len.copy_(match_len)
                 self.sa_draft_tokens.copy_(draft_tokens_sa)
@@ -864,10 +873,11 @@ class MTPWorker(SpecWorkerBase):
         return accepted_tokens, num_accepted_tokens
 
     def change_attn_metadata(self, num_accepted_tokens: torch.Tensor,
-                             attn_metadata: AttentionMetadata):
+                             attn_metadata: AttentionMetadata,
+                             spec_metadata: MTPSpecMetadata):
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
         batch_size = attn_metadata.num_seqs
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        runtime_draft_len = spec_metadata.runtime_draft_len
 
         num_contexts = attn_metadata.num_contexts
         attn_metadata._seq_lens[num_contexts:batch_size] -= 1
@@ -879,14 +889,14 @@ class MTPWorker(SpecWorkerBase):
             # buffer once the graph has been captured also - this will invalidate
             # the graph and force an expensive recapture.
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                mtp_num_modules + 1 -
+                runtime_draft_len + 1 -
                 num_accepted_tokens[num_contexts:batch_size])
 
         if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:
             for i in range(num_contexts, batch_size):
                 # used for vanilla MLA, list on cpu
                 attn_metadata.kv_cache_params.num_cached_tokens_per_seq[
-                    i] -= mtp_num_modules + 1 - num_accepted_tokens[i].item()
+                    i] -= runtime_draft_len + 1 - num_accepted_tokens[i].item()
 
     def prepare_drafter_inputs(
         self,
@@ -905,7 +915,7 @@ class MTPWorker(SpecWorkerBase):
             input_ids: torch.IntTensor
                 [num_tokens]
                 The input ids of all requests. Flatten.
-                num_tokens = sum(all prompts) + num_generation * (mtp_num_modules + 1)
+                num_tokens = sum(all prompts) + num_generation * (runtime_draft_len + 1)
 
             position_ids: torch.IntTensor
                 [1][num_tokens]
@@ -933,7 +943,7 @@ class MTPWorker(SpecWorkerBase):
             input_ids: torch.Tensor
                 [num_tokens]
                 The new input ids of all requests. Flatten.
-                num_tokens = sum(all prompts) + num_generation * (mtp_num_modules)
+                num_tokens = sum(all prompts) + num_generation * (runtime_draft_len)
 
             position_ids: torch.Tensor
                 [1][[num_tokens]]
@@ -957,7 +967,7 @@ class MTPWorker(SpecWorkerBase):
         num_gens = batch_size - num_contexts
         mtp_past_hidden_states_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_hidden_states_pool
         mtp_past_tokens_pool = spec_metadata.mtp_hidden_states_manager.mtp_past_tokens_pool
-        mtp_num_modules = self.spec_config.num_nextn_predict_layers
+        runtime_draft_len = spec_metadata.runtime_draft_len
 
         if self.is_thop:
             # Temporary buffer
@@ -979,7 +989,7 @@ class MTPWorker(SpecWorkerBase):
                  spec_metadata.mtp_hidden_states_ptrs,
                  spec_metadata.mtp_past_tokens_ptrs, hidden_states,
                  accepted_tokens, num_accepted_tokens, return_input_ids,
-                 return_hidden_states, mtp_num_modules, batch_size,
+                 return_hidden_states, runtime_draft_len, batch_size,
                  num_contexts, hidden_size)
 
         else:
@@ -1004,11 +1014,18 @@ class MTPWorker(SpecWorkerBase):
                 accepted_tokens_gen = accepted_tokens[num_contexts:, :]
                 input_ids_gen = accepted_tokens_gen[gen_batch_idx,
                                                     gen_token_idx].unsqueeze(1)
-                input_ids_gen = torch.concat(
-                    [mtp_past_tokens_pool[slot_ids][:, 1:], input_ids_gen],
-                    dim=1)
+
+                if runtime_draft_len > 1:
+                    history_tokens = mtp_past_tokens_pool[slot_ids][:, -(
+                        runtime_draft_len - 1):]
+                else:
+                    history_tokens = torch.empty((num_gens, 0),
+                                                 dtype=torch.int,
+                                                 device=input_ids.device)
+                input_ids_gen = torch.concat([history_tokens, input_ids_gen],
+                                             dim=1)
                 hidden_states_gen = mtp_past_hidden_states_pool[
-                    slot_ids].flatten(0, 1)
+                    slot_ids][:, -runtime_draft_len:, :].flatten(0, 1)
                 return_input_ids_list.append(input_ids_gen.flatten(0, 1))
                 return_hidden_states_list.append(hidden_states_gen)
             # Concatenate into continuous buffers
@@ -1022,9 +1039,9 @@ class MTPWorker(SpecWorkerBase):
             position_ids_list.append(position_ids[:num_ctx_tokens])
         if num_gens > 0:
             position_ids_gen = position_ids[num_ctx_tokens:].reshape(
-                num_gens, mtp_num_modules + 1)[:, -mtp_num_modules:]
+                num_gens, runtime_draft_len + 1)[:, -runtime_draft_len:]
             position_ids_gen = position_ids_gen - (
-                1 + mtp_num_modules -
+                1 + runtime_draft_len -
                 num_accepted_tokens[num_contexts:].unsqueeze(1))
             position_ids_list.append(position_ids_gen.flatten())
         return_position_ids = torch.concat(position_ids_list, dim=-1)
@@ -1158,6 +1175,12 @@ class MTPEagleWorker(MTPWorker):
         draft_model,
         resource_manager=None,
     ):
+        runtime_draft_len = spec_metadata.runtime_draft_len
+        # skip the draft forward if the runtime draft length is 0
+        if runtime_draft_len == 0:
+            return self.skip_drafting(input_ids, position_ids, hidden_states,
+                                      logits, attn_metadata, spec_metadata,
+                                      draft_model)
 
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
@@ -1207,7 +1230,7 @@ class MTPEagleWorker(MTPWorker):
         # Predict draft tokens
         next_draft_tokens = []
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            for i in range(self.mtp_num_modules):
+            for i in range(runtime_draft_len):
                 if i == 0:
                     hidden_states = draft_model.mtp_layers[0](
                         embed_tokens=draft_model.embed_tokens,
@@ -1216,7 +1239,7 @@ class MTPEagleWorker(MTPWorker):
 
                     start_ids_gen = (
                         spec_metadata.batch_indices_cuda[:num_gens] *
-                        (self.mtp_num_modules + 1)).long()
+                        (runtime_draft_len + 1)).long()
                     gather_ids_gen = (start_ids_gen +
                                       num_accepted_tokens[num_contexts:] - 1 +
                                       attn_metadata.num_ctx_tokens)
@@ -1297,7 +1320,7 @@ class MTPEagleWorker(MTPWorker):
                     # update kv_lens_cuda
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                            self.mtp_num_modules -
+                            runtime_draft_len -
                             num_accepted_tokens[num_contexts:])
                         attn_metadata.kv_lens_cuda[:num_contexts] += 1
                     # update metadata for flash mla
@@ -1368,6 +1391,7 @@ class MTPEagleWorker(MTPWorker):
         spec_metadata: MTPSpecMetadata,
     ):
         num_contexts = attn_metadata.num_contexts
+        runtime_draft_len = spec_metadata.runtime_draft_len
 
         # context
         input_ids_ctx = self._prepare_context_input_ids(
@@ -1375,7 +1399,8 @@ class MTPEagleWorker(MTPWorker):
             accepted_tokens, num_contexts)
 
         # generation
-        input_ids_gen = accepted_tokens[num_contexts:, :].flatten()
+        input_ids_gen = accepted_tokens[num_contexts:, :runtime_draft_len +
+                                        1].flatten()
 
         # get draft inputs
         input_ids = torch.concat([input_ids_ctx, input_ids_gen], dim=0)

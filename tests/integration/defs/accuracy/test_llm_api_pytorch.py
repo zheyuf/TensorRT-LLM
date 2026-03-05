@@ -1512,6 +1512,83 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
+    @pytest.mark.skip_less_device_memory(60000)
+    @parametrize_with_ids("enable_max_concurrency,enable_draft_len_schedule", [
+        (False, True),
+        (True, False),
+    ])
+    def test_bfloat16_mtp_dynamic_draft_len(self, enable_max_concurrency,
+                                            enable_draft_len_schedule):
+        max_concurrency = 100 if enable_max_concurrency else None
+        draft_len_schedule = {
+            50: 4,
+            200: 3,
+            350: 2
+        } if enable_draft_len_schedule else None
+        max_draft_len = 4
+        cuda_graph_config = CudaGraphConfig(
+            max_batch_size=500
+            if draft_len_schedule or max_concurrency is not None else None)
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=cuda_graph_config,
+        )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=max_draft_len,
+            max_draft_len=max_draft_len,
+            max_concurrency=max_concurrency,
+            draft_len_schedule=draft_len_schedule,
+        )
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 max_num_tokens=8192,
+                 **pytorch_config,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(60000)
+    @parametrize_with_ids("enable_max_concurrency,enable_draft_len_schedule", [
+        (False, True),
+        (True, False),
+    ])
+    def test_bfloat16_mtp_eagle_dynamic_draft_len(self, enable_max_concurrency,
+                                                  enable_draft_len_schedule):
+        max_concurrency = 100 if enable_max_concurrency else None
+        draft_len_schedule = {
+            50: 4,
+            200: 3,
+            350: 2
+        } if enable_draft_len_schedule else None
+        max_draft_len = 4
+        cuda_graph_config = CudaGraphConfig(
+            max_batch_size=500
+            if draft_len_schedule or max_concurrency is not None else None)
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=cuda_graph_config,
+        )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        # Force MTP-Eagle one-model path.
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=max_draft_len,
+            max_draft_len=max_draft_len,
+            use_mtp_vanilla=False,
+            mtp_eagle_one_model=True,
+            max_concurrency=max_concurrency,
+            draft_len_schedule=draft_len_schedule,
+        )
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 max_num_tokens=8192,
+                 **pytorch_config,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",

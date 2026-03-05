@@ -1664,6 +1664,7 @@ class PyExecutor:
             self.model_engine.runtime_draft_len = runtime_draft_len
         else:
             self.model_engine.runtime_draft_len = self.model_engine.max_draft_len
+        print(f"runtime_draft_len: {self.model_engine.runtime_draft_len}")
 
     def _can_queue(self, scheduled_batch):
 

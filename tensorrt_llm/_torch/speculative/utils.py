@@ -359,6 +359,7 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
     if draft_len_schedule is None:
         return max_draft_len
 
+    print(f"batch_size: {batch_size}")
     # Binary search to find the first threshold >= batch_size
     # draft_len_schedule is already sorted by config validator
     schedule_batch_sizes = list(draft_len_schedule.keys())
