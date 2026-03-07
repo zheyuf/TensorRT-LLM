@@ -1600,6 +1600,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 # So we create cache for position offsets and packed mask for each draft length to avoid reallocation.
                 assert max_draft_len == max_total_draft_tokens, "max_draft_len should be equal to max_total_draft_tokens for linear tree"
                 runtime_draft_len = spec_metadata.runtime_draft_len
+                if spec_metadata.spec_dec_mode.is_pard(
+                ) and runtime_draft_len > 0:
+                    runtime_draft_len = 2 * runtime_draft_len - 1
                 self.generate_spec_decoding_generation_length(
                     runtime_draft_len=runtime_draft_len)
                 self.spec_decoding_position_offsets = generate_spec_decoding_position_offsets(

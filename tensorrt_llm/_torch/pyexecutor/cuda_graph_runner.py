@@ -444,6 +444,12 @@ class CUDAGraphRunner:
         if padding_size + batch.batch_size > self.config.batch_size:
             return 0
 
+        runtime_draft_token_buffer_width = runtime_draft_len
+        if (self.spec_config is not None
+                and self.spec_config.spec_dec_mode.is_pard()
+                and runtime_draft_len > 0):
+            runtime_draft_token_buffer_width = 2 * runtime_draft_len - 1
+
         # No padding if it would create too many concurrent requests.
         # This is not strictly required, but we should probably
         # respect the requirement just in case that changes in the future.
@@ -461,7 +467,7 @@ class CUDAGraphRunner:
             dummy_request = kv_cache_manager.add_dummy_requests(
                 [dummy_request_id],
                 is_gen=True,
-                max_num_draft_tokens=runtime_draft_len,
+                max_num_draft_tokens=runtime_draft_token_buffer_width,
                 use_mrope=self.config.use_mrope,
                 max_beam_width=self.config.max_beam_width,
                 draft_kv_cache_manager=draft_kv_cache_manager)

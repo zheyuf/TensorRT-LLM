@@ -177,8 +177,6 @@ class PyTorchModelEngine(ModelEngine):
         self.original_max_total_draft_tokens = (
             spec_config.tokens_per_gen_step -
             1) if spec_config is not None else 0
-        # Saved before zeroing for draft models; used by update_spec_dec_param.
-        self._spec_dec_max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
         # The draft model won't have any draft tokens attached to
         # generation requests when we invoke it autoregressively
@@ -1163,12 +1161,13 @@ class PyTorchModelEngine(ModelEngine):
         result = ScheduledRequests()
         result.context_requests = []
         num_extra_decoding_steps = self._get_num_extra_decoding_steps()
+        num_draft_tokens = self._get_runtime_carried_draft_len(draft_len)
 
         # Add (batch_size - 1) dummy requests with seq_len=1.
         requests = kv_cache_manager.add_dummy_requests(
             list(range(batch_size - 1)),
             is_gen=True,
-            max_num_draft_tokens=draft_len,
+            max_num_draft_tokens=num_draft_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,
@@ -1185,26 +1184,27 @@ class PyTorchModelEngine(ModelEngine):
         available_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=max_seq_len,
             batch_size=batch_size,
-            max_num_draft_tokens=draft_len)
+            max_num_draft_tokens=num_draft_tokens)
 
         # Also consider draft KV cache capacity when it exists
         if draft_kv_cache_manager is not None:
             draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
                 batch_size=batch_size,
                 token_num_upper_bound=max_seq_len,
-                max_num_draft_tokens=draft_len)
+                max_num_draft_tokens=num_draft_tokens)
             available_tokens = min(available_tokens, draft_available_tokens)
 
         token_num = max(
             1,
             min(
                 available_tokens, max_seq_len - 1 -
-                get_num_extra_kv_tokens(self.spec_config) - draft_len))
+                get_num_extra_kv_tokens(self.spec_config) - num_draft_tokens))
         model_config = self.model.model_config.pretrained_config
         max_position_embeddings = getattr(model_config,
                                           'max_position_embeddings', None)
         if max_position_embeddings is not None:
-            token_num = min(token_num, max_position_embeddings - draft_len)
+            token_num = min(token_num,
+                            max_position_embeddings - num_draft_tokens)
 
         assert token_num > num_extra_decoding_steps, (
             "Cannot fuse drafting loop. Not enough KV cache space for all draft tokens."
@@ -1215,7 +1215,7 @@ class PyTorchModelEngine(ModelEngine):
             request_ids=[batch_size - 1],
             token_nums=[token_num],
             is_gen=True,
-            max_num_draft_tokens=draft_len,
+            max_num_draft_tokens=num_draft_tokens,
             use_mrope=self.use_mrope,
             max_beam_width=self.max_beam_width,
             num_extra_decoding_steps=num_extra_decoding_steps,
@@ -1937,8 +1937,10 @@ class PyTorchModelEngine(ModelEngine):
                                                      non_blocking=True)
 
         # Prepare draft tokens
+        num_draft_tokens_per_extend_request = num_tokens_per_extend_request - 1
         self.draft_tokens_cuda[:previous_batch_draft_tokens].copy_(
-            next_draft_tokens_device[previous_slots, :].flatten(),
+            next_draft_tokens_device[
+                previous_slots, :num_draft_tokens_per_extend_request].flatten(),
             non_blocking=True)
 
         # Compute kv_len_offsets and update offset tensors
@@ -1957,6 +1959,24 @@ class PyTorchModelEngine(ModelEngine):
         self.previous_kv_lens_offsets_cuda[:num_extend_reqeust_wo_dummy].copy_(
             kv_len_offsets_device[previous_slots], non_blocking=True)
 
+    def _get_runtime_carried_draft_len(self,
+                                       runtime_draft_len: Optional[int] = None
+                                       ) -> int:
+        """
+        Currently only effective for PARD.
+
+        Return the carried runtime draft length for shared model-engine paths.
+        `runtime_draft_len` is the logical draft length `K`. For PARD, generic
+        runtime paths operate on the carried `2K - 1` draft-token layout instead.
+        """
+        runtime_draft_len = (self.runtime_draft_len if runtime_draft_len is None
+                             else runtime_draft_len)
+        if not self.is_spec_decode or self.spec_config is None:
+            return 0
+        if self.spec_config.spec_dec_mode.is_pard() and runtime_draft_len > 0:
+            return 2 * runtime_draft_len - 1
+        return runtime_draft_len
+
     def _apply_incremental_update_target(
             self,
             scheduled_requests: ScheduledRequests,
@@ -1974,8 +1994,9 @@ class PyTorchModelEngine(ModelEngine):
         # Pre-compute constants
         extend_requests = scheduled_requests.generation_requests
         num_extend_requests = len(extend_requests)
-        num_tokens_per_extend_request = self.runtime_draft_len + 1
         spec_config = self.spec_config
+        runtime_carried_draft_len = self._get_runtime_carried_draft_len()
+        num_tokens_per_extend_request = runtime_carried_draft_len + 1
 
         prompt_lengths = torch.empty(num_extend_requests,
                                      dtype=torch.int,
@@ -2037,7 +2058,8 @@ class PyTorchModelEngine(ModelEngine):
         prompt_lengths = prompt_lengths.tolist()
         num_cached_tokens_per_seq = num_cached_tokens_per_seq.tolist()
 
-        previous_batch_draft_tokens = num_extend_reqeust_wo_dummy * self.runtime_draft_len
+        previous_batch_draft_tokens = (num_extend_reqeust_wo_dummy *
+                                       runtime_carried_draft_len)
 
         self._update_target_input_tensors(
             num_accepted_tokens_device=num_accepted_tokens_device,
@@ -2312,6 +2334,8 @@ class PyTorchModelEngine(ModelEngine):
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
+        runtime_carried_draft_len = self._get_runtime_carried_draft_len()
+        runtime_tokens_per_gen_step = runtime_carried_draft_len + 1
         for request in extend_requests:
             request_ids.append(request.py_request_id)
             request_accepted_path[
@@ -2370,16 +2394,16 @@ class PyTorchModelEngine(ModelEngine):
                 previous_batch_idx = request.py_batch_idx
                 request.py_batch_idx = request.py_seq_slot
 
-                sequence_lengths.append(1 + self.runtime_draft_len)
+                sequence_lengths.append(runtime_tokens_per_gen_step)
                 num_accepted_draft_tokens.append(
                     request.py_num_accepted_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
 
-                draft_lens.append(self.runtime_draft_len)
+                draft_lens.append(runtime_carried_draft_len)
                 gather_ids.extend(
                     list(
                         range(len(position_ids),
-                              len(position_ids) + 1 + self.runtime_draft_len)))
+                              len(position_ids) + runtime_tokens_per_gen_step)))
                 # For the target model + tree decoding
                 if not self.is_draft_model and not spec_config.is_linear_tree:
                     assert spec_tree_manager is not None
@@ -2392,19 +2416,19 @@ class PyTorchModelEngine(ModelEngine):
                     position_ids.extend(
                         list(
                             range(
-                                past_seen_token_num, past_seen_token_num + 1 +
-                                self.runtime_draft_len)))
+                                past_seen_token_num, past_seen_token_num +
+                                runtime_tokens_per_gen_step)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
-                                            (1 + self.runtime_draft_len))
+                                            runtime_tokens_per_gen_step)
 
                 num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                 self.runtime_draft_len + 1)
+                                                 runtime_tokens_per_gen_step)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
-                    prompt_lengths.append(1 + self.runtime_draft_len)
+                    prompt_lengths.append(runtime_tokens_per_gen_step)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
 
@@ -2694,30 +2718,35 @@ class PyTorchModelEngine(ModelEngine):
             # Initialize these two values to zeros
             self.previous_pos_id_offsets_cuda *= 0
             self.previous_kv_lens_offsets_cuda *= 0
+            runtime_carried_draft_len = self._get_runtime_carried_draft_len()
+            runtime_tokens_per_gen_step = runtime_carried_draft_len + 1
 
             if previous_batch_len > 0:
                 previous_slots = previous_seq_slots_device()
                 # previous input ids
-                previous_batch_tokens = previous_batch_len * (
-                    1 + self.runtime_draft_len)
+                previous_batch_tokens = (previous_batch_len *
+                                         runtime_tokens_per_gen_step)
                 new_tokens = new_tokens_device.transpose(
                     0,
-                    1)[previous_slots, :(1 + self.runtime_draft_len)].flatten()
+                    1)[previous_slots, :runtime_tokens_per_gen_step].flatten()
                 self.input_ids_cuda[num_tokens:num_tokens +
                                     previous_batch_tokens].copy_(
                                         new_tokens, non_blocking=True)
 
                 # previous draft tokens
-                previous_batch_draft_tokens = previous_batch_len * self.runtime_draft_len
-                if self.runtime_draft_len > 0:
-                    self.draft_tokens_cuda[num_draft_tokens:num_draft_tokens +
-                                           previous_batch_draft_tokens].copy_(
-                                               next_draft_tokens_device[
-                                                   previous_slots, :self.
-                                                   runtime_draft_len].flatten(),
-                                               non_blocking=True)
+                previous_batch_draft_tokens = (previous_batch_len *
+                                               runtime_carried_draft_len)
+                if runtime_carried_draft_len > 0:
+                    self.draft_tokens_cuda[
+                        num_draft_tokens:num_draft_tokens +
+                        previous_batch_draft_tokens].copy_(
+                            next_draft_tokens_device[
+                                previous_slots, :runtime_carried_draft_len].
+                            flatten(),
+                            non_blocking=True)
                 # prepare data for the preprocess inputs
-                kv_len_offsets_device = new_tokens_lens_device - self.runtime_draft_len - 1
+                kv_len_offsets_device = (new_tokens_lens_device -
+                                         runtime_tokens_per_gen_step)
                 previous_pos_indices_host = torch.tensor(
                     previous_pos_indices,
                     dtype=torch.int,
@@ -2743,8 +2772,8 @@ class PyTorchModelEngine(ModelEngine):
                     extend_dummy_requests)
                 self.previous_pos_id_offsets_cuda[
                     (num_extend_reqeust_wo_dummy - previous_batch_len) *
-                    (1 + self.runtime_draft_len):num_extend_reqeust_wo_dummy *
-                    (1 + self.runtime_draft_len)].copy_(
+                    runtime_tokens_per_gen_step:num_extend_reqeust_wo_dummy *
+                    runtime_tokens_per_gen_step].copy_(
                         new_tokens_lens_device[self.previous_pos_indices_cuda[
                             0:previous_batch_tokens]],
                         non_blocking=True)
@@ -3578,14 +3607,24 @@ class PyTorchModelEngine(ModelEngine):
             # Propagate runtime_draft_len (already set on self by py_executor)
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
+            attn_max_total_draft_tokens = (
+                self.original_max_total_draft_tokens
+                if self.spec_config is not None
+                and self.spec_config.spec_dec_mode.is_pard() else
+                self.spec_config.max_total_draft_tokens
+                if self.spec_config is not None else 0)
+            attn_max_draft_len = (attn_max_total_draft_tokens
+                                  if self.spec_config is not None
+                                  and self.spec_config.spec_dec_mode.is_pard()
+                                  else self.original_max_draft_len)
 
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
                 is_spec_decoding_enabled=is_spec_dec_mode,
                 is_spec_dec_tree=spec_metadata.is_spec_dec_tree,
                 is_spec_dec_dynamic_tree=spec_metadata.is_spec_dec_dynamic_tree,
-                max_draft_len=self.original_max_draft_len,
-                max_total_draft_tokens=self._spec_dec_max_total_draft_tokens,
+                max_draft_len=attn_max_draft_len,
+                max_total_draft_tokens=attn_max_total_draft_tokens,
                 model_is_wrapped=self.model_is_wrapped,
                 spec_metadata=spec_metadata,
                 spec_tree_manager=spec_tree_manager,

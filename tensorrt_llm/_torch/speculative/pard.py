@@ -71,15 +71,6 @@ class PARDWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
-    @property
-    def _draft_tokens_per_req(self) -> int:
-        """Total tokens per gen request in the draft forward.
-
-        Uses 2K to fit all accepted tokens (up to K+1) plus K-1 mask tokens,
-        ensuring K unique predictions regardless of how many tokens were accepted.
-        """
-        return 2 * self.max_draft_len
-
     def _prepare_attn_metadata_for_pard(self, attn_metadata, spec_metadata):
         """
         Save attn_metadata fields that PARD modifies during forward.
@@ -162,13 +153,25 @@ class PARDWorker(SpecWorkerBase):
         num_gens = batch_size - num_contexts
 
         raw_logits = logits
-        K = self.max_draft_len
+        K = spec_metadata.runtime_draft_len
+
+        if K == 0:
+            return self.skip_drafting(
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+            )
 
         self._execute_guided_decoder_if_present(logits)
 
         # draft_tokens buffer has (2K-1) entries per gen request; extract the K real drafts
         if num_gens > 0:
-            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, 2 * K - 1)[:, :K]
+            draft_tokens = spec_metadata.draft_tokens[: num_gens * (2 * K - 1)]
+            draft_tokens = draft_tokens.reshape(num_gens, 2 * K - 1)[:, :K]
         else:
             draft_tokens = spec_metadata.draft_tokens.reshape(0, K)
 
@@ -222,14 +225,13 @@ class PARDWorker(SpecWorkerBase):
                 gen_start_idx = attn_metadata.num_ctx_tokens
 
                 request_bases = (
-                    torch.arange(num_gens, dtype=torch.long, device="cuda")
-                    * self._draft_tokens_per_req
+                    torch.arange(num_gens, dtype=torch.long, device="cuda") * (2 * K)
                     + gen_start_idx
                 )
 
                 gen_num_accepted = num_accepted_tokens[num_contexts:batch_size].long()
                 base_offsets = gen_num_accepted - 1  # M = bonus position
-                offsets = torch.arange(self.max_draft_len, dtype=torch.long, device="cuda")
+                offsets = torch.arange(K, dtype=torch.long, device="cuda")
 
                 gen_gather_ids = (
                     request_bases.unsqueeze(1) + base_offsets.unsqueeze(1) + offsets.unsqueeze(0)
@@ -241,7 +243,7 @@ class PARDWorker(SpecWorkerBase):
                 )
 
                 vocab_size = gen_logits.shape[-1]
-                gen_logits = gen_logits.reshape(num_gens, self.max_draft_len, vocab_size)
+                gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
                 # Use torch.argmax directly to avoid cute_argmax stride issues
                 d2t = getattr(draft_model.model, "d2t", None)
@@ -339,6 +341,8 @@ class PARDWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         batch_size = attn_metadata.num_seqs
         num_gens = batch_size - num_contexts
+        runtime_draft_len = spec_metadata.runtime_draft_len
+        total_tokens_per_req = 2 * runtime_draft_len
 
         if (
             hasattr(self.spec_config, "mask_token_id")
@@ -366,8 +370,6 @@ class PARDWorker(SpecWorkerBase):
         if num_gens > 0:
             gen_num_accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens]
             gen_accepted_tokens = accepted_tokens[num_contexts : num_contexts + num_gens, :]
-
-            total_tokens_per_req = self._draft_tokens_per_req  # 2K
 
             # Start with all mask tokens
             request_ids_2d = torch.full(
@@ -407,9 +409,9 @@ class PARDWorker(SpecWorkerBase):
                     - total_tokens_per_req
                 )
             else:
-                gen_pos_starts = position_ids[
-                    attn_metadata.num_ctx_tokens :: self._draft_tokens_per_req
-                ][:num_gens]
+                gen_pos_starts = position_ids[attn_metadata.num_ctx_tokens :: total_tokens_per_req][
+                    :num_gens
+                ]
 
             offsets = torch.arange(total_tokens_per_req, dtype=torch.int32, device="cuda")
             position_ids_gen = (gen_pos_starts.unsqueeze(1) + offsets.unsqueeze(0)).flatten()

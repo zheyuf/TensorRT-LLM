@@ -342,6 +342,44 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(60000)
+    @parametrize_with_ids("enable_max_concurrency,enable_draft_len_schedule", [
+        (False, True),
+        (True, False),
+    ])
+    def test_pard_dynamic_draft_len(self, enable_max_concurrency,
+                                    enable_draft_len_schedule):
+        max_concurrency = 100 if enable_max_concurrency else None
+        draft_len_schedule = {
+            50: 4,
+            200: 3,
+            350: 2
+        } if enable_draft_len_schedule else None
+        max_draft_len = 4
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(
+                max_batch_size=500
+                if draft_len_schedule or max_concurrency is not None else None),
+        )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        pard_model_dir = f"{llm_models_root()}/PARD-Llama-3.2-1B"
+        pard_config = PARDDecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model=pard_model_dir,
+            max_concurrency=max_concurrency,
+            draft_len_schedule=draft_len_schedule,
+        )
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 max_num_tokens=8192,
+                 **pytorch_config,
+                 speculative_config=pard_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
     def test_ngram(self):
         max_bs = 16
 
