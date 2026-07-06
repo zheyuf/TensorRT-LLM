@@ -45,8 +45,10 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, copy_weight, load_weight_shard
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..speculative import SpecMetadata
 from ..utils import ActivationType, AuxStreamType, EventType
-from .modeling_utils import DecoderModel, DecoderModelForCausalLM, ModelConfig, register_auto_model
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import DecoderModel, ModelConfig, register_auto_model
 
 # Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
@@ -1260,6 +1262,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -1280,6 +1283,13 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
         else:
             hidden_states = self.mlp(hidden_states)
+        # Eagle3 aux-hidden-state capture. M3 layers have no cross-layer
+        # allreduce+norm fusion, so at layer exit hidden_states is fully
+        # TP-reduced and (hidden_states, residual) is the pre-next-layernorm
+        # pair the draft head was trained on (their sum is this layer's
+        # output in the residual stream).
+        if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -1330,6 +1340,7 @@ class MiniMaxM3Model(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1346,6 +1357,7 @@ class MiniMaxM3Model(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                spec_metadata=spec_metadata,
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -1367,19 +1379,20 @@ _M3_GATE_BIAS_RENAME_MAP = {
 
 
 @register_auto_model("MiniMaxM3SparseForCausalLM")
-class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedConfig]):
-    """Text-only M3 model."""
+class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, PretrainedConfig]):
+    """Text-only M3 model.
+
+    Subclasses :class:`SpecDecOneEngineForCausalLM` so one-engine
+    speculative modes (Eagle3) can attach a draft model and spec
+    worker; without a ``speculative_config`` the base behaves exactly
+    like ``DecoderModelForCausalLM``.
+    """
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         raw_pretrained = model_config.pretrained_config
         if is_minimax_m3_vl_config(raw_pretrained):
             model_config = get_text_model_config(model_config)
-        super().__init__(
-            MiniMaxM3Model(model_config),
-            config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=model_config.pretrained_config.vocab_size,
-        )
+        super().__init__(MiniMaxM3Model(model_config), model_config)
 
     def load_weights(self, weights, *args, **kwargs):
         # Merge the M3-specific gate-bias rename into any caller-
