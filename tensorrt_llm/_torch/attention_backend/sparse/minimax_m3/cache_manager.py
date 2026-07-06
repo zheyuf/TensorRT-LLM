@@ -13,7 +13,7 @@ Provides:
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -411,12 +411,53 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
         return kv_cache_pool_pointers, kv_cache_pool_mapping
 
+    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+        if self.enable_swa_scratch_reuse:
+            # Per-layer page-index mode never takes the shared-pool
+            # offset math, so the base implementation is correct there.
+            super()._prepare_page_table_tensor(index_mapper_capacity)
+            return
+        # The base shared-pool path derives each layer's pool offset via
+        # exact_div(addr_offset, key_bytes * kv_factor * tokens_per_block),
+        # which assumes pools hold exactly K+V per layer; M3 sparse layers
+        # add a coalesced INDEX_KEY buffer, so that division does not hold
+        # (see _build_pool_mapping_tensors).
+        self.kv_cache_pool_pointers, self.kv_cache_pool_mapping = (
+            self._build_pool_mapping_tensors()
+        )
+        # index_scales / kv_offset / host_kv_cache_block_offsets exist for
+        # AttentionOp compatibility only; the M3 runtime backend reads its
+        # buffers via get_buffers()/get_index_k_buffer() instead. kv_offset
+        # is zeroed rather than derived from the V-K address distance,
+        # which is not a whole number of KEY page strides in coalesced
+        # pools.
+        self.index_scales = torch.empty(
+            self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
+        )
+        for pool_id in range(self.num_pools):
+            layer_id = self.impl.layer_grouping[pool_id][0]
+            self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, Role.KEY)
+        self.kv_offset = torch.zeros(
+            self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
+        )
+        # Keep unused block offsets as safe block index 0.
+        self.host_kv_cache_block_offsets = torch.zeros(
+            self.num_pools,
+            index_mapper_capacity * self.max_beam_width,
+            2,  # key and value
+            self.max_blocks_per_seq,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+            device="cpu",
+        )
+
     def _get_batch_cache_indices_by_pool_id(
         self,
         request_ids,
         *,
         pool_id: int = 0,
         is_kv_aggregate: bool = True,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
     ):
         """Return per-request slot ids in ``[0, num_slots)`` directly.
 
@@ -429,22 +470,19 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         Bypass the conversion: the M3 forward path indexes paged
         views (built by :meth:`get_buffers` /
-        :meth:`get_index_k_buffer`) directly by slot id.
-        ``BAD_PAGE_INDEX`` slots stay as 0 to match the legacy
-        padding contract.
+        :meth:`get_index_k_buffer`) directly by slot id. Like the
+        base method, trim each request's padded page-index buffer to
+        the blocks it owns (optionally capped by
+        ``num_blocks_per_seq``).
         """
         res = []
-        for req_id in request_ids:
-            idx_tensor = torch.as_tensor(self.kv_cache_map[req_id].get_base_page_indices(pool_id))
-            res.append(
-                (
-                    torch.where(
-                        idx_tensor != BAD_PAGE_INDEX,
-                        idx_tensor,
-                        torch.full_like(idx_tensor, BAD_PAGE_INDEX),
-                    )
-                ).tolist()
-            )
+        for req_idx, req_id in enumerate(request_ids):
+            kv_cache = self.kv_cache_map[req_id]
+            num_blocks = kv_cache.num_blocks
+            if num_blocks_per_seq is not None:
+                num_blocks = min(num_blocks, num_blocks_per_seq[req_idx])
+            idx_tensor = torch.as_tensor(kv_cache.get_base_page_indices(pool_id)[:num_blocks])
+            res.append(idx_tensor.tolist())
         return res
 
     def get_block_ids_per_seq(self, request_ids):
