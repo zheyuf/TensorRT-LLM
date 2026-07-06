@@ -422,15 +422,26 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # which assumes pools hold exactly K+V per layer; M3 sparse layers
         # add a coalesced INDEX_KEY buffer, so that division does not hold
         # (see _build_pool_mapping_tensors).
-        self.kv_cache_pool_pointers, self.kv_cache_pool_mapping = (
-            self._build_pool_mapping_tensors()
-        )
+        self.kv_cache_pool_pointers, self.kv_cache_pool_mapping = self._build_pool_mapping_tensors()
         # index_scales / kv_offset / host_kv_cache_block_offsets exist for
         # AttentionOp compatibility only; the M3 runtime backend reads its
         # buffers via get_buffers()/get_index_k_buffer() instead. kv_offset
         # is zeroed rather than derived from the V-K address distance,
         # which is not a whole number of KEY page strides in coalesced
         # pools.
+        #
+        # These three tensors also feed the base
+        # ``KVCacheManagerV2.copy_batch_block_offsets`` (invoked every step
+        # by ``TrtllmAttentionMetadata.prepare()`` since the M3 attention
+        # metadata subclasses it). The copy kernel computes
+        # ``dst = index_scales[pool] * base_page_index (+ kv_offset[pool])``
+        # per block with no divisibility assumptions beyond the base V2
+        # ``max_blocks_per_seq % 4 == 0`` padding, so INDEX_KEY-coalesced
+        # pools (scale > 2) yield consistent-but-unused offsets rather than
+        # a crash. Nothing consumes them for M3: the M3 layers index paged
+        # views by slot id, and one-model speculative draft layers read
+        # ``draft_kv_cache_block_offsets`` from their separate standard
+        # draft manager.
         self.index_scales = torch.empty(
             self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
         )

@@ -2683,22 +2683,36 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 draft_kv_cache = None
                 if draft_kv_cache_manager is not None:
-                    draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
-                        req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
-                    )
-                    # Dummy path: see comment above, no salt.
-                    if draft_kv_cache is None:
-                        release_resources(req)
-                        return None
-                    success = draft_kv_cache.resume(draft_kv_cache_manager._stream.cuda_stream)
-                    if not success:
-                        release_resources(req, free_draft_resources=True)
-                        return None
-                    draft_kv_cache.stop_committing()
-                    success = draft_kv_cache.resize(dummy_capacity)
-                    if not success:
-                        release_resources(req, free_draft_resources=True)
-                        return None
+                    if hasattr(draft_kv_cache_manager, "_create_kv_cache"):
+                        draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
+                            req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
+                        )
+                        # Dummy path: see comment above, no salt.
+                        if draft_kv_cache is None:
+                            release_resources(req)
+                            return None
+                        success = draft_kv_cache.resume(draft_kv_cache_manager._stream.cuda_stream)
+                        if not success:
+                            release_resources(req, free_draft_resources=True)
+                            return None
+                        draft_kv_cache.stop_committing()
+                        success = draft_kv_cache.resize(dummy_capacity)
+                        if not success:
+                            release_resources(req, free_draft_resources=True)
+                            return None
+                    else:
+                        # V1-family (standard KVCacheManager) draft manager,
+                        # e.g. the separate draft manager of one-model Eagle3
+                        # with a V2 sparse target (MiniMax-M3). Allocate via
+                        # the V1 batch API, mirroring
+                        # KVCacheManager.add_dummy_requests; freeing goes
+                        # through draft_kv_cache_manager.free_resources in
+                        # release_resources / the resource-manager registry.
+                        draft_kv_cache_manager.impl.add_sequence_batch(
+                            [(req.py_request_id, token_num, beam_width)], [req]
+                        )
+                        for _ in range(self.num_extra_kv_tokens):
+                            draft_kv_cache_manager.impl.add_token(req.py_request_id)
 
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -2716,6 +2730,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         if not success:
                             release_resources(req, free_draft_resources=True)
                             return None
+                    elif draft_kv_cache_manager is not None:
+                        # V1-family draft manager: extend by the draft tokens,
+                        # mirroring KVCacheManager.add_dummy_requests.
+                        for _ in range(_kv_draft):
+                            draft_kv_cache_manager.impl.add_token(req.py_request_id)
 
             if use_mrope:
                 _populate_dummy_mrope_config(req, token_num, is_gen)

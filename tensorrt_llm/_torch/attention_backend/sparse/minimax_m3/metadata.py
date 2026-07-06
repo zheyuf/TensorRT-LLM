@@ -14,8 +14,8 @@ Contains:
     :class:`KVCacheManagerV2`, and pre-allocate CUDA-graph-stable
     buffers.
   * :func:`get_minimax_m3_attention_metadata_cls` -- lazy factory for
-    the :class:`AttentionMetadata` subclass the pyexecutor wires into
-    the M3 sparse layer's forward path.
+    the :class:`TrtllmAttentionMetadata` subclass the pyexecutor wires
+    into the M3 sparse layer's forward path.
 """
 
 from __future__ import annotations
@@ -678,20 +678,38 @@ def build_runtime_metadata_from_kv_manager(
 def get_minimax_m3_attention_metadata_cls():
     """Return :class:`MiniMaxM3AttentionMetadata` (lazy import).
 
-    The class extends :class:`AttentionMetadata` so the pyexecutor's
-    metadata-creation/prepare hooks (model_engine.py) drive M3 metadata
-    construction outside the CUDA-graph capture window. Building the
-    M3-sparse ``req_to_token`` / ``slot_ids`` / ``out_cache_loc``
-    tensors during ``prepare()`` lands them on the GPU **before** the
-    forward call; the forward path then reads from the pre-built
-    attachment and performs no CPU->GPU copies, which is required for
-    CUDA-graph capture safety (``cudaErrorStreamCaptureUnsupported``
-    fires for CPU->GPU ``memcpyAsync`` calls inside a captured stream).
-    """
-    from ...interface import AttentionMetadata
+    The class extends :class:`TrtllmAttentionMetadata` so the
+    pyexecutor's metadata-creation/prepare hooks (model_engine.py)
+    drive M3 metadata construction outside the CUDA-graph capture
+    window. Building the M3-sparse ``req_to_token`` / ``slot_ids`` /
+    ``out_cache_loc`` tensors during ``prepare()`` lands them on the
+    GPU **before** the forward call; the forward path then reads from
+    the pre-built attachment and performs no CPU->GPU copies, which is
+    required for CUDA-graph capture safety
+    (``cudaErrorStreamCaptureUnsupported`` fires for CPU->GPU
+    ``memcpyAsync`` calls inside a captured stream).
 
-    class MiniMaxM3AttentionMetadata(AttentionMetadata):
-        """:class:`AttentionMetadata` that pre-builds MiniMax-M3 metadata.
+    Subclassing :class:`TrtllmAttentionMetadata` (precedent:
+    ``DSAtrtllmAttentionMetadata``) rather than the plain
+    :class:`AttentionMetadata` is required for one-model speculative
+    decoding (Eagle3): the draft layers live in the same engine and run
+    :class:`TrtllmAttention` against this shared per-step metadata, so
+    it must carry the TRTLLM surface (``kv_lens_cuda``,
+    ``host_request_types``, ``kv_cache_block_offsets``,
+    ``draft_kv_cache_block_offsets``, ``update_spec_dec_param``, ...).
+    The engine also gates spec-dec plumbing (draft KV cache swap,
+    overlap-scheduler ``kv_lens_cuda`` fixups) on
+    ``isinstance(..., TrtllmAttentionMetadata)``. The M3 sparse layers
+    themselves keep consuming only the ``minimax_m3`` attachment; the
+    TRTLLM-side block-offset tensors built against the M3 cache manager
+    are consistent but unused (the M3 manager's AttentionOp tensors are
+    synthetic, see ``MiniMaxM3KVCacheManagerV2._prepare_page_table_tensor``).
+    """
+    from ...trtllm import TrtllmAttentionMetadata
+
+    class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
+        """:class:`TrtllmAttentionMetadata` that pre-builds MiniMax-M3
+        metadata.
 
         Overrides :meth:`prepare` so the M3-sparse
         :class:`MiniMaxM3SparseAttentionMetadata` and the per-new-token
@@ -700,7 +718,9 @@ def get_minimax_m3_attention_metadata_cls():
         stored as ``self.minimax_m3 = {"metadata": m3_meta,
         "out_cache_loc": out_cache_loc}`` so the model layer's
         ``_dense_forward`` and ``_sparse_forward`` can read it without
-        any device migration.
+        any device migration. ``super().prepare()`` runs the full
+        TRTLLM preparation first (kv lens, request types, block
+        offsets), which one-model speculative draft layers consume.
 
         Test paths that build their own metadata can short-circuit by
         attaching ``attn_metadata.minimax_m3`` directly before calling
@@ -853,22 +873,30 @@ def get_minimax_m3_attention_metadata_cls():
             # chunk is ``extend_seq_len``; for decode rows
             # ``num_cached`` is ``kv_len - 1`` and ``extend_seq_len`` is
             # 1, so the same builder produces the correct one-slot
-            # entry. Pure-decode batches (``num_contexts == 0``) still
-            # take the decode optimization for CUDA-graph warmup
-            # geometry.
+            # entry.
+            #
+            # Pure-generation batches also take the extend path when any
+            # row carries more than one new token this step: one-model
+            # speculative decoding (e.g. Eagle3) verifies gen rows with
+            # per-row seq len ``1 + draft_len``, which the decode branch
+            # (hard-wired to one slot per row) cannot represent. The
+            # decode branch below is a perf specialization reserved for
+            # pure-decode batches where every row appends exactly one
+            # token; this keeps the CUDA-graph warmup geometry for
+            # non-speculative decode unchanged.
             #
             # Mixed prefill+decode batches always take the extend path:
             # the prefill kernel handles decode rows as 1-slot extends.
-            # The decode branch below is a pure-decode-only perf
-            # specialization. (iter-131 regression: previously a wrong
-            # predicate routed mixed batches into the decode branch and
-            # crashed in index_copy_.)
-            is_extend = num_contexts > 0
+            # (iter-131 regression: previously a wrong predicate routed
+            # mixed batches into the decode branch and crashed in
+            # index_copy_.)
+            new_tokens_per_seq = [
+                kv_lens_cpu_list[b] - int(num_cached_per_seq[b]) for b in range(batch_size)
+            ]
+            is_extend = num_contexts > 0 or any(n > 1 for n in new_tokens_per_seq)
             if is_extend:
                 prefix_lens_list = [int(num_cached_per_seq[b]) for b in range(batch_size)]
-                extend_seq_lens_cpu = [
-                    kv_lens_cpu_list[b] - prefix_lens_list[b] for b in range(batch_size)
-                ]
+                extend_seq_lens_cpu = new_tokens_per_seq
                 prefix_lens = torch.tensor(
                     prefix_lens_list,
                     dtype=torch.int32,

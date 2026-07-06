@@ -31,7 +31,8 @@ from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
-                           get_spec_resource_manager)
+                           get_spec_resource_manager,
+                           should_use_separate_draft_kv_cache)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
@@ -631,6 +632,48 @@ def create_py_executor(
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
+
+    # MiniMax-M3 sparse attention constraints for one-model speculative
+    # decoding (e.g. Eagle3 one-model). The draft layers run TrtllmAttention
+    # against the shared per-step attention metadata, which is only viable
+    # when the draft layers get their own standard KV cache manager: the M3
+    # KVCacheManagerV2 coalesces the per-sparse-layer INDEX_KEY buffer with
+    # K/V, so its AttentionOp-facing tensors (pool mapping / block offsets)
+    # are synthetic and unusable by the C++ attention op. Raise at creation
+    # time instead of failing deep inside the draft forward. Standalone SA
+    # is exempt: it is one-engine but attaches no draft layers.
+    if (sparse_attention_config is not None and getattr(
+            sparse_attention_config, 'algorithm', None) == "minimax_m3"
+            and spec_config is not None
+            and spec_config.spec_dec_mode.use_one_engine()
+            and not spec_config.spec_dec_mode.is_sa()):
+        if getattr(spec_config, 'is_linear_tree', True) is False:
+            raise NotImplementedError(
+                "Tree-based speculative decoding (eagle_choices / "
+                "use_dynamic_tree) is not supported with MiniMax-M3 sparse "
+                "attention: the M3 sparse kernels implement linear-chain "
+                "verification only (no packed-mask or draft-token relocation "
+                "support). Remove eagle_choices / use_dynamic_tree from the "
+                "speculative config to use a linear draft chain.")
+        if mapping.enable_attention_dp:
+            raise NotImplementedError(
+                "One-model speculative decoding with MiniMax-M3 sparse "
+                "attention is not supported with attention DP: attention DP "
+                "forces the draft layers to share the target's "
+                "MiniMaxM3KVCacheManagerV2, whose AttentionOp tensors are "
+                "synthetic (INDEX_KEY-coalesced pools), so the draft "
+                "attention would read garbage block offsets. Disable "
+                "attention DP or use two-model speculative decoding "
+                "(eagle3_one_model=False).")
+        if not should_use_separate_draft_kv_cache(spec_config):
+            raise NotImplementedError(
+                "One-model speculative decoding with MiniMax-M3 sparse "
+                "attention requires a separate draft KV cache manager, but "
+                "it is disabled for this configuration (e.g. disaggregated "
+                "serving disables it as a WAR for nvbug 5807902). Sharing "
+                "the MiniMaxM3KVCacheManagerV2 with the draft layers is not "
+                "supported (synthetic AttentionOp tensors). Use two-model "
+                "speculative decoding (eagle3_one_model=False) instead.")
 
     # Set default value for cache_transceiver_config.max_tokens_in_buffer
     if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:

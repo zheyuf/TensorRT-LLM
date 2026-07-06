@@ -1192,6 +1192,24 @@ class PyTorchModelEngine(ModelEngine):
         if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
             return
 
+        # MiniMax-M3 sparse: the attention metadata subclasses
+        # TrtllmAttentionMetadata (for one-model speculative draft layers),
+        # but the M3 target layers do not run TRTLLM-Gen kernels, and the
+        # warmup's dummy requests cannot be built: the V2 target cache
+        # manager's add_dummy_requests only knows how to create draft KV
+        # through a V2 draft manager, while the one-model draft manager is
+        # the standard V1 KVCacheManager. Skip the warmup (pre-rebase
+        # behavior); draft-layer kernels JIT-compile on first use.
+        # TODO(TRTLLM-14093): teach KVCacheManagerV2.add_dummy_requests the
+        # V1 draft-manager path and remove this gate.
+        if (self.sparse_attention_config is not None
+                and getattr(self.sparse_attention_config, 'algorithm',
+                            None) == 'minimax_m3'):
+            logger.info(
+                "Skipping TRTLLM-Gen FMHA JIT warmup for MiniMax-M3 sparse "
+                "attention")
+            return
+
         @contextlib.contextmanager
         def trtllm_gen_fmha_jit_warmup():
             previous = self._trtllm_gen_jit_warmup
