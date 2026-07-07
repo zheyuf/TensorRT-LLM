@@ -1192,22 +1192,22 @@ class PyTorchModelEngine(ModelEngine):
         if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
             return
 
-        # MiniMax-M3 sparse: the attention metadata subclasses
-        # TrtllmAttentionMetadata (for one-model speculative draft layers),
-        # but the M3 target layers do not run TRTLLM-Gen kernels, and the
-        # warmup's dummy requests cannot be built: the V2 target cache
-        # manager's add_dummy_requests only knows how to create draft KV
-        # through a V2 draft manager, while the one-model draft manager is
-        # the standard V1 KVCacheManager. Skip the warmup (pre-rebase
-        # behavior); draft-layer kernels JIT-compile on first use.
-        # TODO(TRTLLM-14093): teach KVCacheManagerV2.add_dummy_requests the
-        # V1 draft-manager path and remove this gate.
-        if (self.sparse_attention_config is not None
-                and getattr(self.sparse_attention_config, 'algorithm',
-                            None) == 'minimax_m3'):
+        # MiniMax-M3 sparse: the M3 target layers run the Python sparse
+        # backend and never touch TRTLLM-Gen kernels; the attention
+        # metadata subclasses TrtllmAttentionMetadata only so one-model
+        # speculative draft layers (Eagle3) can run TRTLLM attention.
+        # Those draft layers exist exactly when the separate draft KV
+        # cache manager is present (py_executor_creator raises for M3
+        # one-model configs without it), so skip the warmup only when
+        # there is nothing TRTLLM-Gen to warm — otherwise the draft
+        # layer's generation kernels JIT-compile at startup instead of
+        # on the first speculative step.
+        if (self.sparse_attention_config is not None and getattr(
+                self.sparse_attention_config, 'algorithm', None) == 'minimax_m3'
+                and self._get_draft_kv_cache_manager(resource_manager) is None):
             logger.info(
                 "Skipping TRTLLM-Gen FMHA JIT warmup for MiniMax-M3 sparse "
-                "attention")
+                "attention: no one-model speculative draft layers to warm")
             return
 
         @contextlib.contextmanager

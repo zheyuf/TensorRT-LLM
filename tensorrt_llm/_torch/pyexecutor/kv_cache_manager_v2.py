@@ -2723,7 +2723,15 @@ class KVCacheManagerV2(BaseResourceManager):
                     new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
                     if not success:
-                        release_resources(req, free_draft_resources=draft_kv_cache is not None)
+                        # Draft resources exist for this request whenever a
+                        # draft manager was supplied: V2-family holds the
+                        # draft_kv_cache handle, V1-family allocated via
+                        # impl.add_sequence_batch (no handle) — keying on the
+                        # handle alone leaked V1 draft blocks here.
+                        release_resources(
+                            req,
+                            free_draft_resources=draft_kv_cache_manager is not None,
+                        )
                         return None
                     if draft_kv_cache is not None:
                         success = draft_kv_cache.resize(new_capacity)
