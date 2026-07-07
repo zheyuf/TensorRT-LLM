@@ -971,3 +971,159 @@ def test_minimax_m3_swiglu_oai_dense_mlp_under_adp_is_replicated():
         "ADP down_proj must skip the cross-rank all-reduce; otherwise it "
         "mixes outputs across independent rank-local token sets"
     )
+
+
+# ---------------------------------------------------------------------------
+# Overlap-scheduler correction hook (on_update_kv_lens)
+# ---------------------------------------------------------------------------
+#
+# With the overlap scheduler + speculative decoding, prepare() builds the M3
+# attachment from optimistic cached counts (full draft acceptance assumed);
+# the engine later corrects kv_lens_cuda on device and invokes
+# on_update_kv_lens(). These tests build an attachment with optimistic
+# values, apply per-row rejection deltas to kv_lens_cuda, run the hook, and
+# assert the attachment matches a from-scratch build using the true counts.
+
+
+def _build_extend_attachment(device, req_to_token, prefix_lens, ext_lens):
+    """Mirror build_runtime_metadata_from_kv_manager's extend construction."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import (
+        MiniMaxM3SparseAttentionMetadata,
+    )
+
+    batch = len(prefix_lens)
+    seq_lens = [p + e for p, e in zip(prefix_lens, ext_lens)]
+    cu = [0]
+    out_cache_loc = []
+    q_batch_row = []
+    q_positions = []
+    for b in range(batch):
+        for offset in range(ext_lens[b]):
+            pos = prefix_lens[b] + offset
+            out_cache_loc.append(int(req_to_token[b, pos].item()))
+            q_batch_row.append(b)
+            q_positions.append(pos)
+        cu.append(cu[-1] + ext_lens[b])
+    meta = MiniMaxM3SparseAttentionMetadata(
+        is_prefill=True,
+        req_to_token=req_to_token,
+        slot_ids=torch.arange(batch, dtype=torch.int32, device=device),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int32),
+        prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32, device=device),
+        cu_seqlens_q=torch.tensor(cu, dtype=torch.int32, device=device),
+        extend_seq_lens_cpu=list(ext_lens),
+        q_batch_row=torch.tensor(q_batch_row, dtype=torch.int32, device=device),
+        q_positions=torch.tensor(q_positions, dtype=torch.int32, device=device),
+    )
+    return meta, torch.tensor(out_cache_loc, dtype=torch.int32, device=device)
+
+
+def _make_hook_host(device, meta, out_cache_loc, kv_lens):
+    """Minimal MiniMaxM3AttentionMetadata carrying just what the hook reads."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import (
+        get_minimax_m3_attention_metadata_cls,
+    )
+
+    cls = get_minimax_m3_attention_metadata_cls()
+    host = cls.__new__(cls)  # skip dataclass init; the hook reads 3 attrs
+    host.enable_flash_mla = False  # consumed by super().on_update_kv_lens()
+    host.kv_lens_cuda = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    host.minimax_m3 = {"metadata": meta, "out_cache_loc": out_cache_loc}
+    return host
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="device tensors required")
+def test_on_update_kv_lens_rederives_extend_attachment():
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, max_kv_len, draft_w = 3, 32, 4
+    # Random-but-distinct slot table so wrong gathers are detectable.
+    req_to_token = (
+        torch.randperm(batch * max_kv_len, dtype=torch.int32).reshape(batch, max_kv_len).to(device)
+    )
+
+    true_prefix = [7, 12, 5]
+    rejected = [2, 0, 3]  # per-row rejected draft tokens from step N
+    optimistic_prefix = [p + r for p, r in zip(true_prefix, rejected)]
+    ext = [draft_w] * batch
+
+    meta, out_loc = _build_extend_attachment(device, req_to_token, optimistic_prefix, ext)
+    truth_meta, truth_out_loc = _build_extend_attachment(device, req_to_token, true_prefix, ext)
+
+    corrected_kv_lens = [p + e for p, e in zip(true_prefix, ext)]
+    host = _make_hook_host(device, meta, out_loc, corrected_kv_lens)
+    host.on_update_kv_lens()
+
+    torch.testing.assert_close(meta.seq_lens, truth_meta.seq_lens)
+    torch.testing.assert_close(meta.prefix_lens, truth_meta.prefix_lens)
+    torch.testing.assert_close(meta.q_positions, truth_meta.q_positions)
+    torch.testing.assert_close(out_loc, truth_out_loc)
+    # Idempotent: a second invocation (the hook fires pre- and
+    # post-correction each step) must be an identity.
+    host.on_update_kv_lens()
+    torch.testing.assert_close(meta.prefix_lens, truth_meta.prefix_lens)
+    torch.testing.assert_close(out_loc, truth_out_loc)
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="device tensors required")
+def test_on_update_kv_lens_identity_without_correction():
+    device = torch.device("cuda")
+    batch, max_kv_len = 2, 16
+    req_to_token = (
+        torch.arange(batch * max_kv_len, dtype=torch.int32).reshape(batch, max_kv_len).to(device)
+    )
+    prefix = [4, 9]
+    ext = [3, 3]
+    meta, out_loc = _build_extend_attachment(device, req_to_token, prefix, ext)
+    before = (
+        meta.seq_lens.clone(),
+        meta.prefix_lens.clone(),
+        meta.q_positions.clone(),
+        out_loc.clone(),
+    )
+    kv_lens = [p + e for p, e in zip(prefix, ext)]  # uncorrected == optimistic
+    host = _make_hook_host(device, meta, out_loc, kv_lens)
+    host.on_update_kv_lens()
+    torch.testing.assert_close(meta.seq_lens, before[0])
+    torch.testing.assert_close(meta.prefix_lens, before[1])
+    torch.testing.assert_close(meta.q_positions, before[2])
+    torch.testing.assert_close(out_loc, before[3])
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="device tensors required")
+def test_on_update_kv_lens_decode_branch():
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import (
+        MiniMaxM3SparseAttentionMetadata,
+    )
+
+    device = torch.device("cuda")
+    batch, max_kv_len = 2, 16
+    req_to_token = (
+        torch.arange(batch * max_kv_len, dtype=torch.int32).reshape(batch, max_kv_len).to(device)
+    )
+    optimistic = [10, 8]
+    true_lens = [9, 6]
+    meta = MiniMaxM3SparseAttentionMetadata(
+        is_prefill=False,
+        req_to_token=req_to_token,
+        slot_ids=torch.arange(batch, dtype=torch.int32, device=device),
+        seq_lens=torch.tensor(optimistic, dtype=torch.int32, device=device),
+        seq_lens_cpu=torch.tensor(optimistic, dtype=torch.int32),
+    )
+    out_loc = torch.tensor(
+        [int(req_to_token[b, optimistic[b] - 1].item()) for b in range(batch)],
+        dtype=torch.int32,
+        device=device,
+    )
+    host = _make_hook_host(device, meta, out_loc, true_lens)
+    host.on_update_kv_lens()
+    expected = torch.tensor(
+        [int(req_to_token[b, true_lens[b] - 1].item()) for b in range(batch)],
+        dtype=torch.int32,
+        device=device,
+    )
+    torch.testing.assert_close(
+        meta.seq_lens, torch.tensor(true_lens, dtype=torch.int32, device=device)
+    )
+    torch.testing.assert_close(out_loc, expected)

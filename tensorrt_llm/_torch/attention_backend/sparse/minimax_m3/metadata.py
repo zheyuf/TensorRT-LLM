@@ -929,6 +929,64 @@ def get_minimax_m3_attention_metadata_cls():
                 "out_cache_loc": out_cache_loc,
             }
 
+        def on_update_kv_lens(self) -> None:
+            """Re-derive the M3 attachment from the corrected ``kv_lens_cuda``.
+
+            With the overlap scheduler + speculative decoding, the host
+            schedules step N+1 before step N's draft accept/reject results
+            are known, so ``prepare()`` builds the attachment from
+            optimistic cached counts (full acceptance assumed). The engine
+            corrects ``kv_lens_cuda`` on device in ``_preprocess_inputs``
+            (model_engine.py) and invokes this hook; without the refresh
+            the M3 kernels read rejected-token K/V (stale ``seq_lens``
+            extent) and write the new step's K/V to shifted slots (stale
+            ``prefix_lens`` / ``q_positions`` / ``out_cache_loc``),
+            permanently corrupting the sequence's KV history. Same pattern
+            as ``DSAtrtllmAttentionMetadata.on_update_kv_lens``.
+
+            Every value is re-derived from the current ``kv_lens_cuda``,
+            entirely on device and sync-free (sizes come from tensor
+            shapes), so the recompute is idempotent across the hook's
+            pre- and post-correction invocations and is an identity
+            whenever no correction was applied (including context rows,
+            whose offsets are always zero). ``seq_lens_cpu`` /
+            ``max_seqlen_k`` intentionally keep the optimistic values:
+            they only bound arange widths that are masked by ``seq_lens``.
+            """
+            super().on_update_kv_lens()
+            m3 = getattr(self, "minimax_m3", None)
+            if m3 is None:
+                return
+            meta = m3["metadata"]
+            batch = int(meta.slot_ids.shape[0])
+            if batch == 0:
+                return
+            kv_lens = self.kv_lens_cuda[:batch]
+            meta.seq_lens[:batch].copy_(kv_lens)
+            rows = meta.slot_ids.to(torch.long)
+            row_width = meta.req_to_token.shape[1]
+            flat_r2t = meta.req_to_token.reshape(-1)
+            if meta.is_prefill:
+                # Extend path (all speculative verify steps). Q-side
+                # structure (cu_seqlens_q, q_batch_row, per-row widths) is
+                # unchanged by rejections; only the K-side prefix moves.
+                total_q = int(meta.q_positions.shape[0])
+                cu = meta.cu_seqlens_q
+                ext = cu[1 : batch + 1] - cu[:batch]
+                meta.prefix_lens[:batch].copy_(kv_lens - ext)
+                qbr = meta.q_batch_row[:total_q].to(torch.long)
+                tok = torch.arange(total_q, dtype=torch.int32, device=meta.q_positions.device)
+                new_pos = meta.prefix_lens[qbr] + (tok - cu[qbr])
+                meta.q_positions[:total_q].copy_(new_pos)
+                flat = rows[qbr] * row_width + new_pos.to(torch.long)
+                m3["out_cache_loc"][:total_q].copy_(flat_r2t.index_select(0, flat))
+            else:
+                # Pure-decode (one new token per row): reachable with a
+                # correction only when a draft-length schedule produces
+                # W == 1 steps; recompute is an identity otherwise.
+                flat = rows * row_width + (kv_lens.to(torch.long) - 1)
+                m3["out_cache_loc"][:batch].copy_(flat_r2t.index_select(0, flat))
+
     return MiniMaxM3AttentionMetadata
 
 

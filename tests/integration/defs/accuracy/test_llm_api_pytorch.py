@@ -7648,10 +7648,11 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # One-model Eagle3 speculative decoding on the NVFP4 checkpoint
         # with the Inferact/MiniMax-M3-EAGLE3 draft head (1-layer Llama
         # head trained on target layers matching the default capture set
-        # (1, 29, 56)). Runs eager with the overlap scheduler disabled:
-        # spec-dec-shaped CUDA-graph capture and the overlap scheduler's
-        # device-side kv-len fixups are not yet supported on the M3
-        # sparse-attention path. Accuracy must be within noise of
+        # (1, 29, 56)). Runs with the overlap scheduler enabled — the M3
+        # attachment is re-derived from the corrected kv_lens_cuda in
+        # MiniMaxM3AttentionMetadata.on_update_kv_lens — and eager:
+        # spec-dec-shaped CUDA-graph capture is not yet supported on the
+        # M3 sparse-attention path. Accuracy must be within noise of
         # test_nvfp4; the acceptance probe asserts speculation actually
         # accepts drafts (the head's published GSM8K mean acceptance
         # length is ~3.5 at max_draft_len=3; greedy).
@@ -7673,7 +7674,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  max_seq_len=4096,
                  speculative_config=spec_config,
                  cuda_graph_config=None,
-                 disable_overlap_scheduler=True,
+                 disable_overlap_scheduler=False,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = MMLU(model_name)
