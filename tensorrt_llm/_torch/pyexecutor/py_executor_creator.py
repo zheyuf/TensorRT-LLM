@@ -655,16 +655,6 @@ def create_py_executor(
                 "verification only (no packed-mask or draft-token relocation "
                 "support). Remove eagle_choices / use_dynamic_tree from the "
                 "speculative config to use a linear draft chain.")
-        if mapping.enable_attention_dp:
-            raise NotImplementedError(
-                "One-model speculative decoding with MiniMax-M3 sparse "
-                "attention is not supported with attention DP: attention DP "
-                "forces the draft layers to share the target's "
-                "MiniMaxM3KVCacheManagerV2, whose AttentionOp tensors are "
-                "synthetic (INDEX_KEY-coalesced pools), so the draft "
-                "attention would read garbage block offsets. Disable "
-                "attention DP or use two-model speculative decoding "
-                "(eagle3_one_model=False).")
         if not should_use_separate_draft_kv_cache(spec_config):
             raise NotImplementedError(
                 "One-model speculative decoding with MiniMax-M3 sparse "
