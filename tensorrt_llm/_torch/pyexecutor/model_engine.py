@@ -1192,16 +1192,9 @@ class PyTorchModelEngine(ModelEngine):
         if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
             return
 
-        # MiniMax-M3 sparse: the M3 target layers run the Python sparse
-        # backend and never touch TRTLLM-Gen kernels; the attention
-        # metadata subclasses TrtllmAttentionMetadata only so one-model
-        # speculative draft layers (Eagle3) can run TRTLLM attention.
-        # Those draft layers exist exactly when the separate draft KV
-        # cache manager is present (py_executor_creator raises for M3
-        # one-model configs without it), so skip the warmup only when
-        # there is nothing TRTLLM-Gen to warm — otherwise the draft
-        # layer's generation kernels JIT-compile at startup instead of
-        # on the first speculative step.
+        # MiniMax-M3 target layers never run TRTLLM-Gen kernels; the only
+        # consumers in an M3 engine are one-model speculative draft layers,
+        # which exist exactly when the separate draft KV cache manager does.
         if (self.sparse_attention_config is not None and getattr(
                 self.sparse_attention_config, 'algorithm', None) == 'minimax_m3'
                 and self._get_draft_kv_cache_manager(resource_manager) is None):

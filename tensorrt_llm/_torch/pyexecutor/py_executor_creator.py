@@ -634,14 +634,8 @@ def create_py_executor(
     sparse_attention_config = model_engine.sparse_attention_config
 
     # MiniMax-M3 sparse attention constraints for one-model speculative
-    # decoding (e.g. Eagle3 one-model). The draft layers run TrtllmAttention
-    # against the shared per-step attention metadata, which is only viable
-    # when the draft layers get their own standard KV cache manager: the M3
-    # KVCacheManagerV2 coalesces the per-sparse-layer INDEX_KEY buffer with
-    # K/V, so its AttentionOp-facing tensors (pool mapping / block offsets)
-    # are synthetic and unusable by the C++ attention op. Raise at creation
-    # time instead of failing deep inside the draft forward. Standalone SA
-    # is exempt: it is one-engine but attaches no draft layers.
+    # decoding: raise at creation time instead of failing deep inside the
+    # forward. Standalone SA is exempt (one-engine but no draft layers).
     if (sparse_attention_config is not None and getattr(
             sparse_attention_config, 'algorithm', None) == "minimax_m3"
             and spec_config is not None
@@ -652,18 +646,22 @@ def create_py_executor(
                 "Tree-based speculative decoding (eagle_choices / "
                 "use_dynamic_tree) is not supported with MiniMax-M3 sparse "
                 "attention: the M3 sparse kernels implement linear-chain "
-                "verification only (no packed-mask or draft-token relocation "
-                "support). Remove eagle_choices / use_dynamic_tree from the "
-                "speculative config to use a linear draft chain.")
+                "verification only. Remove eagle_choices / use_dynamic_tree "
+                "from the speculative config.")
+        if llm_args.cuda_graph_config is not None:
+            raise NotImplementedError(
+                "CUDA graphs are not supported with MiniMax-M3 sparse "
+                "attention and speculative decoding: multi-token verify "
+                "routes through the M3 extend path, which is not "
+                "capture-safe yet. Set cuda_graph_config to null.")
         if not should_use_separate_draft_kv_cache(spec_config):
             raise NotImplementedError(
                 "One-model speculative decoding with MiniMax-M3 sparse "
                 "attention requires a separate draft KV cache manager, but "
                 "it is disabled for this configuration (e.g. disaggregated "
-                "serving disables it as a WAR for nvbug 5807902). Sharing "
-                "the MiniMaxM3KVCacheManagerV2 with the draft layers is not "
-                "supported (synthetic AttentionOp tensors). Use two-model "
-                "speculative decoding (eagle3_one_model=False) instead.")
+                "serving disables it as a WAR for nvbug 5807902). Use "
+                "two-model speculative decoding (eagle3_one_model=False) "
+                "instead.")
 
     # Set default value for cache_transceiver_config.max_tokens_in_buffer
     if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:

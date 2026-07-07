@@ -940,15 +940,14 @@ class KvCacheCreator:
         in the target model and don't produce a separate ModelConfig. We fall
         back to the target model's config via _get_effective_draft_config().
         """
-        if self._mapping.enable_attention_dp and not self._is_kv_cache_manager_v2:
-            # Back-compat: V1-family targets under attention DP keep the
-            # shared-manager layout their deployments were validated with
-            # (spec layers appended to the target manager). V2-family
-            # targets (e.g. MiniMax-M3 sparse) cannot share — their
-            # AttentionOp-facing tensors are synthetic — so they use the
-            # separate draft manager regardless of attention DP.
-            logger.info("Attention DP with a V1 KV cache manager: draft layers "
-                        "share the target manager.")
+        if self._mapping.enable_attention_dp and getattr(
+                self._kv_cache_manager_cls, 'supports_shared_draft_layers',
+                True):
+            # Back-compat: attention DP keeps the shared-manager layout
+            # existing deployments were validated with, except for managers
+            # that cannot host draft layers (e.g. MiniMax-M3 sparse).
+            logger.info("Attention DP: draft layers share the target KV "
+                        "cache manager.")
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 

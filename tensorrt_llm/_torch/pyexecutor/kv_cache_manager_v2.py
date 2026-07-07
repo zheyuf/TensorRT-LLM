@@ -599,6 +599,12 @@ def _copy_swa_block_offsets_with_scratch_compiled(
 
 
 class KVCacheManagerV2(BaseResourceManager):
+    # Whether one-model speculative draft layers may be appended to this
+    # manager (shared layout). Subclasses whose AttentionOp-facing tensors
+    # are synthetic must override to False so draft layers get a separate
+    # manager instead.
+    supports_shared_draft_layers = True
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -2683,7 +2689,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 draft_kv_cache = None
                 if draft_kv_cache_manager is not None:
-                    if hasattr(draft_kv_cache_manager, "_create_kv_cache"):
+                    if isinstance(draft_kv_cache_manager, KVCacheManagerV2):
                         draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
                             req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
                         )
@@ -2701,18 +2707,22 @@ class KVCacheManagerV2(BaseResourceManager):
                             release_resources(req, free_draft_resources=True)
                             return None
                     else:
-                        # V1-family (standard KVCacheManager) draft manager,
-                        # e.g. the separate draft manager of one-model Eagle3
-                        # with a V2 sparse target (MiniMax-M3). Allocate via
-                        # the V1 batch API, mirroring
-                        # KVCacheManager.add_dummy_requests; freeing goes
-                        # through draft_kv_cache_manager.free_resources in
-                        # release_resources / the resource-manager registry.
-                        draft_kv_cache_manager.impl.add_sequence_batch(
-                            [(req.py_request_id, token_num, beam_width)], [req]
-                        )
-                        for _ in range(self.num_extra_kv_tokens):
-                            draft_kv_cache_manager.impl.add_token(req.py_request_id)
+                        # V1-family draft manager (no per-request cache
+                        # handles): allocate via the V1 batch API, mirroring
+                        # KVCacheManager.add_dummy_requests. The C++ side
+                        # raises on allocation failure rather than returning
+                        # a status, so release before propagating.
+                        draft_seq_added = False
+                        try:
+                            draft_kv_cache_manager.impl.add_sequence_batch(
+                                [(req.py_request_id, token_num, beam_width)], [req]
+                            )
+                            draft_seq_added = True
+                            for _ in range(self.num_extra_kv_tokens):
+                                draft_kv_cache_manager.impl.add_token(req.py_request_id)
+                        except Exception:
+                            release_resources(req, free_draft_resources=draft_seq_added)
+                            raise
 
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -2741,8 +2751,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     elif draft_kv_cache_manager is not None:
                         # V1-family draft manager: extend by the draft tokens,
                         # mirroring KVCacheManager.add_dummy_requests.
-                        for _ in range(_kv_draft):
-                            draft_kv_cache_manager.impl.add_token(req.py_request_id)
+                        try:
+                            for _ in range(_kv_draft):
+                                draft_kv_cache_manager.impl.add_token(req.py_request_id)
+                        except Exception:
+                            release_resources(req, free_draft_resources=True)
+                            raise
 
             if use_mrope:
                 _populate_dummy_mrope_config(req, token_num, is_gen)

@@ -4787,11 +4787,8 @@ class PyExecutor:
                     and self.max_num_tokens is not None):
                 token_nums = [self.max_num_tokens]
             dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
-            # One-model speculative configs with a separate draft KV cache
-            # manager need the dummy registered in BOTH managers; the
-            # DRAFT_KV_CACHE_MANAGER's prepare_resources otherwise calls
-            # add_token on a request id the draft manager never saw. None
-            # when there is no separate draft manager (identical behavior).
+            # A separate draft KV cache manager must also see the dummy, or
+            # its prepare_resources hits an unknown request id.
             draft_kv_cache_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
             llm_request = self.kv_cache_manager.add_dummy_requests(
