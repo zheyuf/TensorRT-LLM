@@ -636,12 +636,12 @@ def create_py_executor(
     # MiniMax-M3 sparse attention constraints for one-model speculative
     # decoding: raise at creation time instead of failing deep inside the
     # forward. Standalone SA is exempt (one-engine but no draft layers).
-    if (sparse_attention_config is not None and getattr(
-            sparse_attention_config, 'algorithm', None) == "minimax_m3"
+    if (sparse_attention_config is not None
+            and sparse_attention_config.algorithm == "minimax_m3"
             and spec_config is not None
             and spec_config.spec_dec_mode.use_one_engine()
             and not spec_config.spec_dec_mode.is_sa()):
-        if getattr(spec_config, 'is_linear_tree', True) is False:
+        if not spec_config.is_linear_tree:
             raise NotImplementedError(
                 "Tree-based speculative decoding (eagle_choices / "
                 "use_dynamic_tree) is not supported with MiniMax-M3 sparse "

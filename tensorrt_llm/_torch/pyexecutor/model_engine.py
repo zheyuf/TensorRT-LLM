@@ -1195,8 +1195,8 @@ class PyTorchModelEngine(ModelEngine):
         # MiniMax-M3 target layers never run TRTLLM-Gen kernels; the only
         # consumers in an M3 engine are one-model speculative draft layers,
         # which exist exactly when the separate draft KV cache manager does.
-        if (self.sparse_attention_config is not None and getattr(
-                self.sparse_attention_config, 'algorithm', None) == 'minimax_m3'
+        if (self.sparse_attention_config is not None
+                and self.sparse_attention_config.algorithm == 'minimax_m3'
                 and self._get_draft_kv_cache_manager(resource_manager) is None):
             logger.info(
                 "Skipping TRTLLM-Gen FMHA JIT warmup for MiniMax-M3 sparse "

@@ -1378,13 +1378,7 @@ _M3_GATE_BIAS_RENAME_MAP = {
 
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, PretrainedConfig]):
-    """Text-only M3 model.
-
-    Subclasses :class:`SpecDecOneEngineForCausalLM` so one-engine
-    speculative modes (Eagle3) can attach a draft model and spec
-    worker; without a ``speculative_config`` the base behaves exactly
-    like ``DecoderModelForCausalLM``.
-    """
+    """Text-only M3 model."""
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         raw_pretrained = model_config.pretrained_config

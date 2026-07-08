@@ -481,8 +481,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             num_blocks = kv_cache.num_blocks
             if num_blocks_per_seq is not None:
                 num_blocks = min(num_blocks, num_blocks_per_seq[req_idx])
-            idx_tensor = torch.as_tensor(kv_cache.get_base_page_indices(pool_id)[:num_blocks])
-            res.append(idx_tensor.tolist())
+            res.append(kv_cache.get_base_page_indices(pool_id)[:num_blocks].tolist())
         return res
 
     def get_block_ids_per_seq(self, request_ids):

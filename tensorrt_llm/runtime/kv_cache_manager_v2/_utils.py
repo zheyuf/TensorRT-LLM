@@ -99,7 +99,7 @@ def in_range(x: int, lower: int, upper: int) -> bool:
 
 
 def exact_div(x: int, y: int) -> int:
-    assert x % y == 0, f"exact_div: {x} not divisible by {y} (remainder {x % y})"
+    assert x % y == 0
     return x // y
 
 

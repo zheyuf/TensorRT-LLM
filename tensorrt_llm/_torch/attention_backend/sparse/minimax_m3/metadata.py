@@ -266,18 +266,11 @@ class MiniMaxM3SparseAttentionMetadata:
             self.max_seqlen_k = 1
         else:
             max_k = int(self.seq_lens_cpu[:batch_size].max().item())
-            # Under the overlap scheduler + speculative decoding,
-            # ``seq_lens_cpu`` holds optimistic (full-acceptance) lengths
-            # that can overhang the last allocated page when a request's
-            # true length sits at a page boundary. Positions beyond
-            # ``req_to_token``'s width are unaddressable — no slot exists
-            # for them — so clamp the host-side width bound. The sparse
-            # kernels merely arange over ``max_seqlen_k`` and mask by the
-            # corrected ``seq_lens``, but the dense fallback consumes it
-            # as the exact SDPA mask/gather width: an overhang makes the
-            # mask one wider than the gathered K and SDPA rejects the
-            # shape. Genuine out-of-range writes are still caught by
-            # ``_assert_paged_write_in_bounds`` on the write path.
+            # Optimistic (overlap+spec) lengths can overhang the page
+            # table at a page boundary — see
+            # derive_q_positions_and_cache_slots for the rationale. Clamp
+            # here too because the dense fallback consumes max_seqlen_k
+            # as the exact SDPA mask/gather width.
             if self.req_to_token is not None:
                 max_k = min(max_k, int(self.req_to_token.shape[1]))
             self.max_seqlen_k = max_k
@@ -627,14 +620,8 @@ def build_runtime_metadata_from_kv_manager(
         slot_ids = torch.arange(batch, device=device, dtype=torch.int32)
 
     # Compute out_cache_loc: per-new-token slot ids, in flattened order
-    # matching the q-token order the model layer projects. The Python
-    # loops below run on CPU lists derived from the CPU-resident
-    # ``seq_lens_cpu`` / ``prefix_lens`` / ``extend_seq_lens_cpu``, so
-    # no GPU sync is needed at this point. The resulting
-    # ``out_cache_loc`` tensor is constructed directly on ``device``.
-    # The ``int(...item())`` reads against ``req_to_token`` are a CPU
-    # sync but only ever run from ``prepare()`` (outside any CUDA-graph
-    # capture window) — they are not in the forward path.
+    # matching the q-token order the model layer projects — derived on
+    # device, sync-free, via derive_*_cache_slots.
     if is_prefill:
         if extend_seq_lens_cpu is None:
             raise ValueError("prefill metadata requires extend_seq_lens_cpu")
