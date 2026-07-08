@@ -426,11 +426,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # exact_div offset math does not hold (see
         # _build_pool_mapping_tensors).
         self.kv_cache_pool_pointers, self.kv_cache_pool_mapping = self._build_pool_mapping_tensors()
-        # The remaining tensors exist for AttentionOp/copy_batch_block_offsets
-        # compatibility only — nothing consumes them on the M3 path (layers
-        # index paged views by slot id; draft layers use their own manager).
-        # kv_offset stays zero: the V-K address distance is not a whole
-        # number of KEY page strides in coalesced pools.
+        # The remaining tensors must exist because the base
+        # copy_batch_block_offsets path (run by every TrtllmAttentionMetadata
+        # prepare()) reads them; their values never reach a kernel for M3 —
+        # layers index paged views by slot id and draft layers use their own
+        # manager. kv_offset stays zero: the V-K address distance is not a
+        # whole number of KEY page strides in coalesced pools, so the base
+        # derivation would assert.
         self.index_scales = torch.empty(
             self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
         )

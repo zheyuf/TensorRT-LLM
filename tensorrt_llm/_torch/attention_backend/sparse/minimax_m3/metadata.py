@@ -266,11 +266,11 @@ class MiniMaxM3SparseAttentionMetadata:
             self.max_seqlen_k = 1
         else:
             max_k = int(self.seq_lens_cpu[:batch_size].max().item())
-            # Optimistic (overlap+spec) lengths can overhang the page
-            # table at a page boundary — see
-            # derive_q_positions_and_cache_slots for the rationale. Clamp
-            # here too because the dense fallback consumes max_seqlen_k
-            # as the exact SDPA mask/gather width.
+            # Optimistic overlap+spec lengths can overhang the page table at
+            # a page boundary (see derive_q_positions_and_cache_slots); the
+            # dense fallback consumes max_seqlen_k as the exact SDPA
+            # mask/gather width, so an unclamped overhang crashes SDPA
+            # (mask 385 vs K 384 on MMLU).
             if self.req_to_token is not None:
                 max_k = min(max_k, int(self.req_to_token.shape[1]))
             self.max_seqlen_k = max_k
@@ -430,17 +430,15 @@ def derive_q_positions_and_cache_slots(
     qbr = q_batch_row.to(torch.long)
     tok = torch.arange(total_q, dtype=torch.int32, device=q_batch_row.device)
     q_positions = prefix_lens[qbr] + (tok - cu_seqlens_q[qbr])
-    # Under the overlap scheduler + speculative decoding the first
-    # derivation runs with optimistic (full-acceptance) prefix_lens whose
-    # positions can overhang the last allocated page when a request's
-    # true length sits at a page boundary. Those slots are placeholders —
-    # on_update_kv_lens re-derives them from the corrected kv_lens before
-    # any forward consumes them — but the gather itself must stay in
-    # bounds: an overhang on the last batch row trips the CUDA
-    # scatter/gather device assert, and on inner rows it silently reads
-    # the next request's slots. Clamp the table index only; the returned
-    # q_positions keep the optimistic values (mask widths are bounded
-    # separately by the max_seqlen_k clamp in prepare()).
+    # Overlap+spec: the first derivation runs with optimistic
+    # (full-acceptance) prefix_lens, which overhang the last allocated page
+    # when a request's true length sits at a page boundary. The overhanging
+    # slots are placeholders (on_update_kv_lens re-derives them from the
+    # corrected kv_lens before any forward consumes them), but the gather
+    # must stay in bounds: unclamped, the last row trips the CUDA gather
+    # assert and inner rows silently read the next request's slots. Clamp
+    # the table index only — q_positions keep the optimistic values, whose
+    # mask width prepare() bounds separately.
     idx = q_positions.to(torch.long).clamp_(min=0, max=req_to_token.shape[1] - 1)
     flat = qbr * req_to_token.shape[1] + idx
     return q_positions, req_to_token.reshape(-1).index_select(0, flat)
@@ -619,9 +617,8 @@ def build_runtime_metadata_from_kv_manager(
         req_to_token = req_to_token_fresh
         slot_ids = torch.arange(batch, device=device, dtype=torch.int32)
 
-    # Compute out_cache_loc: per-new-token slot ids, in flattened order
-    # matching the q-token order the model layer projects — derived on
-    # device, sync-free, via derive_*_cache_slots.
+    # out_cache_loc must be flattened in the q-token order the model layer
+    # projects, or K/V lands in the wrong requests' slots.
     if is_prefill:
         if extend_seq_lens_cpu is None:
             raise ValueError("prefill metadata requires extend_seq_lens_cpu")

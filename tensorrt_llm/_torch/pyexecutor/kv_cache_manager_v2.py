@@ -2744,8 +2744,9 @@ class KVCacheManagerV2(BaseResourceManager):
                             release_resources(req, free_draft_resources=True)
                             return None
                     elif draft_kv_cache_manager is not None:
-                        # V1-family draft manager: extend by the draft tokens,
-                        # mirroring KVCacheManager.add_dummy_requests.
+                        # Gen dummies must expose a 1 + draft_len kv span to
+                        # the draft layers; a V1 manager only grows a
+                        # sequence via add_token.
                         try:
                             for _ in range(_kv_draft):
                                 draft_kv_cache_manager.impl.add_token(req.py_request_id)
