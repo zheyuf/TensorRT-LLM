@@ -430,9 +430,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # copy_batch_block_offsets path (run by every TrtllmAttentionMetadata
         # prepare()) reads them; their values never reach a kernel for M3 —
         # layers index paged views by slot id and draft layers use their own
-        # manager. kv_offset stays zero: the V-K address distance is not a
-        # whole number of KEY page strides in coalesced pools, so the base
-        # derivation would assert.
+        # manager. kv_offset stays zero because no M3 consumer reads the
+        # value; zero keeps init independent of the base's V-K stride
+        # derivation on coalesced pools (PR #15984 keeps that derivation
+        # instead — verified working at TP4, so either choice is sound).
         self.index_scales = torch.empty(
             self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
         )
