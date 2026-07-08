@@ -1279,3 +1279,58 @@ def test_prepare_keeps_in_bounds_max_seqlen_k():
     )
     meta.prepare()
     assert meta.max_seqlen_k == max(in_bounds)
+
+
+# The extend/decode routing predicate in MiniMaxM3AttentionMetadata.prepare()
+# is the line that makes one-model speculative decoding representable at all:
+# spec verify presents pure-generation rows carrying 1 + draft_len tokens,
+# which the decode attachment (hard-wired to one slot per row) cannot hold.
+# Mutation testing showed no unit test pinned it (reverting to the pre-spec
+# `num_contexts > 0` predicate passed the whole suite), so pin the routing
+# decision itself: run prepare() with the TRTLLM base prepare stubbed and the
+# M3 builder mocked, and assert which attachment kind prepare() requested.
+
+
+def _prepare_routing_decision(new_tokens, num_cached, num_contexts):
+    from unittest import mock
+
+    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata as m3_metadata
+    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+
+    cls = m3_metadata.get_minimax_m3_attention_metadata_cls()
+    obj = object.__new__(cls)
+    obj.request_ids = list(range(len(new_tokens)))
+    obj.seq_lens = torch.tensor(new_tokens, dtype=torch.int32)
+    obj.seq_lens_cpu = torch.tensor(new_tokens, dtype=torch.int32)
+    obj.num_contexts = num_contexts
+    obj._m3_static_buffers = None
+    obj.kv_cache_params = mock.Mock(num_cached_tokens_per_seq=num_cached)
+
+    fake_manager = mock.Mock(spec=["get_index_k_buffer", "get_buffers"])
+    fake_manager.get_buffers.return_value = torch.empty(1)  # cache_device = cpu
+    obj.kv_cache_manager = fake_manager
+
+    with (
+        mock.patch.object(TrtllmAttentionMetadata, "prepare", lambda self: None),
+        mock.patch.object(
+            m3_metadata,
+            "build_runtime_metadata_from_kv_manager",
+            return_value=(mock.MagicMock(), mock.MagicMock()),
+        ) as builder,
+    ):
+        obj.prepare()
+    assert builder.call_count == 1
+    return builder.call_args.kwargs["is_prefill"]
+
+
+def test_prepare_routes_multitoken_gen_rows_to_extend():
+    # Spec verify: pure-gen batch, every row carries 1 + draft_len tokens.
+    assert _prepare_routing_decision([4, 4], [10, 20], num_contexts=0) is True
+    # Mixed batch with one multi-token gen row (iter-131 class of bug).
+    assert _prepare_routing_decision([5, 1], [0, 20], num_contexts=1) is True
+
+
+def test_prepare_routes_pure_single_token_decode_to_decode():
+    # Non-speculative decode keeps the one-slot-per-row perf specialization
+    # (and with it the CUDA-graph warmup geometry).
+    assert _prepare_routing_decision([1, 1], [10, 20], num_contexts=0) is False

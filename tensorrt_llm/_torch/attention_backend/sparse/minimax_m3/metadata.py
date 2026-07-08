@@ -979,8 +979,6 @@ def get_minimax_m3_attention_metadata_cls():
                 return
             meta = m3["metadata"]
             batch = int(meta.slot_ids.shape[0])
-            if batch == 0:
-                return
             kv_lens = self.kv_lens_cuda[:batch]
             meta.seq_lens[:batch].copy_(kv_lens)
             if meta.is_prefill:

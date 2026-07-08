@@ -599,11 +599,6 @@ def _copy_swa_block_offsets_with_scratch_compiled(
 
 
 class KVCacheManagerV2(BaseResourceManager):
-    # Whether one-model speculative draft layers may be appended to this
-    # manager (shared layout). Subclasses whose AttentionOp-facing tensors
-    # are synthetic must override to False so draft layers get a separate
-    # manager instead.
-    supports_shared_draft_layers = True
 
     def __init__(
         self,
