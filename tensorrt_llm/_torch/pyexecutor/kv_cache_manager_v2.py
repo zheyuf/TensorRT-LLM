@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Se
 import torch
 from strenum import StrEnum
 
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -996,7 +997,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self._log_kv_cache_pool_lifecycle_mapping()
 
-    def _build_pool_mapping_tensors(self):
+    def _build_pool_mapping_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Build the `(kv_cache_pool_pointers, kv_cache_pool_mapping)` tensors.
 
         Extracted into an overridable hook: subclasses whose pools
@@ -1575,6 +1576,24 @@ class KVCacheManagerV2(BaseResourceManager):
         new roles do not require C++ changes.
         """
         return None
+
+    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
+        """Map native cache roles to disaggregation mapper kinds.
+
+        ``Role.ALL`` is the required fallback for roles without an explicit
+        entry. The default preserves the legacy whole-slot ``INDEXED`` page
+        table. Model-specific managers may declare logical layouts without
+        requiring the shared extractor to inspect private attributes or role
+        names. MiniMax M3, for example, maps ordinary K/V to ``NHD`` and its
+        replicated index-key side cache to ``REPLICATED``.
+
+        Pool memory is layout-agnostic; this declaration describes what the
+        manager's paired attention backend actually writes. A static mapping
+        is valid only for a fixed manager/backend pair. A manager whose backend
+        selects the layout at runtime must derive the mapping from that
+        backend's configuration.
+        """
+        return {Role.ALL: MapperKind.INDEXED}
 
     @property
     def blocks_in_primary_pool(self) -> int:

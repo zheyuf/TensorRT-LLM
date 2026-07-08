@@ -21,6 +21,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PoolView,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MambaHybridCacheManager,
     PythonMambaCacheManager,
@@ -29,13 +30,20 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
 
+_V2_ROLE_MAPPER_KINDS = frozenset(
+    {
+        MapperKind.INDEXED,
+        MapperKind.REPLICATED,
+        MapperKind.NHD,
+    }
+)
+
 
 class KVRegionExtractorV1(RegionExtractorBase):
-    """
-    Descriptor and region extractor for KV cache pool managed by
-    KVCacheManager, KVCacheManagerV2, or described by a KVCachePageTable.
+    """Extract descriptors and regions from KV cache pools.
 
-    Provides region descriptors for adapting block-wise view.
+    Supports pools managed by KVCacheManager or KVCacheManagerV2, as well as
+    pools described directly by a KVCachePageTable.
     """
 
     def __init__(self, kv_arg):
@@ -57,14 +65,11 @@ class KVRegionExtractorV1(RegionExtractorBase):
         layer_group_id: int = 0,
         pool_idx: int = 0,
     ) -> SpecRegion:
-        """
-        Given a list of region_ids (block IDs or slot IDs), returns a single
-        SpecRegion whose memory is a MemRegionGroup containing all blocks
-        described by region_ids.
+        """Return the memory regions for the provided block or slot IDs.
 
-        For KV cache: each ptr = base_address + slot_id * slot_bytes, pointing
-        to the start of a full slot.  The slot contains buffer entries for all
-        layers in this layer_group laid out contiguously from offset 0.
+        Each pointer is ``base_address + slot_id * slot_bytes`` and addresses
+        the selected logical view within a slot. The slot contains entries for
+        all layers in this layer group laid out contiguously from offset zero.
 
         Args:
             layer_group_id: The layer group index (= life cycle index).
@@ -74,13 +79,14 @@ class KVRegionExtractorV1(RegionExtractorBase):
         pv = lg.pool_views[pool_idx]
         pool = get_physical_pool(self._page_table, layer_group_id, pv.pool_idx)
 
-        base_ptr = pool.base_address
-        block_size = pool.slot_bytes
+        base_ptr = pool.base_address + pv.byte_offset
+        block_stride = pool.slot_bytes
+        region_size = pv.bytes_per_region if pv.bytes_per_region is not None else pool.slot_bytes
 
         # KV cache: filter out invalid block_ids (BAD_PAGE_INDEX = -1)
         valid = region_ids >= 0
-        ptrs = base_ptr + block_size * region_ids[valid]
-        memory = MemRegionGroup(ptrs=ptrs, bytes_per_region=block_size)
+        ptrs = base_ptr + block_stride * region_ids[valid]
+        memory = MemRegionGroup(ptrs=ptrs, bytes_per_region=region_size)
         return SpecRegion(memory=memory)
 
 
@@ -325,6 +331,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     # ``PoolView.pool_role``, the manager-supplied equivalence label that
     # disagg uses to match pools across peers without enumerating roles.
     buffer_by_lc_pool: Dict[tuple, list] = defaultdict(list)
+    buffer_ids_by_lc_layer: Dict[tuple, list] = defaultdict(list)
     native_roles_by_pool: Dict[tuple, set] = defaultdict(set)
 
     for buffer_id, attr in storage._buffer_attr.items():
@@ -333,7 +340,36 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         pool_idx = attr.pool_index
         pool_key = (int(lc_id), pool_idx)
         buffer_by_lc_pool[pool_key].append((layer_id, attr.offset, attr.size))
+        buffer_ids_by_lc_layer[(int(lc_id), int(layer_id))].append(buffer_id)
         native_roles_by_pool[pool_key].add(str(role))
+
+    # Every V2 manager declares how native roles map to the closed set of
+    # disaggregation mappers. Role.ALL is the fallback for future/native roles
+    # unknown to this shared extractor. An all-INDEXED mapping preserves the
+    # legacy whole-slot page table; any logical mapper opts every PP rank into
+    # per-layer views, even when that rank has no local buffer of the overriding
+    # role (for example, a dense-only MiniMax rank without INDEX_KEY).
+    role_mapper_kinds = manager.get_disagg_role_mapper_kinds()
+    if Role.ALL not in role_mapper_kinds:
+        raise ValueError("Disaggregation role mapping must define Role.ALL")
+    for role, mapper_kind in role_mapper_kinds.items():
+        if not isinstance(mapper_kind, MapperKind):
+            raise ValueError(
+                f"Invalid disaggregation mapper kind {mapper_kind!r} for role {role!s}"
+            )
+        if mapper_kind not in _V2_ROLE_MAPPER_KINDS:
+            supported = ", ".join(kind.name for kind in sorted(_V2_ROLE_MAPPER_KINDS))
+            raise ValueError(
+                f"Unsupported V2 disaggregation mapper kind {mapper_kind.name} "
+                f"for role {role!s}; supported kinds: {supported}"
+            )
+    if MapperKind.INDEXED in role_mapper_kinds.values() and role_mapper_kinds != {
+        Role.ALL: MapperKind.INDEXED
+    }:
+        raise ValueError("MapperKind.INDEXED is only valid as the sole Role.ALL mapping")
+    default_mapper_kind = role_mapper_kinds[Role.ALL]
+    mapper_kind_order = list(dict.fromkeys(role_mapper_kinds.values()))
+    use_logical_views = any(kind != MapperKind.INDEXED for kind in mapper_kind_order)
 
     # Iterate over life cycles (layer groups), not storage pool groups.
     # Multiple layer_groups can share the same storage pool_group when their
@@ -385,24 +421,67 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         ]
 
         pool_views = []
-        for pool_idx in range(num_pools):
-            pool_key = (lc_idx, pool_idx)
-            buffers_info = buffer_by_lc_pool.get(pool_key, [])
+        if use_logical_views:
+            # Depending on topology, replicated side caches may occupy their
+            # own physical pools or be coalesced with sharded K/V. Describe
+            # each layer and role class as a logical byte range so matching is
+            # independent of that physical coalescing decision.
+            physical_pools = pool_groups[storage_pg_to_list_idx[storage_pg_idx]].pools
+            for layer_id in all_internal_layer_ids:
+                layer_buffers = buffer_ids_by_lc_layer.get((lc_idx, int(layer_id)), [])
+                buffers_by_mapper_kind: Dict[MapperKind, list] = defaultdict(list)
+                for buffer_id in layer_buffers:
+                    mapper_kind = role_mapper_kinds.get(buffer_id[1], default_mapper_kind)
+                    buffers_by_mapper_kind[mapper_kind].append(buffer_id)
 
-            # Skip pools that have no buffers for this layer group.
-            # Multiple life cycles may share the same storage pool group;
-            # only include pools that actually belong to this life cycle.
-            if not buffers_info:
-                continue
+                for mapper_kind in mapper_kind_order:
+                    buffers = buffers_by_mapper_kind.get(mapper_kind, [])
+                    if not buffers:
+                        continue
+                    for desc in manager.impl.get_aggregated_pages(buffers):
+                        desc_buffer_ids = [expanded.id for expanded in desc.buffers]
+                        first_attr = storage._buffer_attr[desc_buffer_ids[0]]
+                        pool_idx = int(first_attr.pool_index)
+                        pool_base = physical_pools[pool_idx].base_address
+                        entries = [
+                            (
+                                int(buffer_id[0]),
+                                int(storage._buffer_attr[buffer_id].offset),
+                                int(storage._buffer_attr[buffer_id].size),
+                            )
+                            for buffer_id in desc_buffer_ids
+                        ]
+                        pool_views.append(
+                            PoolView(
+                                pool_idx=pool_idx,
+                                buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
+                                pool_role=frozenset(
+                                    str(buffer_id[1]) for buffer_id in desc_buffer_ids
+                                ),
+                                mapper_kind=mapper_kind,
+                                byte_offset=int(desc.base) - pool_base,
+                                bytes_per_region=int(desc.size),
+                            )
+                        )
+        else:
+            for pool_idx in range(num_pools):
+                pool_key = (lc_idx, pool_idx)
+                buffers_info = buffer_by_lc_pool.get(pool_key, [])
 
-            pool_views.append(
-                PoolView(
-                    pool_idx=pool_idx,
-                    buffer_entries=np.array(buffers_info, dtype=BUFFER_ENTRY_DTYPE),
-                    pool_role=frozenset(native_roles_by_pool[pool_key]),
-                    mapper_kind=MapperKind.INDEXED,
+                # Skip pools that have no buffers for this layer group.
+                # Multiple life cycles may share the same storage pool group;
+                # only include pools that actually belong to this life cycle.
+                if not buffers_info:
+                    continue
+
+                pool_views.append(
+                    PoolView(
+                        pool_idx=pool_idx,
+                        buffer_entries=np.array(buffers_info, dtype=BUFFER_ENTRY_DTYPE),
+                        pool_role=frozenset(native_roles_by_pool[pool_key]),
+                        mapper_kind=MapperKind.INDEXED,
+                    )
                 )
-            )
 
         # Determine layer group metadata.
         # For managers with virtual layers, internal layer_ids
