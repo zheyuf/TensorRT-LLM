@@ -265,7 +265,22 @@ class MiniMaxM3SparseAttentionMetadata:
         if batch_size == 0:
             self.max_seqlen_k = 1
         else:
-            self.max_seqlen_k = int(self.seq_lens_cpu[:batch_size].max().item())
+            max_k = int(self.seq_lens_cpu[:batch_size].max().item())
+            # Under the overlap scheduler + speculative decoding,
+            # ``seq_lens_cpu`` holds optimistic (full-acceptance) lengths
+            # that can overhang the last allocated page when a request's
+            # true length sits at a page boundary. Positions beyond
+            # ``req_to_token``'s width are unaddressable — no slot exists
+            # for them — so clamp the host-side width bound. The sparse
+            # kernels merely arange over ``max_seqlen_k`` and mask by the
+            # corrected ``seq_lens``, but the dense fallback consumes it
+            # as the exact SDPA mask/gather width: an overhang makes the
+            # mask one wider than the gathered K and SDPA rejects the
+            # shape. Genuine out-of-range writes are still caught by
+            # ``_assert_paged_write_in_bounds`` on the write path.
+            if self.req_to_token is not None:
+                max_k = min(max_k, int(self.req_to_token.shape[1]))
+            self.max_seqlen_k = max_k
 
 
 def ensure_metadata_on_device(
@@ -422,14 +437,35 @@ def derive_q_positions_and_cache_slots(
     qbr = q_batch_row.to(torch.long)
     tok = torch.arange(total_q, dtype=torch.int32, device=q_batch_row.device)
     q_positions = prefix_lens[qbr] + (tok - cu_seqlens_q[qbr])
-    flat = qbr * req_to_token.shape[1] + q_positions.to(torch.long)
+    # Under the overlap scheduler + speculative decoding the first
+    # derivation runs with optimistic (full-acceptance) prefix_lens whose
+    # positions can overhang the last allocated page when a request's
+    # true length sits at a page boundary. Those slots are placeholders —
+    # on_update_kv_lens re-derives them from the corrected kv_lens before
+    # any forward consumes them — but the gather itself must stay in
+    # bounds: an overhang on the last batch row trips the CUDA
+    # scatter/gather device assert, and on inner rows it silently reads
+    # the next request's slots. Clamp the table index only; the returned
+    # q_positions keep the optimistic values (mask widths are bounded
+    # separately by the max_seqlen_k clamp in prepare()).
+    idx = q_positions.to(torch.long).clamp_(min=0, max=req_to_token.shape[1] - 1)
+    flat = qbr * req_to_token.shape[1] + idx
     return q_positions, req_to_token.reshape(-1).index_select(0, flat)
 
 
 def derive_decode_cache_slots(req_to_token: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
-    """Decode-row KV slot ids (new token at position ``seq_lens[b] - 1``)."""
+    """Decode-row KV slot ids (new token at position ``seq_lens[b] - 1``).
+
+    The same optimistic-overhang clamp as
+    :func:`derive_q_positions_and_cache_slots` applies: optimistic
+    seq_lens can point one past the last allocated page at a page
+    boundary (and a zero-length dummy row would index -1); both are
+    placeholder rows whose slots are re-derived from corrected kv_lens
+    before use, so the gather only needs to stay in bounds.
+    """
     rows = torch.arange(seq_lens.shape[0], device=seq_lens.device, dtype=torch.long)
-    flat = rows * req_to_token.shape[1] + (seq_lens.to(torch.long) - 1)
+    idx = (seq_lens.to(torch.long) - 1).clamp_(min=0, max=req_to_token.shape[1] - 1)
+    flat = rows * req_to_token.shape[1] + idx
     return req_to_token.reshape(-1).index_select(0, flat)
 
 
