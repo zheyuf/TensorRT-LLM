@@ -7643,8 +7643,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
-    def test_nvfp4_eagle3(self, tp_size, ep_size):
+    def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp):
         # One-model Eagle3 speculative decoding on the NVFP4 checkpoint
         # with the Inferact/MiniMax-M3-EAGLE3 draft head (1-layer Llama
         # head trained on target layers matching the default capture set
@@ -7656,6 +7657,14 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # test_nvfp4; the acceptance probe asserts speculation actually
         # accepts drafts (the head's published GSM8K mean acceptance
         # length is ~3.5 at max_draft_len=3; greedy).
+        #
+        # The attention_dp=True variant covers M3's recommended DEP
+        # serving layout: the high-concurrency MMLU/GSM8K phase exercises
+        # DP-balanced scheduling and per-rank M3 metadata builds, while
+        # the batch-1 streaming acceptance probe forces the other DP
+        # ranks onto the attention-DP idle-rank dummy path every step —
+        # the path that registers the dummy in both the target and the
+        # separate draft KV cache manager.
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         max_draft_len = 3
@@ -7675,6 +7684,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  speculative_config=spec_config,
                  cuda_graph_config=None,
                  disable_overlap_scheduler=False,
+                 enable_attention_dp=attention_dp,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = MMLU(model_name)
