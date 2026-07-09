@@ -39,6 +39,7 @@ from .indexer import MsaIndexer
 from .metadata import (
     MiniMaxM3SparseConfig,
     build_m3_sparse_metadata_and_plans,
+    build_stable_kv_indices,
     get_global_msa_geometry,
     m3_cache_device,
     rederive_m3_attachment,
@@ -201,6 +202,24 @@ def get_minimax_m3_msa_attention_backend_cls():
                 meta.msa_kv_lens_cpu = kv_lens_cpu
                 if meta.msa_qo_lens_cpu is not None:
                     meta.msa_qo_offset_cpu = (kv_lens_cpu - meta.msa_qo_lens_cpu).to(torch.int32)
+                # The staged flat page table's LAYOUT (cumulative page
+                # counts) also depends on the corrected lens: when a
+                # correction shrinks a row across a page boundary, the
+                # eager kernels rebuild indptr from the corrected lens and
+                # would misbase every subsequent row's pages. Re-stage.
+                geometry = get_global_msa_geometry()
+                if geometry is not None and self._msa_kv_indices_buf is not None:
+                    kv_indices, kv_page_indptr = build_stable_kv_indices(
+                        req_to_token=meta.req_to_token,
+                        slot_ids=meta.slot_ids,
+                        seq_lens=meta.seq_lens,
+                        seq_lens_cpu=kv_lens_cpu,
+                        page_size=int(geometry.block_size),
+                        dst=self._msa_kv_indices_buf,
+                        kv_page_indptr_dst=self._msa_kv_page_indptr_buf,
+                    )
+                    meta.msa_kv_indices = kv_indices
+                    meta.msa_kv_page_indptr = kv_page_indptr
 
         def _attach_decode_state(self, m3_meta, config, cache_device) -> None:
             """Build once and attach the persistent decode state.
