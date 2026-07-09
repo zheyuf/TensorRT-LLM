@@ -150,6 +150,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
       * ``sparse_index_dim`` — width of the index-K/V vectors.
     """
 
+    # The AttentionOp-facing tensors this manager builds are synthetic
+    # placeholders over INDEX_KEY-coalesced pools, so one-model speculative
+    # draft layers must live in a separate manager even under attention DP
+    # (read by ``_should_create_separate_draft_kv_cache``).
+    supports_shared_draft_layers = False
+
     def __init__(
         self,
         *args,

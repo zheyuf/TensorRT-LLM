@@ -62,6 +62,7 @@ from ..modules.linear import (
 )
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..speculative import SpecMetadata
 from ..utils import (
     ActivationType,
     AuxStreamType,
@@ -69,9 +70,9 @@ from ..utils import (
     get_model_extra_attrs,
     is_torch_compiling,
 )
+from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (
     DecoderModel,
-    DecoderModelForCausalLM,
     ModelConfig,
     filter_weights,
     register_auto_model,
@@ -1606,6 +1607,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         # NVTX markers below are emitted only when TLLM_NVTX_DEBUG=1 (or
@@ -1636,6 +1638,10 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
             else:
                 hidden_states = self.mlp(hidden_states)
+        # hidden_states is fully TP-reduced at layer exit (no cross-layer
+        # allreduce+norm fusion).
+        if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
         return hidden_states, residual
 
 
@@ -1688,6 +1694,7 @@ class MiniMaxM3Model(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1698,6 +1705,7 @@ class MiniMaxM3Model(DecoderModel):
         hidden_states = inputs_embeds
 
         residual = None
+<<<<<<< HEAD
         for layer_idx, decoder_layer in enumerate(self.layers):
             # Per-layer NVTX range (layer0, layer1, ...). Emitted only when
             # TLLM_NVTX_DEBUG=1 (or TLLM_LLMAPI_ENABLE_NVTX=1) is set.
@@ -1708,6 +1716,16 @@ class MiniMaxM3Model(DecoderModel):
                     attn_metadata=attn_metadata,
                     residual=residual,
                 )
+=======
+        for decoder_layer in self.layers:
+            hidden_states, residual = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=residual,
+                spec_metadata=spec_metadata,
+            )
+>>>>>>> bad119b1ce ([TRTLLM-14093][feat] Enable one-model Eagle3 speculative decoding for MiniMax-M3)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -1756,19 +1774,14 @@ def _load_index_qk_proj_weights(model: nn.Module, weights) -> None:
 
 
 @register_auto_model("MiniMaxM3SparseForCausalLM")
-class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedConfig]):
+class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         raw_pretrained = model_config.pretrained_config
         if is_minimax_m3_vl_config(raw_pretrained):
             model_config = get_text_model_config(model_config)
-        super().__init__(
-            MiniMaxM3Model(model_config),
-            config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=model_config.pretrained_config.vocab_size,
-        )
+        super().__init__(MiniMaxM3Model(model_config), model_config)
 
     def load_weights(self, weights, *args, **kwargs):
         # Fuse index_q/index_k into each index_qk_proj module (also covers
