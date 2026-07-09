@@ -4787,12 +4787,17 @@ class PyExecutor:
                     and self.max_num_tokens is not None):
                 token_nums = [self.max_num_tokens]
             dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+            # A separate draft KV cache manager must also see the dummy, or
+            # its prepare_resources hits an unknown request id.
+            draft_kv_cache_manager = self.resource_manager.get_resource_manager(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
