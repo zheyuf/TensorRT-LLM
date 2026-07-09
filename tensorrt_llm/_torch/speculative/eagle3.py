@@ -595,8 +595,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
-    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata,
+                                            spec_metadata):
+        # During CUDA-graph warmup (graph metadata, not capturing), also
+        # save/restore kv_lens_cuda: the drafting loop mutates it in place
+        # and the runner warms up twice before capture, so without the
+        # restore the second warmup and the capture run with drifted kv
+        # lens (same pattern as DFlash/PARD). During capture itself the
+        # mutation must be captured, so kv_lens_cuda is not saved there.
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if spec_metadata.is_cuda_graph and not is_capturing:
+            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda",
+                                               "kv_lens_cuda")
+        else:
+            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
         batch_size = attn_metadata.num_seqs
 
         # Save spec-dec params that the drafting loop will overwrite.
@@ -704,7 +716,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             )
 
         # Save the old attn_metadata and spec_metadata
-        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+        self._prepare_attn_metadata_for_spec_dec(attn_metadata, spec_metadata)
 
         # Prepare inputs for the 1st draft model forward
         position_ids = position_ids.squeeze(0)
