@@ -198,8 +198,10 @@ class MsaSparseGqaFmha(Fmha):
             return False
         # Only the MiniMax-M3 MSA layer uses this library. Matching the lowered
         # sparse algorithm lets the base create_fmha_libs add it to that layer
-        # alone, so no create_fmha_libs override is needed.
-        return attn.sparse_params.algorithm == "minimax_m3"
+        # alone, so no create_fmha_libs override is needed. Dense layers (e.g.
+        # the Eagle3 draft model) carry no sparse_params.
+        sparse_params = attn.sparse_params
+        return sparse_params is not None and sparse_params.algorithm == "minimax_m3"
 
     def forward(
         self,

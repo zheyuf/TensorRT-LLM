@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from ...interface import AttentionMetadata
+from ...trtllm import TrtllmAttentionMetadata
 from .common import build_paged_kv_slot_mapping
 
 
@@ -165,7 +166,13 @@ class MiniMaxM3TritonSparseAttentionMetadata:
         if batch_size == 0:
             self.max_seqlen_k = 1
         else:
-            self.max_seqlen_k = int(self.seq_lens_cpu[:batch_size].max().item())
+            max_k = int(self.seq_lens_cpu[:batch_size].max().item())
+            # Optimistic overlap+spec lengths can overhang the page table at
+            # a page boundary (see derive_q_positions_and_cache_slots); the
+            # dense fallback consumes max_seqlen_k as the exact SDPA
+            # mask/gather width, so an unclamped overhang crashes SDPA
+            # (mask 385 vs K 384 on MMLU).
+            self.max_seqlen_k = min(max_k, int(self.req_to_token.shape[1]))
 
 
 def ensure_metadata_on_device(
@@ -369,6 +376,53 @@ def _build_runtime_metadata_fresh(
     return meta, out_cache_loc
 
 
+def derive_q_positions_and_cache_slots(
+    req_to_token: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    q_batch_row: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-Q-token K-side positions and KV slot ids, on device, sync-free.
+
+    ``q_positions[t] = prefix_lens[row(t)] + (t - cu_seqlens_q[row(t)])``;
+    ``out_cache_loc[t] = req_to_token[row(t), q_positions[t]]``. Shared by
+    the metadata builder and the ``on_update_kv_lens`` re-derivation so the
+    two cannot drift.
+    """
+    total_q = int(q_batch_row.shape[0])
+    qbr = q_batch_row.to(torch.long)
+    tok = torch.arange(total_q, dtype=torch.int32, device=q_batch_row.device)
+    q_positions = prefix_lens[qbr] + (tok - cu_seqlens_q[qbr])
+    # Overlap+spec: the first derivation runs with optimistic
+    # (full-acceptance) prefix_lens, which overhang the last allocated page
+    # when a request's true length sits at a page boundary. The overhanging
+    # slots are placeholders (on_update_kv_lens re-derives them from the
+    # corrected kv_lens before any forward consumes them), but the gather
+    # must stay in bounds: unclamped, the last row trips the CUDA gather
+    # assert and inner rows silently read the next request's slots. Clamp
+    # the table index only (non-inplace: ``.to`` aliases int64 inputs) —
+    # q_positions keep the optimistic values, whose mask width prepare()
+    # bounds separately.
+    idx = q_positions.to(torch.long).clamp(min=0, max=req_to_token.shape[1] - 1)
+    flat = qbr * req_to_token.shape[1] + idx
+    return q_positions, req_to_token.reshape(-1).index_select(0, flat)
+
+
+def derive_decode_cache_slots(req_to_token: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
+    """Decode-row KV slot ids (new token at position ``seq_lens[b] - 1``).
+
+    Same in-bounds-placeholder clamp contract as
+    :func:`derive_q_positions_and_cache_slots`; the ``min=0`` floor
+    additionally covers zero-length dummy rows indexing ``-1``.
+    """
+    rows = torch.arange(seq_lens.shape[0], device=seq_lens.device, dtype=torch.long)
+    idx = (seq_lens.to(torch.long) - 1).clamp_(min=0, max=req_to_token.shape[1] - 1)
+    flat = rows * req_to_token.shape[1] + idx
+    return req_to_token.reshape(-1).index_select(0, flat)
+
+
+
+
 def build_runtime_metadata_from_kv_manager(
     *,
     kv_cache_manager,
@@ -539,21 +593,13 @@ def build_runtime_metadata_from_kv_manager(
         req_to_token = req_to_token_fresh
         slot_ids = torch.arange(batch, device=device, dtype=torch.int32)
 
-    # Compute out_cache_loc: per-new-token slot ids, in flattened order
-    # matching the q-token order the model layer projects. The Python
-    # loops below run on CPU lists derived from the CPU-resident
-    # ``seq_lens_cpu`` / ``prefix_lens`` / ``extend_seq_lens_cpu``, so
-    # no GPU sync is needed at this point. The resulting
-    # ``out_cache_loc`` tensor is constructed directly on ``device``.
-    # The ``int(...item())`` reads against ``req_to_token`` are a CPU
-    # sync but only ever run from ``prepare()`` (outside any CUDA-graph
-    # capture window) — they are not in the forward path.
+    # out_cache_loc must be flattened in the q-token order the model layer
+    # projects, or K/V lands in the wrong requests' slots.
     if is_prefill:
         if extend_seq_lens_cpu is None:
             raise ValueError("prefill metadata requires extend_seq_lens_cpu")
         if prefix_lens is None:
             raise ValueError("prefill metadata requires prefix_lens")
-        prefix_lens_cpu = prefix_lens.to("cpu").tolist()
         if static_buffers is not None:
             prefix_buf = static_buffers["prefix_lens"]
             prefix_src = prefix_lens.to(device=device, dtype=torch.int32, non_blocking=True)
@@ -563,17 +609,18 @@ def build_runtime_metadata_from_kv_manager(
             prefix_lens_dev = (
                 prefix_lens.to(device) if prefix_lens.device != device else prefix_lens
             )
-        out_cache_loc_list: List[int] = []
         cu_q: List[int] = [0]
-        req_to_token_cpu = req_to_token_fresh.to("cpu")
-        for b in range(batch):
-            pref = int(prefix_lens_cpu[b])
-            ext = int(extend_seq_lens_cpu[b])
-            for offset in range(ext):
-                slot = int(req_to_token_cpu[b, pref + offset].item())
-                out_cache_loc_list.append(slot)
-            cu_q.append(cu_q[-1] + ext)
+        for ext in extend_seq_lens_cpu:
+            cu_q.append(cu_q[-1] + int(ext))
         total_q = cu_q[-1]
+        cu_seqlens_q_src = torch.tensor(cu_q, dtype=torch.int32, device=device)
+        q_batch_row_src = torch.repeat_interleave(
+            torch.arange(batch, device=device, dtype=torch.int32),
+            torch.tensor(extend_seq_lens_cpu, dtype=torch.int64, device=device),
+        )
+        q_positions_src, out_cache_loc_src = derive_q_positions_and_cache_slots(
+            req_to_token, prefix_lens_dev, cu_seqlens_q_src, q_batch_row_src
+        )
         if static_buffers is not None:
             if total_q > static_buffers["max_num_tokens"]:
                 raise ValueError(
@@ -581,33 +628,22 @@ def build_runtime_metadata_from_kv_manager(
                     f"is smaller than current total_q={total_q}"
                 )
             out_cache_loc_buf = static_buffers["out_cache_loc"]
-            out_cache_loc_src = torch.tensor(out_cache_loc_list, dtype=torch.int32, device=device)
             out_cache_loc_buf[:total_q].copy_(out_cache_loc_src, non_blocking=True)
             out_cache_loc = out_cache_loc_buf[:total_q]
             cu_seqlens_q_buf = static_buffers["cu_seqlens_q"]
-            cu_seqlens_q_src = torch.tensor(cu_q, dtype=torch.int32, device=device)
             cu_seqlens_q_buf[: batch + 1].copy_(cu_seqlens_q_src, non_blocking=True)
             cu_seqlens_q = cu_seqlens_q_buf[: batch + 1]
-            # Populate persistent q_batch_row / q_positions in-place so
-            # the inner metadata's prepare() can leave them alone.
             q_batch_row_buf = static_buffers["q_batch_row"]
             q_positions_buf = static_buffers["q_positions"]
-            for b in range(batch):
-                start, end = cu_q[b], cu_q[b + 1]
-                if end > start:
-                    q_batch_row_buf[start:end] = b
-                    pref = int(prefix_lens_cpu[b])
-                    offsets = (
-                        torch.arange(start, end, device=device, dtype=torch.int32) - start + pref
-                    )
-                    q_positions_buf[start:end].copy_(offsets, non_blocking=True)
+            q_batch_row_buf[:total_q].copy_(q_batch_row_src, non_blocking=True)
+            q_positions_buf[:total_q].copy_(q_positions_src, non_blocking=True)
             q_batch_row = q_batch_row_buf[:total_q]
             q_positions = q_positions_buf[:total_q]
         else:
-            out_cache_loc = torch.tensor(out_cache_loc_list, dtype=torch.int32, device=device)
-            cu_seqlens_q = torch.tensor(cu_q, dtype=torch.int32, device=device)
-            q_batch_row = None
-            q_positions = None
+            out_cache_loc = out_cache_loc_src
+            cu_seqlens_q = cu_seqlens_q_src
+            q_batch_row = q_batch_row_src
+            q_positions = q_positions_src
         meta = MiniMaxM3TritonSparseAttentionMetadata(
             is_prefill=True,
             req_to_token=req_to_token,
@@ -622,12 +658,7 @@ def build_runtime_metadata_from_kv_manager(
         )
     else:
         # Decode: the new token sits at position seq_lens[b] - 1.
-        seq_lens_cpu_list = seq_lens_cpu.to("cpu").tolist()
-        out_cache_loc_list = []
-        req_to_token_cpu = req_to_token_fresh.to("cpu")
-        for b in range(batch):
-            pos = int(seq_lens_cpu_list[b]) - 1
-            out_cache_loc_list.append(int(req_to_token_cpu[b, pos].item()))
+        out_cache_loc_src = derive_decode_cache_slots(req_to_token, seq_lens_dev)
         if static_buffers is not None:
             if batch > static_buffers["max_num_tokens"]:
                 raise ValueError(
@@ -635,11 +666,10 @@ def build_runtime_metadata_from_kv_manager(
                     f"is smaller than current batch={batch}"
                 )
             out_cache_loc_buf = static_buffers["out_cache_loc"]
-            out_cache_loc_src = torch.tensor(out_cache_loc_list, dtype=torch.int32, device=device)
             out_cache_loc_buf[:batch].copy_(out_cache_loc_src, non_blocking=True)
             out_cache_loc = out_cache_loc_buf[:batch]
         else:
-            out_cache_loc = torch.tensor(out_cache_loc_list, dtype=torch.int32, device=device)
+            out_cache_loc = out_cache_loc_src
         meta = MiniMaxM3TritonSparseAttentionMetadata(
             is_prefill=False,
             req_to_token=req_to_token,
@@ -651,8 +681,20 @@ def build_runtime_metadata_from_kv_manager(
     return meta, out_cache_loc
 
 
-class MiniMaxM3AttentionMetadata(AttentionMetadata):
-    """:class:`AttentionMetadata` that pre-builds MiniMax-M3 metadata.
+class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
+    """:class:`TrtllmAttentionMetadata` that pre-builds MiniMax-M3 metadata.
+
+    Subclassing :class:`TrtllmAttentionMetadata` (precedent:
+    ``DSAtrtllmAttentionMetadata``, and the MSA-path metadata) rather than
+    the plain :class:`AttentionMetadata` is required for one-model
+    speculative decoding (Eagle3): the draft layers live in the same engine
+    and run :class:`TrtllmAttention` against this shared per-step metadata,
+    so it must carry the TRTLLM surface (``kv_lens_cuda``,
+    ``host_request_types``, ``kv_cache_block_offsets``,
+    ``draft_kv_cache_block_offsets``, ``update_spec_dec_param``, ...). The
+    engine also gates spec-dec plumbing (draft KV cache swap,
+    overlap-scheduler ``kv_lens_cuda`` fixups) on
+    ``isinstance(..., TrtllmAttentionMetadata)``.
 
     Overrides :meth:`prepare` so the M3-sparse
     :class:`MiniMaxM3TritonSparseAttentionMetadata` and the per-new-token
@@ -862,11 +904,56 @@ class MiniMaxM3AttentionMetadata(AttentionMetadata):
             "out_cache_loc": out_cache_loc,
         }
 
+    def on_update_kv_lens(self) -> None:
+        """Re-derive the M3 attachment from the corrected ``kv_lens_cuda``.
+
+        Under the overlap scheduler + speculative decoding, prepare()
+        runs with optimistic cached counts (full draft acceptance) and
+        the engine corrects ``kv_lens_cuda`` on device before invoking
+        this hook (same pattern as ``DSAtrtllmAttentionMetadata``).
+        On-device, sync-free, and idempotent; ``seq_lens_cpu`` /
+        ``max_seqlen_k`` keep the optimistic values — they only bound
+        arange widths that the kernels mask by ``seq_lens``.
+        """
+        super().on_update_kv_lens()
+        attachment = self.minimax_m3
+        if not attachment:
+            return
+        meta = attachment["metadata"]
+        out_cache_loc = attachment["out_cache_loc"]
+        batch = int(meta.slot_ids.shape[0])
+        kv_lens = self.kv_lens_cuda[:batch]
+        meta.seq_lens[:batch].copy_(kv_lens)
+        if meta.is_prefill:
+            # Only the K-side prefix moves with rejections; the Q-side
+            # structure (cu_seqlens_q, q_batch_row) is fixed per step.
+            total_q = int(meta.q_positions.shape[0])
+            cu = meta.cu_seqlens_q
+            meta.prefix_lens[:batch].copy_(kv_lens - (cu[1 : batch + 1] - cu[:batch]))
+            q_positions, cache_slots = derive_q_positions_and_cache_slots(
+                meta.req_to_token,
+                meta.prefix_lens[:batch],
+                cu,
+                meta.q_batch_row[:total_q],
+            )
+            meta.q_positions[:total_q].copy_(q_positions)
+            out_cache_loc[:total_q].copy_(cache_slots)
+        else:
+            # Reached today only as an identity (the hook also fires
+            # pre-correction on ordinary decode steps); re-deriving
+            # keeps corrected 0-draft steps correct once dynamic
+            # draft lengths make them reachable.
+            out_cache_loc[:batch].copy_(
+                derive_decode_cache_slots(meta.req_to_token, kv_lens)
+            )
+
 
 __all__ = [
     "MiniMaxM3AttentionMetadata",
     "MiniMaxM3TritonSparseAttentionMetadata",
     "allocate_minimax_m3_static_buffers",
     "build_runtime_metadata_from_kv_manager",
+    "derive_decode_cache_slots",
+    "derive_q_positions_and_cache_slots",
     "ensure_metadata_on_device",
 ]
