@@ -633,9 +633,7 @@ def create_py_executor(
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
 
-    # MiniMax-M3 sparse attention constraints for one-model speculative
-    # decoding: raise at creation time instead of failing deep inside the
-    # forward. Standalone SA is exempt (one-engine but no draft layers).
+    # Standalone SA is exempt (one-engine but no draft layers).
     if (sparse_attention_config is not None
             and sparse_attention_config.algorithm == "minimax_m3"
             and spec_config is not None

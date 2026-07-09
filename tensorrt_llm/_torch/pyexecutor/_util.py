@@ -944,8 +944,7 @@ class KvCacheCreator:
                 self._kv_cache_manager_cls, 'supports_shared_draft_layers',
                 True):
             # Back-compat: attention DP keeps the shared-manager layout
-            # existing deployments were validated with, except for managers
-            # that cannot host draft layers (e.g. MiniMax-M3 sparse).
+            # existing deployments were validated with.
             logger.info("Attention DP: draft layers share the target KV "
                         "cache manager.")
             return False

@@ -599,7 +599,6 @@ def _copy_swa_block_offsets_with_scratch_compiled(
 
 
 class KVCacheManagerV2(BaseResourceManager):
-
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -2702,11 +2701,10 @@ class KVCacheManagerV2(BaseResourceManager):
                             release_resources(req, free_draft_resources=True)
                             return None
                     else:
-                        # V1-family draft manager (no per-request cache
-                        # handles): allocate via the V1 batch API, mirroring
-                        # KVCacheManager.add_dummy_requests. The C++ side
-                        # raises on allocation failure rather than returning
-                        # a status, so release before propagating.
+                        # V1-family draft manager (no per-request cache handles);
+                        # mirrors KVCacheManager.add_dummy_requests. The C++ side
+                        # raises on allocation failure rather than returning a
+                        # status, so release before propagating.
                         draft_seq_added = False
                         try:
                             draft_kv_cache_manager.impl.add_sequence_batch(
@@ -2728,11 +2726,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
                     if not success:
-                        # Draft resources exist for this request whenever a
-                        # draft manager was supplied: V2-family holds the
-                        # draft_kv_cache handle, V1-family allocated via
-                        # impl.add_sequence_batch (no handle) — keying on the
-                        # handle alone leaked V1 draft blocks here.
+                        # V1-family draft allocations have no draft_kv_cache
+                        # handle, so key on the manager, not the handle.
                         release_resources(
                             req,
                             free_draft_resources=draft_kv_cache_manager is not None,

@@ -1283,9 +1283,8 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
         else:
             hidden_states = self.mlp(hidden_states)
-        # Eagle3 aux-hidden-state capture: at layer exit hidden_states is
-        # fully TP-reduced (no cross-layer allreduce+norm fusion) and
-        # (hidden_states, residual) is the pre-next-layernorm pair.
+        # hidden_states is fully TP-reduced at layer exit (no cross-layer
+        # allreduce+norm fusion).
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
         return hidden_states, residual

@@ -145,10 +145,10 @@ class MiniMaxM3SparseAttentionMetadata:
         mixed batch appear as 1-slot extends (``extend_seq_len=1``,
         ``prefix_len=num_cached``).
         ``False`` is a perf-only specialization for pure-decode
-        batches (``num_contexts == 0``); it is mathematically
-        equivalent to the ``True`` path with
-        ``extend_seq_len=[1]*batch``. See
-        ``test_iter131_metadata_prepare_mixed_batch_uses_extend_path``.
+        batches (every row appends exactly one token); it is
+        mathematically equivalent to the ``True`` path with
+        ``extend_seq_len=[1]*batch``. See the
+        ``test_prepare_routes_*`` tests.
     req_to_token : torch.Tensor
         Paged ``[max_reqs, max_kv_len]`` int32 mapping from
         ``(req_idx, pos)`` to slot index. Shared across layers.
@@ -271,9 +271,7 @@ class MiniMaxM3SparseAttentionMetadata:
             # dense fallback consumes max_seqlen_k as the exact SDPA
             # mask/gather width, so an unclamped overhang crashes SDPA
             # (mask 385 vs K 384 on MMLU).
-            if self.req_to_token is not None:
-                max_k = min(max_k, int(self.req_to_token.shape[1]))
-            self.max_seqlen_k = max_k
+            self.max_seqlen_k = min(max_k, int(self.req_to_token.shape[1]))
 
 
 def ensure_metadata_on_device(
@@ -447,12 +445,9 @@ def derive_q_positions_and_cache_slots(
 def derive_decode_cache_slots(req_to_token: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
     """Decode-row KV slot ids (new token at position ``seq_lens[b] - 1``).
 
-    The same optimistic-overhang clamp as
-    :func:`derive_q_positions_and_cache_slots` applies: optimistic
-    seq_lens can point one past the last allocated page at a page
-    boundary (and a zero-length dummy row would index -1); both are
-    placeholder rows whose slots are re-derived from corrected kv_lens
-    before use, so the gather only needs to stay in bounds.
+    Same in-bounds-placeholder clamp contract as
+    :func:`derive_q_positions_and_cache_slots`; the ``min=0`` floor
+    additionally covers zero-length dummy rows indexing ``-1``.
     """
     rows = torch.arange(seq_lens.shape[0], device=seq_lens.device, dtype=torch.long)
     idx = (seq_lens.to(torch.long) - 1).clamp_(min=0, max=req_to_token.shape[1] - 1)
@@ -889,8 +884,9 @@ def get_minimax_m3_attention_metadata_cls():
             # masks reads against ``metadata.seq_lens`` as the per-request
             # K-side extent. Compute that cumulative kv length per request
             # and feed it into the algorithm metadata builder.
+            new_tokens_per_seq = [int(seq_lens_cpu[b].item()) for b in range(batch_size)]
             kv_lens_cpu_list = [
-                int(num_cached_per_seq[b]) + int(seq_lens_cpu[b].item()) for b in range(batch_size)
+                int(num_cached_per_seq[b]) + new_tokens_per_seq[b] for b in range(batch_size)
             ]
             kv_lens_cpu = torch.tensor(kv_lens_cpu_list, dtype=torch.int32)
             kv_lens_dev = kv_lens_cpu.to(device=cache_device, non_blocking=True)
@@ -920,9 +916,6 @@ def get_minimax_m3_attention_metadata_cls():
             # (iter-131 regression: previously a wrong predicate routed
             # mixed batches into the decode branch and crashed in
             # index_copy_.)
-            new_tokens_per_seq = [
-                kv_lens_cpu_list[b] - int(num_cached_per_seq[b]) for b in range(batch_size)
-            ]
             is_extend = num_contexts > 0 or any(n > 1 for n in new_tokens_per_seq)
             if is_extend:
                 prefix_lens_list = [int(num_cached_per_seq[b]) for b in range(batch_size)]
@@ -993,9 +986,10 @@ def get_minimax_m3_attention_metadata_cls():
                 meta.q_positions[:total_q].copy_(q_positions)
                 m3["out_cache_loc"][:total_q].copy_(out_cache_loc)
             else:
-                # Pure decode never coincides with a kv-len correction
-                # (corrected steps carry draft tokens and take the extend
-                # path); kept so the hook stays a safe identity.
+                # Reached today only as an identity (the hook also fires
+                # pre-correction on ordinary decode steps); re-deriving
+                # keeps corrected 0-draft steps correct once dynamic
+                # draft lengths make them reachable.
                 m3["out_cache_loc"][:batch].copy_(
                     derive_decode_cache_slots(meta.req_to_token, kv_lens)
                 )

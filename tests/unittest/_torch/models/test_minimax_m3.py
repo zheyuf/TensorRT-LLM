@@ -1133,31 +1133,8 @@ def test_on_update_kv_lens_decode_branch():
     torch.testing.assert_close(out_loc, expected)
 
 
-# prepare() derives max_seqlen_k host-side from the optimistic seq_lens_cpu.
-# When a request's true length sits exactly at a page boundary, the
-# optimistic (full-acceptance) length overhangs the last allocated page —
-# e.g. a 384-token request in a 3-page x 128-slot table with one pending
-# bonus token claims 385. The sparse kernels tolerate the overhang (they
-# arange over max_seqlen_k and mask by the corrected seq_lens), but the
-# dense fallback consumes max_seqlen_k as the exact SDPA mask/gather width:
-# _gather_paged_batched silently clamps the gather to req_to_token's width
-# while the mask keeps the optimistic width, and SDPA rejects the mismatch
-# (found by TestMiniMaxM3::test_nvfp4_eagle3 on MMLU: mask 385 vs K 384).
-# prepare() must clamp max_seqlen_k to the page table's width.
-
-
 @pytest.mark.skipif(not _has_cuda(), reason="device tensors required")
 def test_on_update_kv_lens_rederives_page_boundary_overhang():
-    """Optimistic positions overhanging the page table must not crash the build.
-
-    A request whose true length lands exactly on the table's last slot
-    (page-aligned) plus a rejected draft token from the previous step gives
-    an optimistic position one past the table. The eager device-side slot
-    gather used to trip the CUDA scatter/gather assert on the last batch
-    row (and silently read the next request's slots on inner rows); with
-    the clamp it returns a placeholder, and the correction hook re-derives
-    the true slots before any forward consumes them.
-    """
     device = torch.device("cuda")
     batch, table_width, draft_w = 2, 12, 4
     req_to_token = (
@@ -1175,9 +1152,6 @@ def test_on_update_kv_lens_rederives_page_boundary_overhang():
     ext = [draft_w] * batch
 
     meta, out_loc = _build_extend_attachment(device, req_to_token, optimistic_prefix, ext)
-    meta.prepare()
-    assert meta.max_seqlen_k == table_width  # clamped, not 13
-
     truth_meta, truth_out_loc = _build_extend_attachment(device, req_to_token, true_prefix, ext)
     corrected_kv_lens = [p + e for p, e in zip(true_prefix, ext)]
     host = _make_hook_host(device, meta, out_loc, corrected_kv_lens)
@@ -1207,6 +1181,11 @@ def test_derive_decode_cache_slots_clamps_overhang_and_empty_rows():
     assert slots[2] == req_to_token[2, 0]  # clamped from -1
 
 
+# prepare() must clamp the host-derived max_seqlen_k to the page-table
+# width: optimistic overlap+spec lengths overhang it at page boundaries,
+# and the dense fallback consumes max_seqlen_k as the exact SDPA
+# mask/gather width, so the overhang crashes SDPA (mask 385 vs K 384,
+# found by TestMiniMaxM3::test_nvfp4_eagle3 on MMLU).
 def test_prepare_clamps_prefill_max_seqlen_k_to_page_table_width():
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import (
         MiniMaxM3SparseAttentionMetadata,
@@ -1239,7 +1218,12 @@ def test_prepare_clamps_prefill_max_seqlen_k_to_page_table_width():
     assert meta.max_seqlen_q == max(ext)
 
 
-def test_prepare_clamps_decode_max_seqlen_k_to_page_table_width():
+@pytest.mark.parametrize(
+    "seq_lens,expected_max_k",
+    [([9, 5], 8), ([6, 5], 6)],  # 9 overhangs the 8-wide table; 6 is in bounds
+    ids=["overhang_clamped", "in_bounds_kept"],
+)
+def test_prepare_decode_max_seqlen_k(seq_lens, expected_max_k):
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import (
         MiniMaxM3SparseAttentionMetadata,
     )
@@ -1248,37 +1232,15 @@ def test_prepare_clamps_decode_max_seqlen_k_to_page_table_width():
     req_to_token = torch.arange(batch * table_width, dtype=torch.int32).reshape(
         batch, table_width
     )
-    optimistic = [table_width + 1, 5]
     meta = MiniMaxM3SparseAttentionMetadata(
         is_prefill=False,
         req_to_token=req_to_token,
         slot_ids=torch.arange(batch, dtype=torch.int32),
-        seq_lens=torch.tensor(optimistic, dtype=torch.int32),
-        seq_lens_cpu=torch.tensor(optimistic, dtype=torch.int32),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+        seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int32),
     )
     meta.prepare()
-    assert meta.max_seqlen_k == table_width
-
-
-def test_prepare_keeps_in_bounds_max_seqlen_k():
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import (
-        MiniMaxM3SparseAttentionMetadata,
-    )
-
-    batch, table_width = 2, 8
-    req_to_token = torch.arange(batch * table_width, dtype=torch.int32).reshape(
-        batch, table_width
-    )
-    in_bounds = [6, 5]
-    meta = MiniMaxM3SparseAttentionMetadata(
-        is_prefill=False,
-        req_to_token=req_to_token,
-        slot_ids=torch.arange(batch, dtype=torch.int32),
-        seq_lens=torch.tensor(in_bounds, dtype=torch.int32),
-        seq_lens_cpu=torch.tensor(in_bounds, dtype=torch.int32),
-    )
-    meta.prepare()
-    assert meta.max_seqlen_k == max(in_bounds)
+    assert meta.max_seqlen_k == expected_max_k
 
 
 # The extend/decode routing predicate in MiniMaxM3AttentionMetadata.prepare()

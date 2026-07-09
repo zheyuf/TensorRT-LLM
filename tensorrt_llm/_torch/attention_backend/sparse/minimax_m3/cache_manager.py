@@ -421,10 +421,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             # offset math, so the base implementation is correct there.
             super()._prepare_page_table_tensor(index_mapper_capacity)
             return
-        # The base shared-pool path assumes pools hold exactly K+V per
-        # layer; M3 sparse layers add a coalesced INDEX_KEY buffer, so its
-        # exact_div offset math does not hold (see
-        # _build_pool_mapping_tensors).
+        # The base shared-pool offset math does not hold on M3's coalesced
+        # pools; see _build_pool_mapping_tensors.
         self.kv_cache_pool_pointers, self.kv_cache_pool_mapping = self._build_pool_mapping_tensors()
         # The remaining tensors must exist because the base
         # copy_batch_block_offsets path (run by every TrtllmAttentionMetadata
@@ -473,10 +471,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         Bypass the conversion: the M3 forward path indexes paged
         views (built by :meth:`get_buffers` /
-        :meth:`get_index_k_buffer`) directly by slot id. Like the
-        base method, trim each request's padded page-index buffer to
-        the blocks it owns (optionally capped by
-        ``num_blocks_per_seq``).
+        :meth:`get_index_k_buffer`) directly by slot id.
         """
         res = []
         for req_idx, req_id in enumerate(request_ids):
