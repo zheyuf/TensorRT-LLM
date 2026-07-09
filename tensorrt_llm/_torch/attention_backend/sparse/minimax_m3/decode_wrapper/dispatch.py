@@ -237,17 +237,21 @@ def resolve_decode_state(
 
 
 def _qo_consts(
-    state: M3DecodeState, batch: int, pack_factor: int
+    state: M3DecodeState, batch: int, pack_factor: int, qo_len: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """(qo_segment_lens, qo_segment_offsets) for packed decode lens."""
-    key = (batch, pack_factor)
+    """(qo_segment_lens, qo_segment_offsets) for packed decode lens.
+
+    Each request is one segment of ``qo_len`` query tokens (spec verify:
+    ``1 + draft_len``); packing folds ``pack_factor`` heads into the qo
+    dim, so the packed segment length is ``qo_len * pack_factor``.
+    """
+    key = (batch, pack_factor, qo_len)
     cached = state.qo_const_cache.get(key)
     if cached is None:
-        lens = torch.full((batch,), pack_factor, dtype=torch.int32, device=state.device)
+        packed = qo_len * pack_factor
+        lens = torch.full((batch,), packed, dtype=torch.int32, device=state.device)
         offsets = (
-            (torch.arange(batch + 1, dtype=torch.int64) * pack_factor)
-            .to(torch.int32)
-            .to(state.device)
+            (torch.arange(batch + 1, dtype=torch.int64) * packed).to(torch.int32).to(state.device)
         )
         cached = (lens, offsets)
         state.qo_const_cache[key] = cached
@@ -277,17 +281,39 @@ def _kv_offsets_view(state: M3DecodeState, seq_lens: torch.Tensor, batch: int) -
     return view
 
 
-def _qo_offset_view(state: M3DecodeState, seq_lens: torch.Tensor, batch: int) -> torch.Tensor:
-    """Per-request causal offset `kv_len - 1` (device op).
+def _qo_offset_view(
+    state: M3DecodeState, seq_lens: torch.Tensor, batch: int, qo_len: int = 1
+) -> torch.Tensor:
+    """Per-request causal offset `kv_len - qo_len` (device op).
 
     The kernel's causal bound is inclusive (attend positions
-    `<= offset + q_idx`); with one query token at position `kv_len - 1`
-    this unmasks exactly the `kv_len` cached positions. `kv_len` itself
-    would leak one stale slot from a partially-filled last page in sparse
-    mode, which has no secondary seqlen clip.
+    `<= offset + q_idx`), so with `qo_len` query tokens per request the
+    offset `kv_len - qo_len` unmasks the causal ladder: token `t` attends
+    exactly `kv_len - qo_len + t + 1` positions, the last token the full
+    `kv_len`. `kv_len` itself would leak one stale slot from a
+    partially-filled last page in sparse mode, which has no secondary
+    seqlen clip.
     """
     view = state.qo_offset[:batch]
-    torch.sub(seq_lens, 1, out=view)
+    torch.sub(seq_lens, qo_len, out=view)
+    return view
+
+
+def _ladder_valid_pages(
+    state: M3DecodeState, seq_lens: torch.Tensor, batch: int, qo_len: int
+) -> torch.Tensor:
+    """Per-token valid page counts for the causal ladder (device op).
+
+    Token ``t`` of request ``b`` attends ``seq_lens[b] - qo_len + t + 1``
+    positions; its valid block count is the ceil-div by page_size.
+    Returns a `[batch * qo_len]` int32 view into the persistent buffer.
+    """
+    g = state.geom
+    total_q = batch * qo_len
+    view = state.valid_pages[:total_q]
+    ladder = torch.arange(1 - qo_len, 1, dtype=torch.int32, device=state.device)
+    lens = (seq_lens[:batch].view(batch, 1) + ladder).reshape(total_q)
+    torch.div(lens + (g.page_size - 1), g.page_size, rounding_mode="floor", out=view)
     return view
 
 
@@ -305,38 +331,50 @@ def decode_proxy_max_score(
     kv_page_indptr: torch.Tensor,
     kv_indices: torch.Tensor,
     sm_scale: float,
+    qo_len: int = 1,
 ) -> torch.Tensor:
     """Dense MQA proxy pass, OnlyScore mode.
 
     Parameters
     ----------
-    idx_q : `[batch, num_index_heads, 128]` bf16 (decode: 1 token/req).
+    idx_q : `[batch * qo_len, num_index_heads, 128]` bf16, tokens of one
+        request contiguous (decode: 1 token/req; spec verify:
+        `qo_len = 1 + draft_len`).
     idx_k_paged : `[num_pages, 1, page_size, 128]` bf16 (HND).
-    seq_lens : `[batch]` int32 device; per-request KV length.
+    seq_lens : `[batch]` int32 device; per-request KV length at the
+        LAST token of the row (earlier tokens ladder down causally).
     kv_page_indptr : `[batch + 1]` int32 device.
     kv_indices : `[total_pages]` int32 device page table.
     sm_scale : softmax scale (does not affect max-score ranking).
+    qo_len : query tokens per request (uniform across the batch).
 
     Returns
     -------
-    `[num_index_heads, max_k_tiles, batch]` fp32 view into the persistent
-    max-score buffer; unwritten tiles are -inf.
+    `[num_index_heads, max_k_tiles, batch * qo_len]` fp32 view into the
+    persistent max-score buffer; unwritten tiles are -inf.
     """
     g = state.geom
-    batch = idx_q.shape[0]
+    total_q = idx_q.shape[0]
+    if total_q % qo_len:
+        raise ValueError(f"total_q {total_q} not divisible by qo_len {qo_len}")
+    batch = total_q // qo_len
+    if total_q > g.max_batch:
+        raise ValueError(f"total_q {total_q} exceeds buffer capacity {g.max_batch}")
+    if qo_len * state.pf_proxy > _QO_TILE_SIZE:
+        raise ValueError(f"qo_len {qo_len} * pack_factor {state.pf_proxy} exceeds the qo tile")
     seq_lens = seq_lens[:batch]
 
     max_score = torch.as_strided(
         state.max_score_flat,
-        (g.num_index_heads, state.max_k_tiles, batch),
-        (state.max_k_tiles * batch, batch, 1),
+        (g.num_index_heads, state.max_k_tiles, total_q),
+        (state.max_k_tiles * total_q, total_q, 1),
     )
     max_score.fill_(float("-inf"))
 
-    qo_lens, qo_offsets = _qo_consts(state, batch, state.pf_proxy)
+    qo_lens, qo_offsets = _qo_consts(state, batch, state.pf_proxy, qo_len)
     work_range, work_info = _worklist(state, batch, state.heads_packed_proxy)
     kv_offsets = _kv_offsets_view(state, seq_lens, batch)
-    qo_offset = _qo_offset_view(state, seq_lens, batch)
+    qo_offset = _qo_offset_view(state, seq_lens, batch, qo_len)
 
     state.proxy_module.run(
         state.workspace_buffer,
@@ -355,8 +393,8 @@ def decode_proxy_max_score(
         1.0,
         1.0,
         1.0,
-        state.pf_proxy,  # max_qo_len after packing
-        qo_offset,  # kv_len - 1: inclusive causal bound = last cached pos
+        qo_len * state.pf_proxy,  # max_qo_len after packing
+        qo_offset,  # kv_len - qo_len: inclusive causal-ladder base
         1,  # num_kv_splits
         None,
         None,
@@ -387,26 +425,34 @@ def decode_select_blocks(
     max_score: torch.Tensor,
     *,
     seq_lens: torch.Tensor,
+    qo_len: int = 1,
 ) -> torch.Tensor:
     """Group-reduce index-head scores to KV heads and pick top-k blocks.
 
-    Returns `[batch, num_kv_heads, topk]` int32 view into the persistent
-    `kv_block_indexes` buffer.
+    With `qo_len > 1` each token gets its own causal-ladder valid-block
+    count, so draft token `t` cannot select (or anchor its local window
+    on) blocks past its own attend bound.
+
+    Returns `[batch * qo_len, num_kv_heads, topk]` int32 view into the
+    persistent `kv_block_indexes` buffer.
     """
     g = state.geom
-    batch = max_score.shape[2]
-    seq_lens = seq_lens[:batch]
+    total_q = max_score.shape[2]
+    if total_q % qo_len:
+        raise ValueError(f"total_q {total_q} not divisible by qo_len {qo_len}")
+    batch = total_q // qo_len
 
     group = g.num_index_heads // g.num_kv_heads
     if group > 1:
-        max_score_kv = max_score.view(g.num_kv_heads, group, max_score.shape[1], batch).amax(dim=1)
+        max_score_kv = max_score.view(g.num_kv_heads, group, max_score.shape[1], total_q).amax(
+            dim=1
+        )
     else:
         max_score_kv = max_score
 
-    valid_pages = state.valid_pages[:batch]
-    torch.div(seq_lens + (g.page_size - 1), g.page_size, rounding_mode="floor", out=valid_pages)
+    valid_pages = _ladder_valid_pages(state, seq_lens, batch, qo_len)
 
-    out = state.kv_block_indexes[:batch]
+    out = state.kv_block_indexes[:total_q]
     return select_topk_blocks(
         max_score_kv,
         valid_pages,
@@ -433,29 +479,66 @@ def decode_sparse_attention(
     kv_page_indptr: torch.Tensor,
     kv_indices: torch.Tensor,
     sm_scale: float,
+    qo_len: int = 1,
 ) -> torch.Tensor:
     """Block-sparse paged GQA over the selected KV blocks.
 
     Parameters
     ----------
-    q : `[batch, num_q_heads, 128]` bf16.
+    q : `[batch * qo_len, num_q_heads, 128]` bf16, tokens of one request
+        contiguous.
     k_paged / v_paged : `[num_pages, num_kv_heads, page_size, 128]` bf16.
-    kv_block_indexes : `[batch, num_kv_heads, topk]` int32 ascending,
-        -1 tail padded.
+    kv_block_indexes : `[batch * qo_len, num_kv_heads, topk]` int32
+        ascending, -1 tail padded (per token).
     seq_lens / kv_page_indptr / kv_indices : as in `decode_proxy_max_score`.
+    qo_len : query tokens per request (uniform across the batch).
 
     Returns
     -------
-    `[batch, num_q_heads, 128]` bf16 view into the persistent output buffer.
+    `[batch * qo_len, num_q_heads, 128]` bf16 view into the persistent
+    output buffer.
     """
-    batch = q.shape[0]
+    g = state.geom
+    total_q = q.shape[0]
+    if total_q % qo_len:
+        raise ValueError(f"total_q {total_q} not divisible by qo_len {qo_len}")
+    batch = total_q // qo_len
+    if total_q > g.max_batch:
+        raise ValueError(f"total_q {total_q} exceeds buffer capacity {g.max_batch}")
     seq_lens = seq_lens[:batch]
 
-    out = state.out[:batch]
-    qo_lens, qo_offsets = _qo_consts(state, batch, state.pf_sparse)
-    work_range, work_info = _worklist(state, batch, state.heads_packed_sparse)
-    kv_offsets = _kv_offsets_view(state, seq_lens, batch)
-    qo_offset = _qo_offset_view(state, seq_lens, batch)
+    out = state.out[:total_q]
+    if qo_len == 1:
+        row_seq_lens = seq_lens
+        row_indptr = kv_page_indptr
+        qo_offset = _qo_offset_view(state, seq_lens, batch)
+    else:
+        # Row expansion: the kernel's sparse mode consumes kv_block_indexes
+        # per ROW, so each query token becomes its own qo_len=1 pseudo-row
+        # (the same transform `fmha_sm100.api._expand_for_per_token_sparse`
+        # applies on the eager path). A pseudo-row keeps its request's FULL
+        # kv_len and page-table BASE offset; the causal ladder lives solely
+        # in the per-row offset `kv_len - qo_len + t`. All device ops, so
+        # the expansion is CUDA-graph-capturable and tracks corrected
+        # seq_lens at replay.
+        row_seq_lens = torch.repeat_interleave(seq_lens, qo_len)
+        row_indptr = torch.empty(
+            total_q + 1, dtype=kv_page_indptr.dtype, device=kv_page_indptr.device
+        )
+        row_indptr[:total_q] = torch.repeat_interleave(kv_page_indptr[:batch], qo_len)
+        row_indptr[total_q:] = kv_page_indptr[batch : batch + 1]
+        ladder = (
+            torch.arange(qo_len, dtype=torch.int32, device=state.device)
+            .repeat(batch)
+            .sub_(qo_len)
+        )
+        qo_offset = state.qo_offset[:total_q]
+        torch.add(row_seq_lens, ladder, out=qo_offset)
+
+    rows = total_q
+    qo_lens, qo_offsets = _qo_consts(state, rows, state.pf_sparse)
+    work_range, work_info = _worklist(state, rows, state.heads_packed_sparse)
+    kv_offsets = _kv_offsets_view(state, row_seq_lens, rows)
 
     state.sparse_module.run(
         state.workspace_buffer,
@@ -463,7 +546,7 @@ def decode_sparse_attention(
         k_paged,
         v_paged,
         qo_lens,
-        seq_lens,
+        row_seq_lens,
         qo_offsets,
         kv_offsets,
         work_range,
@@ -474,8 +557,8 @@ def decode_sparse_attention(
         1.0,
         1.0,
         1.0,
-        state.pf_sparse,  # max_qo_len after packing
-        qo_offset,  # kv_len - 1 (see _qo_offset_view)
+        state.pf_sparse,  # max_qo_len after packing (rows are qo_len=1)
+        qo_offset,  # per-row inclusive causal bound (ladder when expanded)
         1,  # num_kv_splits
         None,
         None,
@@ -485,7 +568,7 @@ def decode_sparse_attention(
         None,
         _QO_TILE_SIZE,
         kv_indices,
-        kv_page_indptr,
+        row_indptr,
         None,  # max_score
         -1,  # max_k_tiles
         kv_block_indexes,
