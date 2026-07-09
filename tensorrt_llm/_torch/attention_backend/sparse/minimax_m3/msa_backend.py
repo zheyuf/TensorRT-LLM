@@ -133,6 +133,48 @@ def run_msa_sparse_decode(
     return out.reshape(batch, config.num_q_heads * config.head_dim)
 
 
+def rederive_msa_attachment(owner) -> None:
+    """Re-derive the M3 attachment + MSA eager-plan mirrors after the
+    overlap scheduler's on-device kv-len correction.
+
+    Decode (spec verify included): sync-free and capture-legal — the
+    decode driver re-reads ``seq_lens`` on device per call, so
+    overwriting the attachment lengths + KV slots is sufficient.
+    Prefill (mixed context+gen batches): runs the EAGER fmha plan, which
+    consumes the CPU length mirrors AND the staged flat page table —
+    whose LAYOUT (cumulative page counts) depends on the corrected lens:
+    a correction that shrinks a row across a page boundary changes the
+    indptr the eager kernels rebuild from the lens, misbasing every
+    subsequent row's pages. Refresh both — host work is legal on this
+    branch precisely because mixed batches are never CUDA-graph captured.
+
+    Module-level so the multi-token unit tests exercise the same code
+    the metadata hook runs.
+    """
+    rederive_m3_attachment(owner)
+    meta = owner.m3_sparse_metadata
+    if meta is None or not meta.is_prefill or meta.msa_kv_lens_cpu is None:
+        return
+    batch = int(meta.slot_ids.shape[0])
+    kv_lens_cpu = owner.kv_lens_cuda[:batch].to("cpu", torch.int32)
+    meta.msa_kv_lens_cpu = kv_lens_cpu
+    if meta.msa_qo_lens_cpu is not None:
+        meta.msa_qo_offset_cpu = (kv_lens_cpu - meta.msa_qo_lens_cpu).to(torch.int32)
+    geometry = get_global_msa_geometry()
+    if geometry is not None and owner._msa_kv_indices_buf is not None:
+        kv_indices, kv_page_indptr = build_stable_kv_indices(
+            req_to_token=meta.req_to_token,
+            slot_ids=meta.slot_ids,
+            seq_lens=meta.seq_lens,
+            seq_lens_cpu=kv_lens_cpu,
+            page_size=int(geometry.block_size),
+            dst=owner._msa_kv_indices_buf,
+            kv_page_indptr_dst=owner._msa_kv_page_indptr_buf,
+        )
+        meta.msa_kv_indices = kv_indices
+        meta.msa_kv_page_indptr = kv_page_indptr
+
+
 @functools.lru_cache(maxsize=1)
 def get_minimax_m3_msa_attention_backend_cls():
     """Return `MiniMaxM3MSATrtllmAttention` (selection entry point)."""
@@ -181,45 +223,11 @@ def get_minimax_m3_msa_attention_backend_cls():
             self._attach_decode_state(m3_meta, geometry, m3_cache_device(self))
 
         def on_update_kv_lens(self) -> None:
-            """Re-derive the M3 attachment after the overlap scheduler's
-            on-device kv-len correction (same pattern as
-            ``DSAtrtllmAttentionMetadata`` and the Triton-path M3 metadata).
-
-            Decode (spec verify included): sync-free and capture-legal —
-            the decode driver re-reads ``seq_lens`` on device per call, so
-            overwriting the attachment lengths + KV slots is sufficient.
-            Prefill (mixed context+gen batches): runs the EAGER fmha plan,
-            which also consumes the CPU length mirrors; refresh them with a
-            host copy — legal on this branch precisely because mixed
-            batches are never CUDA-graph captured.
+            """Same pattern as ``DSAtrtllmAttentionMetadata`` and the
+            Triton-path M3 metadata; see ``rederive_msa_attachment``.
             """
             super().on_update_kv_lens()
-            rederive_m3_attachment(self)
-            meta = self.m3_sparse_metadata
-            if meta is not None and meta.is_prefill and meta.msa_kv_lens_cpu is not None:
-                batch = int(meta.slot_ids.shape[0])
-                kv_lens_cpu = self.kv_lens_cuda[:batch].to("cpu", torch.int32)
-                meta.msa_kv_lens_cpu = kv_lens_cpu
-                if meta.msa_qo_lens_cpu is not None:
-                    meta.msa_qo_offset_cpu = (kv_lens_cpu - meta.msa_qo_lens_cpu).to(torch.int32)
-                # The staged flat page table's LAYOUT (cumulative page
-                # counts) also depends on the corrected lens: when a
-                # correction shrinks a row across a page boundary, the
-                # eager kernels rebuild indptr from the corrected lens and
-                # would misbase every subsequent row's pages. Re-stage.
-                geometry = get_global_msa_geometry()
-                if geometry is not None and self._msa_kv_indices_buf is not None:
-                    kv_indices, kv_page_indptr = build_stable_kv_indices(
-                        req_to_token=meta.req_to_token,
-                        slot_ids=meta.slot_ids,
-                        seq_lens=meta.seq_lens,
-                        seq_lens_cpu=kv_lens_cpu,
-                        page_size=int(geometry.block_size),
-                        dst=self._msa_kv_indices_buf,
-                        kv_page_indptr_dst=self._msa_kv_page_indptr_buf,
-                    )
-                    meta.msa_kv_indices = kv_indices
-                    meta.msa_kv_page_indptr = kv_page_indptr
+            rederive_msa_attachment(self)
 
         def _attach_decode_state(self, m3_meta, config, cache_device) -> None:
             """Build once and attach the persistent decode state.
