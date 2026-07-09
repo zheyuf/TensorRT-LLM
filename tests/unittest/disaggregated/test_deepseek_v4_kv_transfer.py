@@ -656,14 +656,24 @@ def run_deepseek_v4_transfer_test(
     manager_factory: _ManagerFactory[_CacheManagerT] = _create_managers_for_instance,
     init_fn: _CacheInitializer[_CacheManagerT] = _init_pool_data,
     verify_fn: _CacheVerifier[_CacheManagerT] = verify_all_requests,
+    transceiver_config: Optional[CacheTransceiverConfig] = None,
+    request_lengths: Optional[List[int]] = None,
 ) -> None:
-    """Run a KV transfer test with injectable model-specific cache hooks."""
+    """Run a KV transfer test with injectable model-specific cache hooks.
+
+    ``transceiver_config`` overrides the default NIXL/PYTHON config, e.g. to enable the
+    KV bounce staging path (kv_cache_bounce_size_mb) in the structured-NHD e2e tests.
+    ``request_lengths`` overrides the default token lengths (each must be <= MAX_SEQ_LEN
+    and their sum must fit the managers' token budget), e.g. to force multi-block
+    long-context requests through the bounce staging path.
+    """
     ctx_world = ctx_tp * ctx_pp
     gen_world = gen_tp * gen_pp
 
-    # Mix of block-aligned and non-aligned lengths for boundary testing.
-    # TOKENS_PER_BLOCK=128: 65=half+1, 256=2x exact, 129=1x+1, 383=3x-1
-    request_lengths = [65, 256, 129, 383]
+    if request_lengths is None:
+        # Mix of block-aligned and non-aligned lengths for boundary testing.
+        # TOKENS_PER_BLOCK=128: 65=half+1, 256=2x exact, 129=1x+1, 383=3x-1
+        request_lengths = [65, 256, 129, 383]
 
     # ===== 1. Create DeepseekV4CacheManagers =====
     ctx_managers = list(manager_factory(ctx_tp, ctx_pp, ctx_enable_dp, compress_ratios))
@@ -676,7 +686,7 @@ def run_deepseek_v4_transfer_test(
     init_fn(gen_managers, gen_tp, fill_random=False)
 
     # ===== 3. Create KvCacheTransceiverV2 instances (threaded init) =====
-    config = CacheTransceiverConfig(
+    config = transceiver_config or CacheTransceiverConfig(
         backend="NIXL",
         transceiver_runtime="PYTHON",
         max_tokens_in_buffer=512,

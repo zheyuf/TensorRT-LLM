@@ -39,7 +39,20 @@ from tensorrt_llm.runtime.generation import CUASSERT
 from .buffer import SlotAllocator
 from .config import SizingContext, fit_within_free
 from .core import BounceTransport, Disposition, Settlement, TransferContext
-from .gather_scatter import Plan, gather_contiguous, scatter_contiguous
+from .gather_scatter import (
+    Plan,
+    gather_contiguous,
+    gather_structured,
+    scatter_contiguous,
+    scatter_structured,
+)
+from .nhd_plan import (
+    NHDResultTail,
+    decode_nhd_tail,
+    encode_nhd_tail,
+    is_nhd_tail,
+    specs_total_bytes,
+)
 
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
@@ -57,15 +70,26 @@ class VmmBounceTransport(BounceTransport):
 
     @classmethod
     def from_config(
-        cls, agent, cfg, *, device_id: int, block_bytes_per_group: List[int]
+        cls,
+        agent,
+        cfg,
+        *,
+        device_id: int,
+        block_bytes_per_group: List[int],
+        page_table=None,
     ) -> Optional["VmmBounceTransport"]:
         """Build a transport sized from the config and clamped to free memory, or None if not even one
-        chunk fits."""
+        chunk fits. ``page_table`` lets geometry-aware sizings (TokenBudgetSizing) derive the
+        capacity from the cache layout."""
         chunk = cfg.chunk_mb * _MIB
         free_b, total_b = CUASSERT(cudart.cudaMemGetInfo())
         want_capacity = cfg.sizing.resolve(
             SizingContext(
-                free_bytes=free_b, total_bytes=total_b, chunk_bytes=chunk, device_id=device_id
+                free_bytes=free_b,
+                total_bytes=total_b,
+                chunk_bytes=chunk,
+                device_id=device_id,
+                page_table=page_table,
             )
         )
         capacity_bytes = fit_within_free(want_capacity, free_bytes=free_b, chunk_bytes=chunk)
@@ -84,6 +108,7 @@ class VmmBounceTransport(BounceTransport):
             phys_chunk_size=chunk,
             block_bytes_per_group=block_bytes_per_group,
             min_blocks=cfg.min_blocks,
+            structured_nhd=getattr(cfg, "structured_nhd", False),
         )
 
     def __init__(
@@ -95,11 +120,15 @@ class VmmBounceTransport(BounceTransport):
         phys_chunk_size: int,
         block_bytes_per_group: List[int],
         min_blocks: int = 96,
+        structured_nhd: bool = False,
         quarantine_grace_s: float = _QUARANTINE_GRACE_S,
         name: str = "kv_bounce",
     ):
         self._agent = agent
         self._device_id = device_id
+        # Analytic NHD head-mismatch staging plans (Config.structured_nhd); OFF keeps the
+        # merged bounce behavior bit-identical.
+        self.structured_nhd = structured_nhd
         # The byte size of one cache block, listed for each attention layer group.
         self._block_bytes_per_group = list(block_bytes_per_group)
         # Below this many blocks, skip bounce: coalescing only pays off for long context (the default
@@ -144,16 +173,43 @@ class VmmBounceTransport(BounceTransport):
         self._scatter_thread.start()
 
     def _new_stream(self):
-        return CUASSERT(cudart.cudaStreamCreate())[0]
+        # A stream from cudaStreamCreate() implicitly synchronizes with CUDA's legacy
+        # default stream. Scatter must not wait behind unrelated model execution before
+        # making received KV visible, and gather has the same independence requirement.
+        return CUASSERT(cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking))[0]
+
+    @staticmethod
+    def _structured_specs(write_meta) -> Optional[list]:
+        """The structured staging specs of a write, in canonical section order, or None."""
+        sections = getattr(write_meta, "nhd_sections", None)
+        return [s.spec for s in sections] if sections else None
+
+    @staticmethod
+    def _direct_rest(write_meta) -> bool:
+        """Whether the materialized remainder bypasses the slot under split routing."""
+        return bool(getattr(write_meta, "bounce_direct_rest", False))
 
     def _launch_gather(self, src_addr: int, write_meta, total: int):
         """Launch the gather of the scattered fragments into the send region and return an event to
-        wait on."""
-        plan = Plan(write_meta.src_ptrs, write_meta.dst_ptrs, write_meta.sizes, total)
+        wait on. Structured NHD sections stage first (analytic kernel), then any materialized
+        remainder — the same layout the structured result tail describes to the receiver. Under
+        split routing (bounce_direct_rest) the remainder never enters the slot: it rides
+        the same NIXL write as direct per-fragment descriptors instead (see _make_write)."""
+        specs = self._structured_specs(write_meta)
         with self._send_stream_lock:
-            gather_contiguous(
-                src_addr, plan.src_ptrs, plan.sizes, plan.offsets, stream=self._send_stream
-            )
+            offset = 0
+            if specs:
+                gather_structured(src_addr, specs, stream=self._send_stream)
+                offset = specs_total_bytes(specs)
+            if write_meta.src_ptrs.size > 0 and not self._direct_rest(write_meta):
+                plan = Plan(write_meta.src_ptrs, write_meta.dst_ptrs, write_meta.sizes, total)
+                gather_contiguous(
+                    src_addr + offset,
+                    plan.src_ptrs,
+                    plan.sizes,
+                    plan.offsets,
+                    stream=self._send_stream,
+                )
             event = CUASSERT(cudart.cudaEventCreate())[0]
             CUASSERT(cudart.cudaEventRecord(event, self._send_stream))
         return event
@@ -164,23 +220,35 @@ class VmmBounceTransport(BounceTransport):
             CUASSERT(cudart.cudaEventDestroy(event))
 
     def _make_write(self, src_addr: int, write_meta, total: int):
-        # one coalesced descriptor spanning the whole region
+        # One coalesced descriptor spanning the staged region. Under split routing
+        # (bounce_direct_rest) the materialized remainder (replicated INDEX_KEY and any other
+        # non-structured pools) rides the SAME TransferRequest as direct per-fragment
+        # descriptors targeting its real destination pointers, so one submit/wait covers both
+        # and the writer's completion (and its result message) means everything landed.
+        src_ptrs = np.array([src_addr], dtype=np.int64)
+        dst_ptrs = np.array([write_meta.bounce_dst_base], dtype=np.int64)
         sizes = np.array([total], dtype=np.int64)
+        if self._direct_rest(write_meta) and write_meta.src_ptrs.size > 0:
+            src_ptrs = np.concatenate([src_ptrs, write_meta.src_ptrs])
+            dst_ptrs = np.concatenate([dst_ptrs, write_meta.dst_ptrs])
+            sizes = np.concatenate([sizes, write_meta.sizes])
         src = MemoryDescs.from_arrays_uniform_device(
-            MemoryType.VRAM, np.array([src_addr], dtype=np.int64), sizes, self._device_id
+            MemoryType.VRAM, src_ptrs, sizes, self._device_id
         )
         dst = MemoryDescs.from_arrays_uniform_device(
-            MemoryType.VRAM,
-            np.array([write_meta.bounce_dst_base], dtype=np.int64),
-            sizes,
-            write_meta.dst_device_id,
+            MemoryType.VRAM, dst_ptrs, sizes, write_meta.dst_device_id
         )
         return TransferRequest(TransferOp.WRITE, src, dst, write_meta.peer_name, None)
 
     def _reserve_and_gather(self, write_meta, *, timeout):
         """Reserve a send slot and gather into it, or None on send-region backpressure. Eligibility
-        was already decided by the receiver, so the sender only falls back under backpressure."""
-        total = int(write_meta.sizes.sum())
+        was already decided by the receiver, so the sender only falls back under backpressure.
+        The slot holds only the staged bytes: specs plus, unless the remainder goes direct
+        (bounce_direct_rest), the materialized fragment bytes."""
+        total = 0 if self._direct_rest(write_meta) else int(write_meta.sizes.sum())
+        specs = self._structured_specs(write_meta)
+        if specs:
+            total += specs_total_bytes(specs)
         res = self._send_alloc.reserve(total, timeout=timeout)
         if res is None:
             logger.debug(
@@ -218,19 +286,37 @@ class VmmBounceTransport(BounceTransport):
         return False
 
     def reserve(
-        self, recv_req, num_writers: int = 1, *, timeout: Optional[float] = _RESERVE_TIMEOUT_S
+        self,
+        recv_req,
+        num_writers: int = 1,
+        *,
+        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
+        scatter_plan: Optional[Dict] = None,
+        descriptor_dominated: bool = False,
+        staged_bytes_per_writer: Optional[int] = None,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
-        must divide across the writers."""
+        must divide across the writers. ``scatter_plan`` (structured NHD templates, keyed by the
+        receiver's (layer_group, pool)) rides the TransferContext; ``descriptor_dominated``
+        bypasses only the min_blocks heuristic — head-mismatch descriptor explosion makes bounce
+        profitable from a few blocks up — while capacity and backpressure still apply.
+        ``staged_bytes_per_writer`` provides an explicit structured reservation capacity. It may
+        contain only the NHD payload (fan-in split routing) or NHD plus a receiver-derived upper
+        bound for a single writer's merged non-structured pools."""
         nblocks = sum(int(a.size) for a in recv_req.block_ids_per_layer_groups)
-        if nblocks < self._min_blocks:
+        if nblocks < self._min_blocks and not descriptor_dominated:
             return self._skip_bounce(f"{nblocks} blocks < min {self._min_blocks} (too small)")
-        total = 0
-        for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
-            if g >= len(self._block_bytes_per_group):
-                return self._skip_bounce(f"layer group {g} has no known slot size (e.g. mamba)")
-            total += int(block_ids.size) * self._block_bytes_per_group[g]
+        if staged_bytes_per_writer is not None:
+            if staged_bytes_per_writer <= 0:
+                return self._skip_bounce(f"staged bytes per writer {staged_bytes_per_writer} <= 0")
+            total = staged_bytes_per_writer * num_writers
+        else:
+            total = 0
+            for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
+                if g >= len(self._block_bytes_per_group):
+                    return self._skip_bounce(f"layer group {g} has no known slot size (e.g. mamba)")
+                total += int(block_ids.size) * self._block_bytes_per_group[g]
         if total <= 0:
             return self._skip_bounce(f"computed transfer size {total} <= 0")
         if num_writers > 1 and total % num_writers != 0:
@@ -259,6 +345,7 @@ class VmmBounceTransport(BounceTransport):
                 base_addr=addr,
                 per_writer_bytes=total // num_writers,
                 num_writers=num_writers,
+                scatter_plan=scatter_plan,
             )
             self._reserved_map[ctx.rid_slice] = ctx  # inactive until the first writer reports
         return True
@@ -324,6 +411,45 @@ class VmmBounceTransport(BounceTransport):
                     f"[kv-bounce] completion callback failed (slot={settlement.slot_id}): {e}"
                 )
 
+    @staticmethod
+    def _structured_scatter_desc(ctx: TransferContext, tail: NHDResultTail) -> Optional[tuple]:
+        """Turn a writer's structured result tail plus the reserve-time templates into a scatter
+        descriptor ``(src_base, specs, rest_dst_ptrs, rest_sizes)``, or None when there is nothing
+        to scatter. Raises ValueError when the tail does not fit the reservation — a mismatched
+        tail must fail the writer rather than scatter garbage."""
+        plan = ctx.scatter_plan
+        if plan is None:
+            raise ValueError("structured tail received but no scatter templates were reserved")
+        # The tail's src_base is the writer's sub-region; its fan-in index (which decides the
+        # writer's head sub-range) is recovered from the even split the receiver assigned.
+        writer_index, rem = divmod(int(tail.src_base) - ctx.base_addr, max(ctx.per_writer_bytes, 1))
+        if rem != 0 or not 0 <= writer_index < ctx.num_writers:
+            raise ValueError(
+                f"src_base {tail.src_base:#x} is not a writer base of region "
+                f"{ctx.base_addr:#x}+{ctx.num_writers}x{ctx.per_writer_bytes}"
+            )
+        specs = []
+        for dst_lg, dst_pool, dst_skip, n_blocks in tail.records:
+            template = plan.get((dst_lg, dst_pool))
+            if template is None:
+                raise ValueError(f"no scatter template for pool ({dst_lg}, {dst_pool})")
+            specs.append(template.spec_for(int(writer_index), int(dst_skip), int(n_blocks)))
+        total = specs_total_bytes(specs) + int(tail.rest_sizes.sum())
+        if total > ctx.per_writer_bytes:
+            # Detect-after-write guard: the one-sided RDMA already landed, so an
+            # over-claiming writer may have overwritten adjacent staged bytes.
+            # Failing here drains the transfer without scattering (the KV pools
+            # are never touched); well-formed peers cannot reach this because
+            # sender sections are sized from aligned dst lists that are always
+            # <= the receiver's advertised block count.
+            raise ValueError(
+                f"structured tail claims {total}B, exceeding the writer's "
+                f"{ctx.per_writer_bytes}B sub-region"
+            )
+        if total == 0:
+            return None  # nothing staged; treat like an empty legacy tail
+        return (int(tail.src_base), specs, tail.rest_dst_ptrs, tail.rest_sizes)
+
     def record_result(
         self,
         rid_slice: RidSlice,
@@ -332,15 +458,46 @@ class VmmBounceTransport(BounceTransport):
         sizes=None,
         src_base=None,
         on_done: Optional[Callable[[bool], None]] = None,
+        structured_tail: Optional[NHDResultTail] = None,
     ) -> None:
-        """A writer reported success. The completion callback fires only after the scatter lands, so
-        the reader never sees completion before the cache is in place."""
+        """Record a successful writer report.
+
+        The completion callback fires only after scatter lands. Structured and legacy tails that
+        exceed the writer's reservation record that writer as failed, allowing the region to drain
+        without scattering outside its fan-in sub-region.
+        """
 
         def mut(ctx: TransferContext) -> None:
             if on_done is not None:
                 ctx.on_done = on_done
+            succeeded = True
+            scatter_desc = None
+            if structured_tail is not None:
+                try:
+                    scatter_desc = self._structured_scatter_desc(ctx, structured_tail)
+                except ValueError as e:
+                    succeeded = False
+                    logger.error(
+                        f"[kv-bounce] structured tail rejected "
+                        f"(rid_slice={rid_slice}, peer_rank={peer_rank}): {e}"
+                    )
+            elif sizes is not None and int(sizes.sum()) > ctx.per_writer_bytes:
+                # A malformed or build-mismatched legacy tail could otherwise read beyond its
+                # reservation into the next writer subregion or adjacent transfer slot.
+                succeeded = False
+                logger.error(
+                    f"[kv-bounce] legacy tail rejected "
+                    f"(rid_slice={rid_slice}, peer_rank={peer_rank}): claims "
+                    f"{int(sizes.sum())}B, exceeding the writer's "
+                    f"{ctx.per_writer_bytes}B sub-region"
+                )
             ctx.record_writer_result(
-                peer_rank, succeeded=True, src_base=src_base, dst_ptrs=dst_ptrs, sizes=sizes
+                peer_rank,
+                succeeded=succeeded,
+                src_base=src_base,
+                dst_ptrs=dst_ptrs,
+                sizes=sizes,
+                scatter_desc=scatter_desc,
             )
 
         self._apply(rid_slice, mut)
@@ -365,12 +522,33 @@ class VmmBounceTransport(BounceTransport):
             ok = True
             try:
                 # Scatter each writer's fragments from its own source, never one global offset, so a
-                # missing or fallback writer cannot shift where the others are read from.
-                for src_base, dst_ptrs, sizes in descs:
-                    p = Plan(dst_ptrs, dst_ptrs, sizes, int(sizes.sum()))
-                    scatter_contiguous(
-                        src_base, p.dst_ptrs, p.sizes, p.offsets, stream=self._scatter_stream
-                    )
+                # missing or fallback writer cannot shift where the others are read from. Legacy
+                # descs are (src_base, dst_ptrs, sizes); structured descs are
+                # (src_base, specs, rest_dst_ptrs, rest_sizes) with the structured sections staged
+                # first and the materialized remainder after them, mirroring the sender's gather.
+                # Back-to-back calls on one stream are safe: the pinned metadata buffer is
+                # event-guarded per fill (see gather_scatter._MetaEntry).
+                for desc in descs:
+                    if len(desc) == 4:
+                        src_base, specs, rest_dst_ptrs, rest_sizes = desc
+                        scatter_structured(int(src_base), specs, stream=self._scatter_stream)
+                        if rest_dst_ptrs is not None and rest_dst_ptrs.size > 0:
+                            p = Plan(
+                                rest_dst_ptrs, rest_dst_ptrs, rest_sizes, int(rest_sizes.sum())
+                            )
+                            scatter_contiguous(
+                                int(src_base) + specs_total_bytes(specs),
+                                p.dst_ptrs,
+                                p.sizes,
+                                p.offsets,
+                                stream=self._scatter_stream,
+                            )
+                    else:
+                        src_base, dst_ptrs, sizes = desc
+                        p = Plan(dst_ptrs, dst_ptrs, sizes, int(sizes.sum()))
+                        scatter_contiguous(
+                            src_base, p.dst_ptrs, p.sizes, p.offsets, stream=self._scatter_stream
+                        )
                 CUASSERT(cudart.cudaStreamSynchronize(self._scatter_stream))
             except Exception as e:
                 # a scatter failure must not kill the worker nor be reported as success
@@ -408,7 +586,14 @@ class NoBounceTransport(BounceTransport):
         pass
 
     def reserve(
-        self, recv_req, num_writers: int = 1, *, timeout: Optional[float] = _RESERVE_TIMEOUT_S
+        self,
+        recv_req,
+        num_writers: int = 1,
+        *,
+        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
+        scatter_plan: Optional[Dict] = None,
+        descriptor_dominated: bool = False,
+        staged_bytes_per_writer: Optional[int] = None,
     ) -> bool:
         return False
 
@@ -422,7 +607,14 @@ class NoBounceTransport(BounceTransport):
         pass
 
     def record_result(
-        self, rid_slice, peer_rank, dst_ptrs=None, sizes=None, src_base=None, on_done=None
+        self,
+        rid_slice,
+        peer_rank,
+        dst_ptrs=None,
+        sizes=None,
+        src_base=None,
+        on_done=None,
+        structured_tail=None,
     ):
         pass
 
@@ -440,7 +632,11 @@ def create_bounce(agent, cfg, *, device_id: int, page_table) -> BounceTransport:
         return NoBounceTransport()
     try:
         transport = VmmBounceTransport.from_config(
-            agent, cfg, device_id=device_id, block_bytes_per_group=block_bytes_per_group(page_table)
+            agent,
+            cfg,
+            device_id=device_id,
+            block_bytes_per_group=block_bytes_per_group(page_table),
+            page_table=page_table,
         )
         return transport if transport is not None else NoBounceTransport()
     except (
@@ -461,20 +657,50 @@ def build_send_request(bounce, write_meta, fallback):
 
 
 def scatter_write_result(
-    bounce, rid_slice, peer_rank: int, dst_ptrs, sizes, src_base=None, on_done=None
+    bounce,
+    rid_slice,
+    peer_rank: int,
+    dst_ptrs,
+    sizes,
+    src_base=None,
+    on_done=None,
+    structured_tail=None,
 ) -> None:
     """Handle a success result: a bounced transfer records the writer and scatters once all arrive; a
     non-bounced transfer already landed in place, so fire the callback inline."""
     if bounce.is_bounced(rid_slice):
-        bounce.record_result(rid_slice, peer_rank, dst_ptrs, sizes, src_base, on_done)
+        bounce.record_result(
+            rid_slice, peer_rank, dst_ptrs, sizes, src_base, on_done, structured_tail
+        )
     elif on_done is not None:
         on_done(True)
 
 
 def encode_result_tail(write_meta) -> list:
-    """The binary tail appended to a bounced result: the destination fragment table and the source
-    this writer wrote to, so the receiver can scatter and order the fan-in writers."""
+    """The binary tail appended to a bounced result. Legacy form: the full destination fragment
+    table plus this writer's source, so the receiver can scatter and order the fan-in writers.
+    Structured form (one small frame, when the write staged via NHD specs): per-section alignment
+    records — the only sender-side facts the receiver cannot derive — plus the materialized
+    remainder tables for any trailing non-structured sections."""
     sb = write_meta.bounce_dst_base if write_meta.bounce_dst_base is not None else 0
+    sections = getattr(write_meta, "nhd_sections", None)
+    if sections:
+        # Split routing: the remainder never entered the slot (it landed in place
+        # via direct descriptors on the same write), so the tail must not tell the
+        # receiver to scatter it out of the slot.
+        if getattr(write_meta, "bounce_direct_rest", False):
+            rest_dst_ptrs = np.zeros(0, dtype=np.int64)
+            rest_sizes = np.zeros(0, dtype=np.int64)
+        else:
+            rest_dst_ptrs = write_meta.dst_ptrs
+            rest_sizes = write_meta.sizes
+        tail = NHDResultTail(
+            src_base=sb,
+            records=tuple((s.dst_lg, s.dst_pool, s.dst_skip, s.n_blocks) for s in sections),
+            rest_dst_ptrs=rest_dst_ptrs,
+            rest_sizes=rest_sizes,
+        )
+        return [encode_nhd_tail(tail)]
     return [
         write_meta.dst_ptrs.tobytes(),
         write_meta.sizes.tobytes(),
@@ -483,15 +709,21 @@ def encode_result_tail(write_meta) -> list:
 
 
 def decode_result_tail(message):
-    """Recover the destination fragments, sizes, and source from the optional trailing frames, or
-    nothing if the tail is absent."""
+    """Recover the bounce tail from the optional trailing frames as
+    ``(dst_ptrs, sizes, src_base, structured_tail)`` — the legacy triple with
+    structured_tail None, all-None triple with a decoded NHDResultTail for the structured
+    single-frame form, or all None when the tail is absent. The two forms coexist: fan-in
+    siblings may take different paths per writer."""
+    if len(message) == 3 and is_nhd_tail(message[2]):
+        return None, None, None, decode_nhd_tail(message[2])
     if len(message) >= 5:
         return (
             np.frombuffer(message[2], dtype=np.int64),
             np.frombuffer(message[3], dtype=np.int64),
             int(np.frombuffer(message[4], dtype=np.int64)[0]),
+            None,
         )
-    return None, None, None
+    return None, None, None, None
 
 
 def block_bytes_per_group(page_table) -> list:

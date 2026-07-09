@@ -18,9 +18,19 @@ cuda_ipc/MNNVL) through the BounceTransport interface; default per-block path is
 unchanged when no Config is given. config_from_size() is the on/off switch."""
 
 from .buffer import Buffer, SlotAllocator
-from .config import Config, FixedSizing, Sizing, SizingContext, config_from_size
+from .config import (
+    Config,
+    FixedSizing,
+    Sizing,
+    SizingContext,
+    TokenBudgetSizing,
+    config_from_size,
+    resolve_bounce_config,
+    structured_nhd_from_env,
+    token_budget_bytes,
+)
 from .core import BounceTransport, Disposition, ScatterState, TransferContext, TransferState
-from .gather_scatter import Plan
+from .gather_scatter import Plan, gather_structured, scatter_structured
 from .impl import (
     NoBounceTransport,
     VmmBounceTransport,
@@ -30,6 +40,7 @@ from .impl import (
     encode_result_tail,
     scatter_write_result,
 )
+from .nhd_plan import NHDGatherSpec, NHDResultTail, NHDScatterTemplate
 
 __all__ = [
     "BounceTransport",
@@ -37,12 +48,16 @@ __all__ = [
     "Config",
     "Disposition",
     "FixedSizing",
+    "NHDGatherSpec",
+    "NHDResultTail",
+    "NHDScatterTemplate",
     "NoBounceTransport",
     "Plan",
     "ScatterState",
     "Sizing",
     "SizingContext",
     "SlotAllocator",
+    "TokenBudgetSizing",
     "TransferContext",
     "TransferState",
     "VmmBounceTransport",
@@ -51,5 +66,10 @@ __all__ = [
     "create_bounce",
     "decode_result_tail",
     "encode_result_tail",
+    "gather_structured",
+    "resolve_bounce_config",
+    "scatter_structured",
     "scatter_write_result",
+    "structured_nhd_from_env",
+    "token_budget_bytes",
 ]

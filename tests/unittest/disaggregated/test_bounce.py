@@ -44,6 +44,26 @@ except ImportError:  # pragma: no cover - CPU-only env without CUDA bindings
 _MIB = 1024 * 1024
 
 
+@pytest.mark.skipif(not _HAVE_TRANSPORT, reason="transport import needs cuda-python")
+def test_bounce_stream_is_non_blocking(monkeypatch):
+    calls = []
+    non_blocking = btr.cudart.cudaStreamNonBlocking
+
+    def create_stream(flags):
+        calls.append(flags)
+        return btr.cudart.cudaError_t.cudaSuccess, 0xCAFE
+
+    monkeypatch.setattr(
+        btr.cudart,
+        "cudaStreamCreateWithFlags",
+        create_stream,
+    )
+
+    transport = object.__new__(btr.VmmBounceTransport)
+    assert transport._new_stream() == 0xCAFE
+    assert calls == [non_blocking]
+
+
 # --------------------------------------------------------------------------- #
 # config.py — sizing + OOM guard (pure math, always runnable)
 # --------------------------------------------------------------------------- #
@@ -124,14 +144,20 @@ class TestResultTail:
         # message = [msg_type, packed_prefix, *tail]; tail lives at [2:].
         msg = [b"KV_AGENT_RESULT", b"prefix"] + btr.encode_result_tail(wm)
         assert len(msg) == 5
-        dst, sizes, src_base = btr.decode_result_tail(msg)
+        dst, sizes, src_base, structured_tail = btr.decode_result_tail(msg)
         assert np.array_equal(dst, wm.dst_ptrs)
         assert np.array_equal(sizes, wm.sizes)
         assert src_base == 0xABCD
+        assert structured_tail is None  # legacy 3-frame tail, not the structured form
 
     def test_no_tail_returns_none(self):
         # non-bounced result: only [msg_type, prefix] -> no tail.
-        assert btr.decode_result_tail([b"KV_AGENT_RESULT", b"prefix"]) == (None, None, None)
+        assert btr.decode_result_tail([b"KV_AGENT_RESULT", b"prefix"]) == (
+            None,
+            None,
+            None,
+            None,
+        )
 
     def test_encode_tail_handles_unset_base(self):
         wm = self._wm([1, 2], [8, 8], None)

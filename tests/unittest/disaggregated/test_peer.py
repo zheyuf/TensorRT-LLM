@@ -574,6 +574,50 @@ def test_pool_buffer_mapper_uses_entry_offsets_for_head_mismatch():
     assert pairs[0].src.memory.ptrs.tolist() == [1000, 1008, 1016]
     assert pairs[0].dst.memory.ptrs.tolist() == [2000, 2004, 2008]
     assert pairs[0].src.memory.bytes_per_region == 4
+    assert mapper.supports_structured_staging is False
+
+
+def test_pool_buffer_mapper_supports_structured_staging_for_pure_nhd():
+    self_ri = make_rankinfo(
+        instance_name="local",
+        tp_size=2,
+        kv_heads_per_rank=2,
+        tokens_per_block=2,
+        dims_per_head=2,
+        element_bytes=2,
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        kv_heads_per_rank=1,
+        tokens_per_block=2,
+        dims_per_head=2,
+        element_bytes=2,
+    )
+    mapper = PoolBufferMapper(
+        mappings=[
+            PoolBufferMapping(0, 0, 16, 8, MapperKind.NHD),
+            PoolBufferMapping(16, 8, 16, 8, MapperKind.NHD),
+        ],
+        self_ri=self_ri,
+        peer_ri=peer_ri,
+        self_region_bytes=32,
+        peer_region_bytes=16,
+        full_region_identity=False,
+        include_sharded=True,
+        include_replicated=True,
+    )
+
+    pairs = mapper.map(
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=32)),
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=16)),
+    )
+
+    assert mapper.supports_structured_staging is True
+    assert len(pairs) == 1
+    assert pairs[0].src.memory.ptrs.tolist() == [1000, 1008, 1016, 1024]
+    assert pairs[0].dst.memory.ptrs.tolist() == [2000, 2004, 2008, 2012]
+    assert pairs[0].src.memory.bytes_per_region == 4
 
 
 def test_replicated_mapper_ignores_kv_head_mismatch():
@@ -791,11 +835,21 @@ def test_peer_registrar_rejects_legacy_subbyte_head_mismatch():
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
-def test_peer_registrar_dispatches_nhd_mapper():
+def test_peer_registrar_dispatches_pool_buffer_mapper_for_v2_nhd_entries():
     self_pt = make_page_table()
     peer_pt = make_page_table(block_bytes=[2048])
     self_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
     peer_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
+    peer_pt.layer_groups[0].pool_views[0].buffer_entries = np.array(
+        [(0, 0, 512), (0, 512, 512), (1, 1024, 512), (1, 1536, 512)],
+        dtype=BUFFER_ENTRY_DTYPE,
+    )
+    for pool_view in (
+        self_pt.layer_groups[0].pool_views[0],
+        peer_pt.layer_groups[0].pool_views[0],
+    ):
+        pool_view.buffer_roles = ("key", "value", "key", "value")
+        pool_view.buffer_mapper_kinds = (MapperKind.NHD,) * 4
     self_ri = make_rankinfo(
         kv_heads_per_rank=2,
         tp_size=2,
@@ -812,7 +866,8 @@ def test_peer_registrar_dispatches_nhd_mapper():
 
     mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
 
-    assert isinstance(mapper, NHDHeadMismatchMapper)
+    assert isinstance(mapper, PoolBufferMapper)
+    assert mapper.supports_structured_staging is True
 
 
 def test_peer_registrar_warns_for_nhd_head_mismatch(monkeypatch):

@@ -17,9 +17,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     WaitResult,
     get_unique_rid,
 )
-from tensorrt_llm._torch.disaggregation.native.bounce import (
-    config_from_size as bounce_config_from_size,
-)
+from tensorrt_llm._torch.disaggregation.native.bounce import resolve_bounce_config
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -89,8 +87,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
                 tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
                 rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
-                # On/off switch via config (size 0 => None => per-block path).
-                bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
+                # On/off switch via config (size 0 => None => per-block path), except that
+                # TRTLLM_KV_BOUNCE_STRUCTURED_NHD=1 auto-enables bounce with a token-budget
+                # capacity when the size knob is unset.
+                bounce=resolve_bounce_config(
+                    cache_transceiver_config.kv_cache_bounce_size_mb,
+                    max_tokens_in_buffer=cache_transceiver_config.max_tokens_in_buffer,
+                ),
             )
         )
         self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0

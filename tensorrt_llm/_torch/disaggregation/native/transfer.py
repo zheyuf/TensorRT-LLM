@@ -7,6 +7,7 @@ import threading
 import time
 import weakref
 from dataclasses import dataclass
+from dataclasses import fields as dataclass_fields
 from enum import Enum
 from typing import TYPE_CHECKING, List, Optional, Union
 
@@ -49,6 +50,7 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -57,7 +59,8 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggSchedul
 from tensorrt_llm.runtime.generation import CUASSERT
 
 if TYPE_CHECKING:
-    from .bounce import Config
+    from .bounce import Config, NHDGatherSpec, NHDScatterTemplate
+    from .peer import PeerOverlap
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
@@ -82,24 +85,39 @@ class RecvReqInfo:
     mamba_state_index: Optional[int] = None
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
+    # Receiver opted into structured NHD staging: it holds scatter templates for this
+    # reservation, so an eligible sender may stage via analytic specs and answer with
+    # the compact structured result tail instead of the full dst-pointer table.
+    structured_nhd: bool = False
+    # Fan-in split routing: the bounce slot holds ONLY the structured NHD sections
+    # (equal per-writer bytes by construction); every non-structured pool (e.g. a
+    # replicated INDEX_KEY sent by one elected writer) must go via direct per-fragment
+    # descriptors instead of the slot.
+    structured_only: bool = False
 
     def to_bytes(self) -> bytes:
-        return msgpack.packb(
-            {
-                "sender_req_id": self.sender_req_id,
-                "instance_name": self.instance_name,
-                "instance_rank": self.instance_rank,
-                "block_ids_per_layer_groups": [
-                    arr.tobytes() for arr in self.block_ids_per_layer_groups
-                ],
-                "unique_rid": self.unique_rid,
-                "dst_start_token": self.dst_start_token,
-                "aux_slot": self.aux_slot,
-                "mamba_state_index": self.mamba_state_index,
-                "slice_id": self.slice_id,
-                "bounce_dst_base": self.bounce_dst_base,
-            }
-        )
+        d = {
+            "sender_req_id": self.sender_req_id,
+            "instance_name": self.instance_name,
+            "instance_rank": self.instance_rank,
+            "block_ids_per_layer_groups": [
+                arr.tobytes() for arr in self.block_ids_per_layer_groups
+            ],
+            "unique_rid": self.unique_rid,
+            "dst_start_token": self.dst_start_token,
+            "aux_slot": self.aux_slot,
+            "mamba_state_index": self.mamba_state_index,
+            "slice_id": self.slice_id,
+            "bounce_dst_base": self.bounce_dst_base,
+        }
+        # Omit when False so the flag-off wire format stays byte-identical to
+        # pre-structured-NHD builds: from_bytes is cls(**d), so an old receiver
+        # would TypeError on the unknown key even with the feature disabled.
+        if self.structured_nhd:
+            d["structured_nhd"] = True
+        if self.structured_only:
+            d["structured_only"] = True
+        return msgpack.packb(d)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RecvReqInfo":
@@ -107,7 +125,11 @@ class RecvReqInfo:
         d["block_ids_per_layer_groups"] = [
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
         ]
-        return cls(**d)
+        # Drop keys this build does not know so a newer peer's optional
+        # feature keys (e.g. structured-NHD negotiation) degrade to a decline
+        # instead of a TypeError that drops the request until rx timeout.
+        known = {f.name for f in dataclass_fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 @dataclass
@@ -120,6 +142,27 @@ class ReadMeta:
 class WriteMetaType(Enum):
     KV = "KV"
     AUX = "AUX"
+
+
+@dataclass
+class NHDStagedSection:
+    """One structured (analytic NHD head-mismatch) staging section of a bounced write.
+
+    ``spec`` drives the sender's gather kernel; the ``dst_*`` fields are the alignment
+    record shipped in the structured result tail (the only sender-side facts the
+    receiver cannot derive from its own page table). ``mapper``/``src_region``/
+    ``dst_region`` are retained so the per-fragment fallback can materialize this
+    section on demand (bounce backpressure) without having paid the fragment-table
+    explosion up front."""
+
+    spec: "NHDGatherSpec"
+    dst_lg: int  # receiver's layer-group index for this pool pair
+    dst_pool: int  # receiver's pool index within that layer group
+    dst_skip: int  # receiver blocks skipped at the head by transfer alignment
+    n_blocks: int  # aligned block count actually transferred
+    mapper: object  # NHDHeadMismatchMapper for the pool pair
+    src_region: object  # SpecRegion of local block bases (fallback materialization)
+    dst_region: object  # SpecRegion of peer block bases (fallback materialization)
 
 
 @dataclass
@@ -138,6 +181,13 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
+    # Structured NHD staging sections, in canonical staging order; they stage FIRST in
+    # the bounce slot, followed by the materialized remainder in src/dst_ptrs/sizes.
+    nhd_sections: Optional[List[NHDStagedSection]] = None
+    # Split routing (RecvReqInfo.structured_only): only the structured sections enter
+    # the bounce slot; src/dst_ptrs/sizes ride the same NIXL write as direct per-fragment
+    # descriptors targeting their real destinations.
+    bounce_direct_rest: bool = False
 
 
 class MessageType:
@@ -504,6 +554,36 @@ class Sender(SenderBase):
             TransferOp.WRITE, src_memory_descs, dst_memory_descs, write_meta.peer_name, None
         )
 
+    @staticmethod
+    def _materialize_structured(write_meta: WriteMeta) -> WriteMeta:
+        """Expand structured NHD sections back into per-fragment tables, in place.
+
+        Used when the bounce path falls back (send-region backpressure) to the direct
+        per-fragment WRITE, which needs the receiver-side dst pointers the structured
+        plan deliberately never computed. Descriptor order does not matter for the
+        direct path (independent one-sided writes), so the expanded fragments are
+        appended after the already-materialized remainder. No-op without sections."""
+        sections = write_meta.nhd_sections
+        if not sections:
+            return write_meta
+        src_parts = [write_meta.src_ptrs]
+        dst_parts = [write_meta.dst_ptrs]
+        size_parts = [write_meta.sizes]
+        for section in sections:
+            region_pair = section.mapper.map(section.src_region, section.dst_region)
+            region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
+            for rp in region_pairs:
+                src_parts.append(rp.src.memory.ptrs)
+                dst_parts.append(rp.dst.memory.ptrs)
+                size_parts.append(
+                    np.full(rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region, dtype=np.int64)
+                )
+        write_meta.src_ptrs = np.concatenate(src_parts)
+        write_meta.dst_ptrs = np.concatenate(dst_parts)
+        write_meta.sizes = np.concatenate(size_parts)
+        write_meta.nhd_sections = None
+        return write_meta
+
     @nvtx_range("_deliver_kv_to_agent")
     def _deliver_kv_to_agent(self, write_meta: WriteMeta):
         assert write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size, (
@@ -560,11 +640,16 @@ class Sender(SenderBase):
 
         agent_result = AgentResult.SUCCESS
         send_slot_id = None
-        if write_meta.src_ptrs.size > 0:
+        if write_meta.src_ptrs.size > 0 or write_meta.nhd_sections:
+            # The fallback materializes any structured sections first: the direct
+            # per-fragment WRITE needs the dst pointer tables the structured plan
+            # deliberately skipped building.
             request, send_slot_id = build_send_request(
                 self._bounce,
                 write_meta,
-                lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
+                lambda: Sender._make_agent_request(
+                    Sender._materialize_structured(write_meta), device_id=self._device_id
+                ),
             )
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
@@ -699,15 +784,36 @@ class Sender(SenderBase):
         dst_token_start: int,
         tokens_per_block: int,
     ) -> tuple[np.ndarray, np.ndarray]:
+        """See :meth:`_align_kv_blocks_with_skip`; drops the dst-skip count."""
+        src, dst, _ = Sender._align_kv_blocks_with_skip(
+            src_block_ids,
+            dst_block_ids,
+            src_token_start=src_token_start,
+            dst_token_start=dst_token_start,
+            tokens_per_block=tokens_per_block,
+        )
+        return src, dst
+
+    @staticmethod
+    def _align_kv_blocks_with_skip(
+        src_block_ids: np.ndarray,
+        dst_block_ids: np.ndarray,
+        *,
+        src_token_start: int,
+        dst_token_start: int,
+        tokens_per_block: int,
+    ) -> tuple[np.ndarray, np.ndarray, int]:
         """Align src/dst block arrays using explicit token-start positions.
 
         Both src_token_start and dst_token_start must be block-aligned
         (multiples of tokens_per_block), which is always true for prefix-cache
         boundaries in current KV cache managers.
 
-        Returns the (src, dst) sub-arrays that cover the shared token overlap.
-        Returns a pair of empty arrays when there is no overlap (i.e. this
-        context slice is entirely within generation's already-cached prefix).
+        Returns the (src, dst) sub-arrays that cover the shared token overlap,
+        plus the number of dst blocks skipped at the head — the alignment fact
+        the structured NHD result tail ships to the receiver. Returns empty
+        arrays and skip 0 when there is no overlap (i.e. this context slice is
+        entirely within generation's already-cached prefix).
 
         This handles four cases without special-casing:
           1. No prefix cache on either side  → identity (start_token == 0 both)
@@ -721,10 +827,11 @@ class Sender(SenderBase):
         dst_skip = (overlap_start - dst_token_start) // tokens_per_block
         n_transfer = min(src_block_ids.size - src_skip, dst_block_ids.size - dst_skip)
         if n_transfer <= 0:
-            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+            return np.array([], dtype=np.int64), np.array([], dtype=np.int64), 0
         return (
             src_block_ids[src_skip : src_skip + n_transfer],
             dst_block_ids[dst_skip : dst_skip + n_transfer],
+            int(dst_skip),
         )
 
     @staticmethod
@@ -746,12 +853,42 @@ class Sender(SenderBase):
         sliding_window_size: Optional[int],
         prompt_len: Optional[int],
     ) -> tuple[np.ndarray, np.ndarray]:
+        """See :meth:`_prepare_kv_blocks_with_skip`; drops the dst-skip count."""
+        src, dst, _ = Sender._prepare_kv_blocks_with_skip(
+            src_block_ids,
+            dst_block_ids,
+            tokens_per_block=tokens_per_block,
+            slice_end=slice_end,
+            beam_width=beam_width,
+            dst_start_token=dst_start_token,
+            sliding_window_size=sliding_window_size,
+            prompt_len=prompt_len,
+        )
+        return src, dst
+
+    @staticmethod
+    def _prepare_kv_blocks_with_skip(
+        src_block_ids: np.ndarray,
+        dst_block_ids: np.ndarray,
+        *,
+        tokens_per_block: int,
+        slice_end: int,
+        beam_width: int,
+        dst_start_token: Optional[int],
+        sliding_window_size: Optional[int],
+        prompt_len: Optional[int],
+    ) -> tuple[np.ndarray, np.ndarray, int]:
         """Normalize and align one layer-group pair's source/destination blocks.
 
         Each block list is a suffix of the logical blocks covering
         ``[0, slice_end)``; its omitted prefix is inferred from list length.
         ``prompt_len`` can exceed ``slice_end`` for non-final context chunks,
         so SWA staleness is derived from the full prompt, not the slice.
+
+        Also returns the number of dst blocks skipped at the head of the
+        receiver's advertised list (draft-block trim only shortens the tail,
+        so head indexing is unaffected); the structured NHD result tail sends
+        this so the receiver can slice its local scatter template.
         """
         block_diff = dst_block_ids.size - src_block_ids.size
         if block_diff == 1:
@@ -799,7 +936,7 @@ class Sender(SenderBase):
             src_start = max(stale_end * tokens_per_block, src_start)
             dst_start = max(stale_end * tokens_per_block, dst_start)
 
-        return Sender._align_kv_blocks(
+        return Sender._align_kv_blocks_with_skip(
             src_block_ids,
             dst_block_ids,
             src_token_start=src_start,
@@ -835,7 +972,22 @@ class Sender(SenderBase):
         dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
         src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
 
-        aligned_blocks_by_layer_groups: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+        aligned_blocks_by_layer_groups: dict[
+            tuple[int, int], tuple[np.ndarray, np.ndarray, int]
+        ] = {}
+
+        # Structured NHD staging: the receiver opted in (it holds scatter templates for
+        # this reservation) and this transport's flag is on. Eligible pool pairs skip
+        # mapper.map()'s fragment-table explosion and carry an analytic spec instead;
+        # beam > 1 with head mismatch is an untested combination, so it explicitly
+        # falls back to the materialized path (correct, just not structured).
+        use_structured = (
+            req_info.bounce_dst_base is not None
+            and req_info.structured_nhd
+            and getattr(self._bounce, "structured_nhd", False)
+            and task._beam_width == 1
+        )
+        nhd_sections: list[NHDStagedSection] = []
 
         # Aggregate fragments from all matching pools using numpy concatenation.
         # Ownership is decided per logical pool because replicated side caches
@@ -855,7 +1007,7 @@ class Sender(SenderBase):
                 token_range = task._slice.token_range
                 lg_info = extractor.page_table.layer_groups[self_lg]
                 aligned_blocks_by_layer_groups[layer_group_pair] = (
-                    Sender._prepare_kv_blocks_for_transfer(
+                    Sender._prepare_kv_blocks_with_skip(
                         src_block_ids_per_groups[self_lg],
                         dst_block_ids_per_groups[peer_lg],
                         tokens_per_block=extractor.page_table.tokens_per_block,
@@ -866,13 +1018,29 @@ class Sender(SenderBase):
                         prompt_len=task._prompt_len,
                     )
                 )
-            src_block_ids, dst_block_ids = aligned_blocks_by_layer_groups[layer_group_pair]
+            src_block_ids, dst_block_ids, dst_skip = aligned_blocks_by_layer_groups[
+                layer_group_pair
+            ]
 
             src_region = extractor.extract(src_block_ids, layer_group_id=self_lg, pool_idx=self_pi)
             dst_region = peer_extractor.extract(
                 dst_block_ids, layer_group_id=peer_lg, pool_idx=peer_pi
             )
             mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
+            if use_structured and getattr(mapper, "supports_structured_staging", False):
+                nhd_sections.append(
+                    NHDStagedSection(
+                        spec=mapper.src_gather_spec(src_region.memory.ptrs),
+                        dst_lg=peer_lg,
+                        dst_pool=peer_pi,
+                        dst_skip=dst_skip,
+                        n_blocks=int(dst_block_ids.size),
+                        mapper=mapper,
+                        src_region=src_region,
+                        dst_region=dst_region,
+                    )
+                )
+                continue
             region_pair = mapper.map(src_region, dst_region)
             region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
             for rp in region_pairs:
@@ -910,7 +1078,33 @@ class Sender(SenderBase):
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
-            timer.record_transfer_sizes(peer_ri.instance_rank, int(kv_sizes.sum()), dst_frags.size)
+            total_bytes = int(kv_sizes.sum())
+            total_frags = int(dst_frags.size)
+            for section in nhd_sections:
+                total_bytes += section.spec.total_bytes
+                total_frags += section.spec.n_frags
+            timer.record_transfer_sizes(peer_ri.instance_rank, total_bytes, total_frags)
+
+        # Fan-in split routing: the receiver sized its slot for the structured sections
+        # alone, so the materialized remainder must ride direct descriptors, never the
+        # slot. A writer that stages nothing structurally (no eligible section, or the
+        # structured branch declined locally, e.g. beam > 1) must drop the slot address
+        # entirely — gathering materialized bytes into the structured-sized sub-region
+        # could overflow into a sibling writer's range; the whole write goes direct and
+        # the receiver counts this writer without a scatter (record_result, no tail).
+        direct_rest = use_structured and req_info.structured_only and bool(nhd_sections)
+        bounce_dst_base = req_info.bounce_dst_base
+        if req_info.structured_only and not direct_rest:
+            bounce_dst_base = None
+        if use_structured and nhd_sections:
+            logger.info_once(
+                "[kv-bounce] structured NHD staging engaged "
+                f"(sections={len(nhd_sections)}, direct_rest={direct_rest}, "
+                f"expected_transfers={expected_transfers})",
+                key=(
+                    f"structured-nhd-engaged-{len(nhd_sections)}-{direct_rest}-{expected_transfers}"
+                ),
+            )
 
         return WriteMeta(
             task=task,
@@ -925,7 +1119,9 @@ class Sender(SenderBase):
             unique_rid=task._unique_rid,
             slice_id=task.slice_id,
             is_last_slice=task._slice.is_last_slice,
-            bounce_dst_base=req_info.bounce_dst_base,
+            bounce_dst_base=bounce_dst_base,
+            nhd_sections=nhd_sections or None,
+            bounce_direct_rest=direct_rest,
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1567,6 +1763,142 @@ class Receiver(ReceiverBase):
                 return False
         return True
 
+    @staticmethod
+    def _fanin_writer_set_is_exact(sender_dp_rank: Optional[int], peer_dp_size: int) -> bool:
+        """Whether a fan-in request names exactly one context DP writer group.
+
+        Gen-first ADP normally broadcasts before ``ctx_dp_rank`` is known, so
+        multiple context DP groups could target one reservation. With exactly
+        one context DP group the broadcast set is already exact and TP fan-in
+        may safely use the bounce subregions.
+        """
+        return sender_dp_rank is not None or peer_dp_size == 1
+
+    @staticmethod
+    def _ordered_rank_union(overlaps) -> list[int]:
+        """Deduplicate overlap ranks without changing their topology order.
+
+        ``PeerOverlap.ranks`` is pp-outer/cp/tp-inner, and structured fan-in uses its
+        list position as the writer's TP head-shard index. A set-based union can swap
+        non-contiguous ranks and silently scatter writer i into writer j's head range.
+        """
+        return list(dict.fromkeys(rank for overlap in overlaps for rank in overlap.ranks))
+
+    @staticmethod
+    def _iter_pool_pairs(pool_mapping):
+        return pool_mapping.items() if hasattr(pool_mapping, "items") else pool_mapping
+
+    @staticmethod
+    def _legacy_fanin_pools_uniform(pool_mapping: dict, page_table) -> bool:
+        """Return whether every mapped pool contributes bytes from every fan-in writer.
+
+        Legacy bounce divides one receiver region evenly across writers. A replicated
+        logical pool elects one owner, so its presence makes writer payloads unequal
+        even when the region's total byte count happens to divide evenly.
+        """
+        return not any(
+            page_table.layer_groups[layer_group].pool_views[pool].mapper_kind
+            == MapperKind.REPLICATED
+            for (layer_group, pool), _peer_pool_key in Receiver._iter_pool_pairs(pool_mapping)
+        )
+
+    @staticmethod
+    def _legacy_bounce_layout_complete(pool_mapping: dict, page_table) -> bool:
+        """Whether legacy first-pool sizing covers every mapped logical view.
+
+        Legacy bounce reserves physical pool zero's slot for each layer group.
+        Multiple logical views may safely share that physical pool,
+        but a view backed by another physical pool contributes bytes outside the
+        reservation and must use structured split routing or the direct path.
+        """
+        for (layer_group, pool), _peer_pool_key in Receiver._iter_pool_pairs(pool_mapping):
+            views = page_table.layer_groups[layer_group].pool_views
+            if views[pool].pool_idx != 0:
+                return False
+        return True
+
+    def _structured_scatter_plan(
+        self, task: KVRecvTask, peer_ri: RankInfo
+    ) -> tuple[dict[tuple[int, int], "NHDScatterTemplate"], int]:
+        """Build the receiver-local scatter templates for every structured-eligible pool
+        pair (NHD head-mismatch), keyed by the receiver's (layer_group, pool) — the key
+        the structured result tail names. Computed from the receiver's OWN page table,
+        block ids, and mapper (its head offsets relative to the sender are baked in by
+        the registrar's kv-map); no pointer table ever crosses the wire. Also returns a
+        receiver-derived upper bound for every non-structured mapped pool. A single
+        writer may reserve that capacity and safely merge those pools into the staged
+        write; fan-in still sends them directly because owner-only pools are asymmetric."""
+        templates: dict[tuple[int, int], "NHDScatterTemplate"] = {}
+        unstructured_capacity = 0
+        pool_mapping = self._registrar.get_pool_mapping(peer_ri)
+        for (self_lg, self_pi), peer_pool_key in self._iter_pool_pairs(pool_mapping):
+            mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), peer_pool_key)
+            block_ids = task._kv_slice.block_ids_per_layer_groups[self_lg]
+            region = self._registrar.self_extractor.extract(
+                block_ids, layer_group_id=self_lg, pool_idx=self_pi
+            )
+            if not getattr(mapper, "supports_structured_staging", False):
+                unstructured_capacity += int(region.memory.ptrs.size) * int(
+                    region.memory.bytes_per_region
+                )
+                continue
+            templates[(self_lg, self_pi)] = mapper.recv_scatter_template(region.memory.ptrs)
+        return templates, unstructured_capacity
+
+    @staticmethod
+    def _structured_section_bytes(
+        templates: dict[tuple[int, int], "NHDScatterTemplate"],
+    ) -> int:
+        """Return one fan-in writer's structured staging capacity.
+
+        Each receiver template already owns the advertised destination block list and
+        the per-block fragment geometry, so it is the single source of truth for this
+        reservation. Senders may align away leading blocks and use less capacity.
+        """
+        return sum(template.total_bytes for template in templates.values())
+
+    @staticmethod
+    def _structured_bounce_eligible(
+        templates: dict, expected_transfers: int, overlap: "PeerOverlap"
+    ) -> bool:
+        """Whether the structured staging fast path may opt this reservation in.
+
+        Needs at least one structured section. Under fan-in the slot is sized for the
+        structured NHD sections ALONE (RecvReqInfo.structured_only): those contribute
+        equal per-writer bytes by construction (each writer stages min-heads for the
+        same blocks/layers/tokens), so the even region split is exact, while every
+        non-structured pool (e.g. a replicated INDEX_KEY sent by one elected writer)
+        rides the same NIXL write as direct per-fragment descriptors instead of the
+        slot — mixed pools no longer force the whole request onto the descriptor path.
+
+        Fan-in must be pure-TP: NHDScatterTemplate.spec_for reconstructs each
+        writer's slot from writer_index via HEAD-stride math (writer i holds heads
+        [i*heads_per_writer, ...)), which is only valid when the writers differ by
+        TP head shard. PeerOverlap.ranks enumerates pp-outer/cp/tp-inner, so with
+        overlap_pp_size > 1 (or cp > 1) writers differ by LAYER window (or sequence
+        chunk) with identical byte counts — applying a head shift there silently
+        corrupts data. Require tp-only fan-in (pp <= 1 and cp <= 1, i.e.
+        expected_transfers == overlap_tp_size); anything else keeps the descriptor
+        path, which _fanin_bounce_safe may still coalesce correctly."""
+        if not templates:
+            return False
+        if expected_transfers == 1:
+            return True
+        return overlap.overlap_pp_size <= 1 and overlap.overlap_cp_size <= 1
+
+    @staticmethod
+    def _structured_split_required(
+        scatter_plan: Optional[dict], expected_transfers: int, has_unbounded_remainder: bool
+    ) -> bool:
+        """Whether non-structured pools must bypass the structured staging slot.
+
+        Fan-in always uses split routing so every writer's staged NHD region has
+        equal geometry. A single writer uses an explicit receiver-derived capacity
+        and keeps the faster merged layout unless an out-of-band remainder (currently
+        Mamba state) cannot be bounded from the mapped attention pool views.
+        """
+        return scatter_plan is not None and (expected_transfers > 1 or has_unbounded_remainder)
+
     def dispatch_task(self, task: KVRecvTask):
         params = task._params
         logger.debug(
@@ -1585,17 +1917,19 @@ class Receiver(ReceiverBase):
             # get_peer_overlap returns ranks for one DP group (topology is
             # symmetric), so use dp_rank=0 as representative.
             dp_size = peer_infos.dp_size
-            dp0_overlap = self._registrar.get_peer_overlap(peer_infos, 0)
-            # Union of overlapping ranks across all DP groups for broadcast (deduplicated)
-            all_ranks_set: set[int] = set(dp0_overlap.ranks)
-            for dp in range(1, dp_size):
-                all_ranks_set.update(self._registrar.get_peer_overlap(peer_infos, dp).ranks)
-            all_ranks = list(all_ranks_set)
+            dp_overlaps = [
+                self._registrar.get_peer_overlap(peer_infos, dp) for dp in range(dp_size)
+            ]
+            dp0_overlap = dp_overlaps[0]
+            # Preserve each overlap's pp-outer/cp/tp-inner order. In particular, a
+            # dp_size==1 broadcast must retain dp0_overlap.ranks because structured
+            # fan-in interprets the list position as the writer's TP head-shard index.
+            all_ranks = self._ordered_rank_union(dp_overlaps)
             logger.debug(
                 f"Receiver.dispatch_task: ADP broadcast path, dp_size={dp_size}, "
                 f"all_ranks={all_ranks}"
             )
-            peer_overlap = type(dp0_overlap)(ranks=all_ranks)
+            peer_overlap = dp0_overlap if dp_size == 1 else type(dp0_overlap)(ranks=all_ranks)
 
         # In gen-first ADP broadcast, peer_overlap contains the union of all DP
         # groups, but expected_transfers should reflect per-DP-group count since
@@ -1604,14 +1938,71 @@ class Receiver(ReceiverBase):
             task.expected_transfers = len(peer_overlap.ranks)
         else:
             task.expected_transfers = len(dp0_overlap.ranks)
-        # TP fan-in splits ONE region equally, so allow it only for a uniform writer set:
-        # _fanin_bounce_safe() (TP-by-head / even-PP), and never under ADP broadcast (sender_dp_rank
-        # None), where the real writer count exceeds expected_transfers and would overflow the slot.
+        # TP fan-in splits ONE region equally, so allow it only for a uniform, exact writer set.
+        # An ADP broadcast is ambiguous when multiple context DP groups exist, but with one group
+        # the broadcast names the same TP writers as a known ctx_dp_rank.
         topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
-        allow_bounce = task.expected_transfers == 1 or (
-            sender_dp_rank is not None and self._fanin_bounce_safe(topo_overlap, peer_infos)
+        topology_allows_bounce = task.expected_transfers == 1 or (
+            self._fanin_writer_set_is_exact(sender_dp_rank, peer_infos.dp_size)
+            and self._fanin_bounce_safe(topo_overlap, peer_infos)
         )
-        bounced = allow_bounce and self._bounce.reserve(receiver_req, task.expected_transfers)
+        pool_mapping = self._registrar.get_pool_mapping(peer_infos)
+        page_table = self._registrar.self_extractor.page_table
+        legacy_pools_uniform = self._legacy_fanin_pools_uniform(pool_mapping, page_table)
+        legacy_layout_complete = self._legacy_bounce_layout_complete(pool_mapping, page_table)
+        # Legacy bounce stages every pool into equally sized writer subregions but sizes
+        # those regions from the first physical pool. Replicated owner-only pools make
+        # fan-in payloads unequal; separately backed pools make the reservation incomplete.
+        # Structured split routing stages only NHD and may opt either case back in below.
+        allow_bounce = (
+            topology_allows_bounce
+            and legacy_layout_complete
+            and (task.expected_transfers == 1 or legacy_pools_uniform)
+        )
+        # Structured NHD staging (flag-gated): compute the local scatter templates at
+        # reserve time. A structured-eligible reservation also bypasses the min_blocks
+        # heuristic (descriptor explosion makes bounce pay off at small sizes); with the
+        # flag off, nothing below runs and bounce behavior is unchanged.
+        scatter_plan = None
+        unstructured_capacity = 0
+        if topology_allows_bounce and getattr(self._bounce, "structured_nhd", False):
+            try:
+                templates, unstructured_capacity = self._structured_scatter_plan(task, peer_infos)
+            except (KeyError, IndexError, ValueError) as e:
+                logger.warning(
+                    f"structured NHD scatter plan failed for rid={task._unique_rid}: {e}; "
+                    "using the descriptor path"
+                )
+                templates = {}
+            if self._structured_bounce_eligible(templates, task.expected_transfers, topo_overlap):
+                scatter_plan = templates
+                allow_bounce = True
+        # Structured split routing: fan-in always stages only the equal NHD sections.
+        # A single writer reserves an explicit NHD + mapped-remainder capacity and
+        # coalesces side pools such as INDEX_KEY into the same staged write. Mamba
+        # state is not represented by these attention pool views, so keep it direct.
+        structured_only = self._structured_split_required(
+            scatter_plan,
+            task.expected_transfers,
+            task._kv_slice.mamba_state_index is not None,
+        )
+        staged_bytes_per_writer = None
+        if scatter_plan is not None:
+            staged_bytes_per_writer = self._structured_section_bytes(scatter_plan)
+            if not structured_only:
+                staged_bytes_per_writer += unstructured_capacity
+        bounced = allow_bounce and self._bounce.reserve(
+            receiver_req,
+            task.expected_transfers,
+            scatter_plan=scatter_plan,
+            descriptor_dominated=scatter_plan is not None,
+            staged_bytes_per_writer=staged_bytes_per_writer,
+        )
+        if bounced and scatter_plan is not None:
+            # Tell the senders they may stage via analytic specs and answer with the
+            # compact structured tail; serialized below with bounce_dst_base.
+            receiver_req.structured_nhd = True
+            receiver_req.structured_only = structured_only
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -1740,7 +2131,7 @@ class Receiver(ReceiverBase):
         )
         from .bounce import decode_result_tail
 
-        dst_ptrs, sizes, src_base = decode_result_tail(message)
+        dst_ptrs, sizes, src_base, structured_tail = decode_result_tail(message)
         session = self._get_session(unique_rid)
         if session is None:
             logger.warning(
@@ -1755,6 +2146,7 @@ class Receiver(ReceiverBase):
             dst_ptrs=dst_ptrs,
             sizes=sizes,
             src_base=src_base,
+            structured_tail=structured_tail,
         )
 
     def _process_aux_agent_result(self, _send_id: bytes, message: list[bytes]):
@@ -1873,6 +2265,7 @@ class RxSession(RxSessionBase):
         dst_ptrs=None,
         sizes=None,
         src_base=None,
+        structured_tail=None,
     ):
         with self.lock:
             assert sender_slice_id < len(self._kv_tasks), (
@@ -1942,6 +2335,7 @@ class RxSession(RxSessionBase):
                     sizes,
                     src_base,
                     on_done,
+                    structured_tail=structured_tail,
                 )
             elif status == AgentResult.FAILED:
                 detail = (

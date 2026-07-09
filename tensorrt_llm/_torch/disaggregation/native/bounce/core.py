@@ -70,6 +70,10 @@ class TransferContext:
     per_writer_bytes: int
     num_writers: int
     on_done: Optional[Callable[[bool], None]] = None
+    # Receiver-local structured-NHD scatter templates, keyed by the receiver's
+    # (layer_group, pool) — built at reserve() time, consumed when a writer's
+    # structured result tail arrives. Plain host data; dropped with the context.
+    scatter_plan: Optional[Dict[Tuple[int, int], object]] = None
 
     # Whether each writer that reported succeeded, keyed by rank; presence means it reported.
     _writer_ok: Dict[int, bool] = field(default_factory=dict)
@@ -107,16 +111,21 @@ class TransferContext:
         src_base: Optional[int] = None,
         dst_ptrs=None,
         sizes=None,
+        scatter_desc: Optional[tuple] = None,
     ) -> None:
         """Record one writer's terminal report. Repeat or late reports are ignored, so duplicate or
-        out-of-order messages are harmless."""
+        out-of-order messages are harmless. ``scatter_desc`` is a pre-built structured scatter
+        descriptor (from a structured result tail) that replaces the legacy (src_base, dst_ptrs,
+        sizes) form; both start with src_base so :meth:`sorted_scatter_descs` orders them alike."""
         # A duplicate or late report can still arrive after the writer set is final, because
         # scatter runs on another thread while the region stays live. For example a retransmitted
         # notification, or a stray failure that would flip a good transfer to failed; drop it.
         if self._writers_final() or peer_rank in self._writer_ok:
             return
         self._writer_ok[peer_rank] = succeeded
-        if succeeded and dst_ptrs is not None and int(dst_ptrs.size) > 0:
+        if succeeded and scatter_desc is not None:
+            self._scatter_descs.append(scatter_desc)
+        elif succeeded and dst_ptrs is not None and int(dst_ptrs.size) > 0:
             self._scatter_descs.append(
                 (src_base if src_base is not None else self.base_addr, dst_ptrs, sizes)
             )
@@ -181,6 +190,8 @@ class BounceTransport(ABC):
 
     #: True for a real transport, False for the disabled null object.
     enabled: bool = False
+    #: Whether the structured NHD staging fast path is enabled (Config.structured_nhd).
+    structured_nhd: bool = False
 
     @abstractmethod
     def build_request(self, write_meta):
@@ -192,8 +203,23 @@ class BounceTransport(ABC):
         """Release a send region after its write completes."""
 
     @abstractmethod
-    def reserve(self, recv_req, num_writers: int = 1, *, timeout: Optional[float] = None) -> bool:
-        """Reserve a region and record its address for the senders. False falls back to per-fragment."""
+    def reserve(
+        self,
+        recv_req,
+        num_writers: int = 1,
+        *,
+        timeout: Optional[float] = None,
+        scatter_plan: Optional[Dict[Tuple[int, int], object]] = None,
+        descriptor_dominated: bool = False,
+        staged_bytes_per_writer: Optional[int] = None,
+    ) -> bool:
+        """Reserve a region and record its address for the senders. False falls back to
+        per-fragment. ``scatter_plan`` carries the receiver's structured-NHD scatter templates;
+        ``descriptor_dominated`` bypasses the min_blocks size heuristic (head-mismatch descriptor
+        explosion pays off at small sizes) but never capacity or backpressure.
+        ``staged_bytes_per_writer`` provides an explicit structured reservation capacity. For
+        fan-in it contains only equal-sized NHD sections; for a single writer it may also include
+        a receiver-derived upper bound for merged non-structured pools."""
 
     @abstractmethod
     def writer_base(self, rid_slice, writer_index: int) -> Optional[int]:
@@ -209,9 +235,18 @@ class BounceTransport(ABC):
 
     @abstractmethod
     def record_result(
-        self, rid_slice, peer_rank, dst_ptrs=None, sizes=None, src_base=None, on_done=None
+        self,
+        rid_slice,
+        peer_rank,
+        dst_ptrs=None,
+        sizes=None,
+        src_base=None,
+        on_done=None,
+        structured_tail=None,
     ) -> None:
-        """Handle a writer's success; scatter and finalize once all writers reported."""
+        """Handle a writer's success; scatter and finalize once all writers reported.
+        ``structured_tail`` is the decoded structured result tail (nhd_plan.NHDResultTail)
+        for a writer that staged via the structured path."""
 
     @abstractmethod
     def record_failure(self, rid_slice, peer_rank) -> None:

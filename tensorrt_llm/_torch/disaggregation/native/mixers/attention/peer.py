@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -14,6 +15,12 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_mapper_kinds
 from tensorrt_llm._utils import nvtx_range
 
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.disaggregation.native.bounce.nhd_plan import (
+        NHDGatherSpec,
+        NHDScatterTemplate,
+    )
+
 
 @dataclass(frozen=True)
 class PoolBufferMapping:
@@ -24,6 +31,14 @@ class PoolBufferMapping:
     src_bytes: int
     dst_bytes: int
     mapper_kind: MapperKind
+
+
+@dataclass(frozen=True)
+class _PoolBufferStructuredNHDPlan:
+    src_flat_offsets: np.ndarray
+    dst_flat_offsets: np.ndarray
+    frag_bytes: int
+    src_head_off: int
 
 
 class IdentityMapper(RegionMapperBase):
@@ -111,7 +126,7 @@ class PoolBufferMapper(RegionMapperBase):
             if full_region_identity and head_match and all_mappings_included
             else None
         )
-        self._plans = self._build_plans(
+        self._plans, self._structured_nhd_plan = self._build_plans(
             mappings=mappings,
             self_ri=self_ri,
             peer_ri=peer_ri,
@@ -136,7 +151,7 @@ class PoolBufferMapper(RegionMapperBase):
         peer_ri: RankInfo,
         include_sharded: bool,
         include_replicated: bool,
-    ) -> list[tuple[np.ndarray, np.ndarray, int]]:
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray, int]], _PoolBufferStructuredNHDPlan | None]:
         head_match = (
             self_ri.attention.is_mla
             or self_ri.attention.kv_heads_per_rank == peer_ri.attention.kv_heads_per_rank
@@ -146,6 +161,12 @@ class PoolBufferMapper(RegionMapperBase):
         self_tpb = self_ri.attention.tokens_per_block
         peer_tpb = peer_ri.attention.tokens_per_block
         offsets_by_size: dict[int, tuple[list[int], list[int]]] = {}
+        structured_src_offsets: list[int] = []
+        structured_dst_offsets: list[int] = []
+        structured_frag_bytes: int | None = None
+        structured_src_head_off: int | None = None
+        structured_candidate = not head_match
+        included_kinds: list[MapperKind] = []
 
         def append_offsets(size: int, src_offsets, dst_offsets) -> None:
             src_list, dst_list = offsets_by_size.setdefault(size, ([], []))
@@ -160,6 +181,7 @@ class PoolBufferMapper(RegionMapperBase):
             elif not include_sharded:
                 continue
 
+            included_kinds.append(kind)
             if head_match or kind == MapperKind.REPLICATED:
                 if mapping.src_bytes != mapping.dst_bytes:
                     raise ValueError(
@@ -207,15 +229,32 @@ class PoolBufferMapper(RegionMapperBase):
                 )
                 transfer_bytes = min(self_heads, peer_heads) * self_bytes_per_token_head
                 token_indices = np.arange(self_tpb, dtype=np.int64)
-                append_offsets(
-                    transfer_bytes,
+                src_offsets = (
                     mapping.src_offset
                     + token_indices * self_heads * self_bytes_per_token_head
-                    + src_head_off,
+                    + src_head_off
+                )
+                dst_offsets = (
                     mapping.dst_offset
                     + token_indices * peer_heads * peer_bytes_per_token_head
-                    + dst_head_off,
+                    + dst_head_off
                 )
+                append_offsets(
+                    transfer_bytes,
+                    src_offsets,
+                    dst_offsets,
+                )
+                if structured_candidate:
+                    if structured_frag_bytes is None:
+                        structured_frag_bytes = transfer_bytes
+                        structured_src_head_off = src_head_off
+                    elif (
+                        structured_frag_bytes != transfer_bytes
+                        or structured_src_head_off != src_head_off
+                    ):
+                        structured_candidate = False
+                    structured_src_offsets.extend(int(offset) for offset in src_offsets)
+                    structured_dst_offsets.extend(int(offset) for offset in dst_offsets)
                 continue
 
             if kind == MapperKind.INDEXED:
@@ -253,7 +292,7 @@ class PoolBufferMapper(RegionMapperBase):
 
             raise ValueError(f"Unsupported per-buffer mapper kind: {kind.name}")
 
-        return [
+        plans = [
             (
                 np.asarray(src_offsets, dtype=np.int64),
                 np.asarray(dst_offsets, dtype=np.int64),
@@ -261,6 +300,21 @@ class PoolBufferMapper(RegionMapperBase):
             )
             for size, (src_offsets, dst_offsets) in offsets_by_size.items()
         ]
+        structured_plan = None
+        if (
+            structured_candidate
+            and included_kinds
+            and all(kind == MapperKind.NHD for kind in included_kinds)
+            and structured_frag_bytes is not None
+            and structured_src_head_off is not None
+        ):
+            structured_plan = _PoolBufferStructuredNHDPlan(
+                src_flat_offsets=np.asarray(structured_src_offsets, dtype=np.int64),
+                dst_flat_offsets=np.asarray(structured_dst_offsets, dtype=np.int64),
+                frag_bytes=int(structured_frag_bytes),
+                src_head_off=int(structured_src_head_off),
+            )
+        return plans, structured_plan
 
     @nvtx_range("PoolBufferMapper.map")
     def map(
@@ -296,6 +350,54 @@ class PoolBufferMapper(RegionMapperBase):
                 )
             )
         return results
+
+    @property
+    def supports_structured_staging(self) -> bool:
+        """Pure NHD head-mismatch pool-buffer mappings have analytic fragment geometry.
+
+        Mixed pools deliberately stay on the materialized/remainder path because one
+        NHDGatherSpec supports only a single fragment size and replicated buffers have
+        different fan-in ownership rules.
+        """
+        return self._identity is None and self._structured_nhd_plan is not None
+
+    def src_gather_spec(self, src_block_ptrs: np.ndarray) -> "NHDGatherSpec":
+        if self._structured_nhd_plan is None:
+            raise ValueError("PoolBufferMapper does not support structured NHD staging")
+        from tensorrt_llm._torch.disaggregation.native.bounce.nhd_plan import NHDGatherSpec
+
+        return NHDGatherSpec(
+            block_ptrs=np.ascontiguousarray(src_block_ptrs, dtype=np.int64),
+            flat_offsets=self._structured_nhd_plan.src_flat_offsets,
+            frag_bytes=int(self._structured_nhd_plan.frag_bytes),
+        )
+
+    def dst_scatter_spec(self, dst_block_ptrs: np.ndarray) -> "NHDGatherSpec":
+        if self._structured_nhd_plan is None:
+            raise ValueError("PoolBufferMapper does not support structured NHD staging")
+        from tensorrt_llm._torch.disaggregation.native.bounce.nhd_plan import NHDGatherSpec
+
+        return NHDGatherSpec(
+            block_ptrs=np.ascontiguousarray(dst_block_ptrs, dtype=np.int64),
+            flat_offsets=self._structured_nhd_plan.dst_flat_offsets,
+            frag_bytes=int(self._structured_nhd_plan.frag_bytes),
+        )
+
+    def recv_scatter_template(self, self_block_ptrs: np.ndarray) -> "NHDScatterTemplate":
+        if self._structured_nhd_plan is None:
+            raise ValueError("PoolBufferMapper does not support structured NHD staging")
+        from tensorrt_llm._torch.disaggregation.native.bounce.nhd_plan import NHDScatterTemplate
+
+        flat_offsets = self._structured_nhd_plan.src_flat_offsets
+        src_head_off = int(self._structured_nhd_plan.src_head_off)
+        if src_head_off != 0:
+            flat_offsets = flat_offsets - np.int64(src_head_off)
+        return NHDScatterTemplate(
+            block_ptrs=np.ascontiguousarray(self_block_ptrs, dtype=np.int64),
+            flat_offsets=flat_offsets,
+            frag_bytes=int(self._structured_nhd_plan.frag_bytes),
+            writer_head_stride=int(self._structured_nhd_plan.frag_bytes),
+        )
 
 
 class HeadMatchMapper(RegionMapperBase):
@@ -609,6 +711,9 @@ class NHDHeadMismatchMapper(HeadMismatchMapper):
             peer_kv_heads=peer_heads,
             bytes_per_head=self_bytes_per_token_head,
         )
+        # kept so recv_scatter_template can rebase the flat offsets to fan-in writer 0
+        self._src_head_off = src_head_off
+        self._dst_head_off = dst_head_off
 
         self._src_flat_offsets = self._build_flat_offsets(
             transfer_layers=transfer_layers,
@@ -627,6 +732,84 @@ class NHDHeadMismatchMapper(HeadMismatchMapper):
             heads=peer_heads,
             bytes_per_token_head=peer_bytes_per_token_head,
             head_offset=dst_head_off,
+        )
+
+    @property
+    def supports_structured_staging(self) -> bool:
+        """NHD head-mismatch fragments are perfectly regular (constant size, addresses
+        analytic in (block, layer, K/V, token)), so the bounce staging fast path can
+        replace the materialized fragment tables with an NHDGatherSpec."""
+        return True
+
+    def src_gather_spec(self, src_block_ptrs: np.ndarray) -> "NHDGatherSpec":
+        """Analytic bounce gather plan over this rank's paged blocks.
+
+        Calling this requires cuda-python: the bounce package init pulls cudart at
+        import time, so this accessor (unlike the rest of this module) is unusable in
+        a CPU-only environment without CUDA bindings.
+
+        Args:
+            src_block_ptrs: [n_blocks] absolute source slot base addresses, in the
+                aligned transfer order.
+        """
+        # local import: the bounce package init pulls CUDA-binding modules, and peer.py
+        # must stay importable without them (CPU unit tests)
+        from tensorrt_llm._torch.disaggregation.native.bounce.nhd_plan import NHDGatherSpec
+
+        return NHDGatherSpec(
+            block_ptrs=np.ascontiguousarray(src_block_ptrs, dtype=np.int64),
+            flat_offsets=self._src_flat_offsets,
+            # int(): harden against np.integer from the geometry arithmetic; the spec
+            # validates isinstance(frag_bytes, int)
+            frag_bytes=int(self._bytes_cont_heads),
+        )
+
+    def dst_scatter_spec(self, dst_block_ptrs: np.ndarray) -> "NHDGatherSpec":
+        """The mirror plan for the peer's paged blocks: same fragment order and sizes,
+        with the peer-side flat offsets (its head offset already baked in).
+
+        Calling this requires cuda-python, exactly as :meth:`src_gather_spec` does.
+
+        Args:
+            dst_block_ptrs: [n_blocks] absolute destination slot base addresses, in the
+                aligned transfer order.
+        """
+        from tensorrt_llm._torch.disaggregation.native.bounce.nhd_plan import NHDGatherSpec
+
+        return NHDGatherSpec(
+            block_ptrs=np.ascontiguousarray(dst_block_ptrs, dtype=np.int64),
+            flat_offsets=self._dst_flat_offsets,
+            frag_bytes=int(self._bytes_cont_heads),
+        )
+
+    def recv_scatter_template(self, self_block_ptrs: np.ndarray) -> "NHDScatterTemplate":
+        """Receiver-side scatter template over this rank's OWN paged blocks.
+
+        The template's flat offsets are the self-side offsets rebased to fan-in
+        writer 0 (head offset zero); writer ``i``'s offsets follow at
+        ``i * bytes_cont_heads`` — the head span each fan-in writer contributes,
+        matching what :meth:`HeadMismatchMapper._compute_head_offsets` assigns to the
+        sender's tp_rank (fan-in writers are indexed in ``PeerOverlap.ranks`` order,
+        tp innermost). The baked-in ``_src_head_off`` is subtracted rather than
+        assumed zero so the template is independent of which peer rank's RankInfo
+        built this mapper.
+
+        Calling this requires cuda-python, exactly as :meth:`src_gather_spec` does.
+
+        Args:
+            self_block_ptrs: [n_blocks] absolute local slot base addresses covering
+                every block this receiver advertised for the pool's layer group.
+        """
+        from tensorrt_llm._torch.disaggregation.native.bounce.nhd_plan import NHDScatterTemplate
+
+        flat_offsets = self._src_flat_offsets
+        if int(self._src_head_off) != 0:
+            flat_offsets = flat_offsets - np.int64(self._src_head_off)
+        return NHDScatterTemplate(
+            block_ptrs=np.ascontiguousarray(self_block_ptrs, dtype=np.int64),
+            flat_offsets=flat_offsets,
+            frag_bytes=int(self._bytes_cont_heads),
+            writer_head_stride=int(self._bytes_cont_heads),
         )
 
     @staticmethod

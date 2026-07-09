@@ -106,6 +106,13 @@ class RegionMapperBase(ABC):
     Maps a batch of region descriptors to corresponding destination(s).
     """
 
+    @property
+    def supports_structured_staging(self) -> bool:
+        """Whether this mapper can describe its fragments analytically for the bounce
+        staging fast path (native/bounce/nhd_plan.py) instead of materialized tables.
+        Mappers that can, override this and expose spec accessors."""
+        return False
+
     @abstractmethod
     def map(self, src_regions: SpecRegion, dst_regions: SpecRegion) -> SpecRegionPair:
         """
