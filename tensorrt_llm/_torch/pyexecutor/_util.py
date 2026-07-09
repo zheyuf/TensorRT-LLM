@@ -952,10 +952,13 @@ class KvCacheCreator:
         in the target model and don't produce a separate ModelConfig. We fall
         back to the target model's config via _get_effective_draft_config().
         """
-        if self._mapping.enable_attention_dp:
-            logger.info(
-                "Attention DP is enabled, separate draft KV cache is not supported."
-            )
+        if self._mapping.enable_attention_dp and getattr(
+                self._kv_cache_manager_cls, 'supports_shared_draft_layers',
+                True):
+            # Back-compat: attention DP keeps the shared-manager layout
+            # existing deployments were validated with.
+            logger.info("Attention DP: draft layers share the target KV "
+                        "cache manager.")
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 

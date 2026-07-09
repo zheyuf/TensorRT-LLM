@@ -7686,6 +7686,80 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("overlap_scheduler", [True])
+    @parametrize_with_ids("attention_dp", [False, True])
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
+                          overlap_scheduler):
+        model_name = "nvidia/MiniMax-M3-NVFP4"
+        model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        max_draft_len = 3
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",
+        )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False)
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=MiniMaxM3SparseAttentionConfig(),
+                 moe_config=MoeConfig(backend="CUTLASS"),
+                 max_seq_len=4096,
+                 speculative_config=spec_config,
+                 cuda_graph_config=None,
+                 disable_overlap_scheduler=not overlap_scheduler,
+                 enable_attention_dp=attention_dp,
+                 trust_remote_code=True) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+            # Acceptance probe (pattern: TestNemotronV3Ultra
+            # test_nvfp4_4gpu_mtp_ar): stream a few greedy prompts and
+            # derive per-step acceptance from the token increments.
+            raw_prompts = [
+                "Solve step by step: what is 12 times 17?",
+                "Write a Python function that reverses a linked list.",
+                "The capital of France is",
+            ]
+            prompts = [
+                llm.tokenizer.apply_chat_template(
+                    [{
+                        "role": "user",
+                        "content": p
+                    }],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ) for p in raw_prompts
+            ]
+            tok_ids = [llm.tokenizer.encode(p) for p in prompts]
+            sampling_params = SamplingParams(max_tokens=128, temperature=0)
+            total_drafted = 0
+            total_accepted = 0
+            total_steps = 0
+            for i in range(len(tok_ids)):
+                num_tokens = 0
+                for output in llm.generate_async(tok_ids[i],
+                                                 sampling_params,
+                                                 streaming=True):
+                    new_tokens = output.outputs[0].token_ids
+                    total_drafted += max_draft_len
+                    total_accepted += len(new_tokens) - num_tokens - 1
+                    total_steps += 1
+                    num_tokens = len(new_tokens)
+            accept_rate = total_accepted / total_drafted
+            accept_length = 1 + total_accepted / total_steps
+            print(f"MiniMax-M3 Eagle3 acceptance: rate={accept_rate:.3f}, "
+                  f"mean acceptance length={accept_length:.3f}")
+            assert accept_rate > 0.25, \
+                f"Eagle3 acceptance rate too low: {accept_rate:.3f}"
+
 
 @skip_pre_blackwell
 class TestGLM5FP8(LlmapiAccuracyTestHarness):
