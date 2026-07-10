@@ -633,21 +633,6 @@ def create_py_executor(
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
 
-    # The MSA kernel path packs one query token per generation row and its
-    # prefill plan stages CPU values that go stale under overlap kv-len
-    # correction, so it cannot verify draft tokens (two-model spec also
-    # emits multi-token target rows) — reject at creation instead of at the
-    # first verify step inside prepare().
-    if (sparse_attention_config is not None
-            and sparse_attention_config.algorithm == "minimax_m3"
-            and getattr(sparse_attention_config, "sparse_use_msa", False)
-            and spec_config is not None):
-        raise NotImplementedError(
-            "Speculative decoding is not supported with the MiniMax-M3 MSA "
-            "kernel path (sparse_use_msa=True): MSA packs one query token "
-            "per generation row. Set sparse_use_msa=False to use the "
-            "reference sparse backend with speculative decoding.")
-
     if (sparse_attention_config is not None
             and sparse_attention_config.algorithm == "minimax_m3"
             and spec_config is not None

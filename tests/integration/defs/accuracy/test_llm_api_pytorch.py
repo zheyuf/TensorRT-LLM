@@ -7688,11 +7688,16 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("use_msa", [True])
     @parametrize_with_ids("overlap_scheduler", [True])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
-                          overlap_scheduler):
+                          overlap_scheduler, use_msa):
+        if use_msa:
+            pytest.importorskip(
+                "fmha_sm100",
+                reason="MSA kernels (fmha_sm100) not installed")
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         max_draft_len = 3
@@ -7700,13 +7705,16 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             max_draft_len=max_draft_len,
             speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",
         )
+        # The MSA kernels require page_size == sparse_block_size (128).
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        tokens_per_block=128 if use_msa else 32)
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
-                 sparse_attention_config=MiniMaxM3SparseAttentionConfig(),
+                 sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+                     sparse_use_msa=use_msa),
                  moe_config=MoeConfig(backend="CUTLASS"),
                  max_seq_len=4096,
                  speculative_config=spec_config,

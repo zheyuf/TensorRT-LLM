@@ -69,12 +69,14 @@ def _geometry(max_batch):
     )
 
 
-def _make_inputs(kv_lens, seed=0, pool_pages=None):
-    """Build synthetic paged caches + decode Q for the given KV lengths.
+def _make_inputs(kv_lens, seed=0, pool_pages=None, qo_len=1):
+    """Build synthetic paged caches + Q for the given KV lengths.
 
-    `pool_pages` fixes the physical page-pool size so tensors keep
-    identical shapes across calls (required by the CUDA graph test's
-    in-place refreshes).
+    `qo_len` query tokens per request, tokens of one request contiguous;
+    `kv_lens[b]` is the KV length at the LAST token (earlier tokens
+    ladder down causally). `pool_pages` fixes the physical page-pool
+    size so tensors keep identical shapes across calls (required by the
+    CUDA graph tests' in-place refreshes).
     """
     device = torch.device("cuda")
     gen = torch.Generator(device="cuda").manual_seed(seed)
@@ -91,8 +93,8 @@ def _make_inputs(kv_lens, seed=0, pool_pages=None):
             dtype
         )
 
-    q = r(batch, NUM_Q_HEADS, HEAD_DIM, scale=0.5)
-    idx_q = r(batch, NUM_INDEX_HEADS, HEAD_DIM, scale=0.5)
+    q = r(batch * qo_len, NUM_Q_HEADS, HEAD_DIM, scale=0.5)
+    idx_q = r(batch * qo_len, NUM_INDEX_HEADS, HEAD_DIM, scale=0.5)
     k_paged = r(pool_pages, NUM_KV_HEADS, PAGE_SIZE, HEAD_DIM, scale=0.5)
     v_paged = r(pool_pages, NUM_KV_HEADS, PAGE_SIZE, HEAD_DIM, scale=0.5)
     idx_k_paged = r(pool_pages, 1, PAGE_SIZE, HEAD_DIM, scale=0.5)
@@ -105,6 +107,7 @@ def _make_inputs(kv_lens, seed=0, pool_pages=None):
 
     return {
         "batch": batch,
+        "qo_len": qo_len,
         "q": q,
         "idx_q": idx_q,
         "k_paged": k_paged,
@@ -125,9 +128,9 @@ def _make_inputs(kv_lens, seed=0, pool_pages=None):
 def _msa_proxy_max_score(inp):
     import fmha_sm100
 
-    batch = inp["batch"]
-    qo_lens_cpu = torch.ones(batch, dtype=torch.int32)
-    qo_offset_cpu = (inp["kv_lens_cpu"] - 1).to(torch.int32)
+    batch, qo_len = inp["batch"], inp["qo_len"]
+    qo_lens_cpu = torch.full((batch,), qo_len, dtype=torch.int32)
+    qo_offset_cpu = (inp["kv_lens_cpu"] - qo_len).to(torch.int32)
     plan = fmha_sm100.fmha_sm100_plan(
         qo_lens_cpu,
         inp["kv_lens_cpu"],
@@ -136,7 +139,9 @@ def _msa_proxy_max_score(inp):
         qo_offset=qo_offset_cpu,
         page_size=PAGE_SIZE,
         output_maxscore=True,
-        causal=False,
+        # In-row ladder tokens need causal masking; at qo_len=1 the
+        # offset alone bounds the row (production decode configuration).
+        causal=qo_len > 1,
         num_kv_splits=1,
     )
     _, max_score = fmha_sm100.fmha_sm100(
@@ -178,9 +183,9 @@ def _msa_sparse(inp, kv_block_indexes, causal=False):
     """
     import fmha_sm100
 
-    batch = inp["batch"]
-    qo_lens_cpu = torch.ones(batch, dtype=torch.int32)
-    qo_offset_cpu = (inp["kv_lens_cpu"] - 1).to(torch.int32)
+    batch, qo_len = inp["batch"], inp["qo_len"]
+    qo_lens_cpu = torch.full((batch,), qo_len, dtype=torch.int32)
+    qo_offset_cpu = (inp["kv_lens_cpu"] - qo_len).to(torch.int32)
     plan = fmha_sm100.fmha_sm100_plan(
         qo_lens_cpu,
         inp["kv_lens_cpu"],
@@ -231,15 +236,18 @@ def _intree_proxy(state, inp):
         kv_page_indptr=inp["kv_page_indptr"],
         kv_indices=inp["kv_indices"],
         sm_scale=IDX_SM_SCALE,
+        qo_len=inp["qo_len"],
     )
 
 
-def _intree_select(state, max_score, seq_lens):
+def _intree_select(state, max_score, inp):
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.decode_wrapper.dispatch import (  # noqa: E501
         decode_select_blocks,
     )
 
-    return decode_select_blocks(state, max_score, seq_lens=seq_lens)
+    return decode_select_blocks(
+        state, max_score, seq_lens=inp["seq_lens_dev"], qo_len=inp["qo_len"]
+    )
 
 
 def _intree_sparse(state, inp, kv_block_indexes):
@@ -257,6 +265,7 @@ def _intree_sparse(state, inp, kv_block_indexes):
         kv_page_indptr=inp["kv_page_indptr"],
         kv_indices=inp["kv_indices"],
         sm_scale=SM_SCALE,
+        qo_len=inp["qo_len"],
     )
 
 
@@ -292,13 +301,27 @@ def _reference_topk(max_score_kv, kv_lens):
 
 UNIFORM_LENS = [512] * 8
 HETERO_LENS = [1, 130, 257, 128, 511, 1024, 33, 900]
+QO_LEN = 4  # 1 verified token + draft_len=3 (spec verify row width)
+# Page-boundary ladder coverage: kv_len % PAGE_SIZE in {0, 1, 127}, plus a
+# ladder that crosses a page edge mid-row (129: token lens 126..129) and a
+# short row (5: token lens 2..5).
+MT_BOUNDARY_LENS = [128, 129, 255, 256, 383, 512, 2048, 5]
 
 
-@pytest.mark.parametrize("kv_lens", [UNIFORM_LENS, HETERO_LENS], ids=["uniform", "hetero"])
-def test_proxy_max_score_bitdiff(kv_lens):
+@pytest.mark.parametrize(
+    "kv_lens, qo_len",
+    [
+        (UNIFORM_LENS, 1),
+        (HETERO_LENS, 1),
+        (UNIFORM_LENS, QO_LEN),
+        (MT_BOUNDARY_LENS, QO_LEN),
+    ],
+    ids=["uniform", "hetero", "mt_uniform", "mt_boundary"],
+)
+def test_proxy_max_score_bitdiff(kv_lens, qo_len):
     _require_env()
-    inp = _make_inputs(kv_lens)
-    state = _decode_state(max_batch=len(kv_lens))
+    inp = _make_inputs(kv_lens, qo_len=qo_len)
+    state = _decode_state(max_batch=len(kv_lens) * qo_len)
 
     ms_ref = _msa_proxy_max_score(inp)
     ms_new = _intree_proxy(state, inp)
@@ -318,7 +341,7 @@ def test_topk_bitdiff_uniform():
 
     ms = _msa_proxy_max_score(inp)
     blocks_ref = _msa_topk(ms, inp["kv_lens_cpu"])
-    blocks_new = _intree_select(state, ms, inp["seq_lens_dev"])
+    blocks_new = _intree_select(state, ms, inp)
     torch.cuda.synchronize()
 
     assert torch.equal(blocks_ref, blocks_new), (
@@ -326,18 +349,23 @@ def test_topk_bitdiff_uniform():
     )
 
 
-def test_topk_reference_hetero():
+@pytest.mark.parametrize(
+    "kv_lens, qo_len",
+    [(HETERO_LENS, 1), (MT_BOUNDARY_LENS, QO_LEN)],
+    ids=["hetero", "mt_boundary"],
+)
+def test_topk_reference(kv_lens, qo_len):
     _require_env()
-    inp = _make_inputs(HETERO_LENS)
-    state = _decode_state(max_batch=len(HETERO_LENS))
+    inp = _make_inputs(kv_lens, qo_len=qo_len)
+    state = _decode_state(max_batch=len(kv_lens) * qo_len)
 
     ms = _intree_proxy(state, inp)
-    blocks_new = _intree_select(state, ms, inp["seq_lens_dev"]).cpu()
+    blocks_new = _intree_select(state, ms, inp).cpu()
     torch.cuda.synchronize()
-    blocks_ref = _reference_topk(ms, HETERO_LENS)
+    blocks_ref = _reference_topk(ms, _ladder_lens(kv_lens, qo_len))
 
     assert torch.equal(blocks_ref, blocks_new), (
-        f"per-row topk mismatch, first rows: ref={blocks_ref[:2].tolist()} "
+        f"per-token topk mismatch, first rows: ref={blocks_ref[:2].tolist()} "
         f"new={blocks_new[:2].tolist()}"
     )
 
@@ -385,7 +413,7 @@ def test_full_pipeline_bitdiff_uniform():
     out_ref = _msa_sparse(inp, blocks_ref)
 
     ms_new = _intree_proxy(state, inp)
-    blocks_new = _intree_select(state, ms_new, inp["seq_lens_dev"])
+    blocks_new = _intree_select(state, ms_new, inp)
     out_new = _intree_sparse(state, inp, blocks_new)
     torch.cuda.synchronize()
 
@@ -393,7 +421,15 @@ def test_full_pipeline_bitdiff_uniform():
     assert torch.equal(out_ref, out_new)
 
 
-def test_cuda_graph_replay_tracks_device_state():
+@pytest.mark.parametrize(
+    "qo_len, seed_base, hetero_lens",
+    [
+        (1, 10, [128, 512, 1920, 256, 640, 64, 2048, 300]),
+        (QO_LEN, 20, [128, 512, 1920, 256, 640, 129, 2048, 300]),
+    ],
+    ids=["qo1", "qo4"],
+)
+def test_cuda_graph_replay_tracks_device_state(qo_len, seed_base, hetero_lens):
     """Capture once, mutate lengths + contents, replay: must match eager.
 
     This is exactly the failure mode of the MSA driver (frozen plan): the
@@ -402,11 +438,11 @@ def test_cuda_graph_replay_tracks_device_state():
     """
     _require_env()
     batch = 8
-    state = _decode_state(max_batch=batch)
+    state = _decode_state(max_batch=batch * qo_len)
 
     # Persistent input buffers the graph will read.
     pool_pages = batch * (MAX_KV_LEN // PAGE_SIZE)
-    inp0 = _make_inputs([256] * batch, seed=1, pool_pages=pool_pages)
+    inp0 = _make_inputs([256] * batch, seed=1, pool_pages=pool_pages, qo_len=qo_len)
     seq_lens = inp0["seq_lens_dev"].clone()
     kv_page_indptr = inp0["kv_page_indptr"].clone()
     kv_indices_buf = torch.zeros(
@@ -435,8 +471,9 @@ def test_cuda_graph_replay_tracks_device_state():
             kv_page_indptr=kv_page_indptr,
             kv_indices=kv_indices_buf,
             sm_scale=IDX_SM_SCALE,
+            qo_len=qo_len,
         )
-        blocks = decode_select_blocks(state, ms, seq_lens=seq_lens)
+        blocks = decode_select_blocks(state, ms, seq_lens=seq_lens, qo_len=qo_len)
         return decode_sparse_attention(
             state,
             q,
@@ -447,6 +484,7 @@ def test_cuda_graph_replay_tracks_device_state():
             kv_page_indptr=kv_page_indptr,
             kv_indices=kv_indices_buf,
             sm_scale=SM_SCALE,
+            qo_len=qo_len,
         )
 
     # Warm up (JIT + shape caches + allocator) then capture.
@@ -456,11 +494,9 @@ def test_cuda_graph_replay_tracks_device_state():
     with torch.cuda.graph(graph):
         out_view = run_pipeline()
 
-    for step, lens in enumerate(
-        [[256] * batch, [384] * batch, [128, 512, 1920, 256, 640, 64, 2048, 300]]
-    ):
+    for step, lens in enumerate([[256] * batch, [384] * batch, hetero_lens]):
         # Refresh device state in place (as prepare() would).
-        inp = _make_inputs(lens, seed=10 + step, pool_pages=pool_pages)
+        inp = _make_inputs(lens, seed=seed_base + step, pool_pages=pool_pages, qo_len=qo_len)
         seq_lens.copy_(inp["seq_lens_dev"])
         kv_page_indptr.copy_(inp["kv_page_indptr"])
         n = inp["kv_indices"].shape[0]
@@ -484,6 +520,84 @@ def test_cuda_graph_replay_tracks_device_state():
             f"max abs diff "
             f"{(replay_out.float() - eager_out.float()).abs().max().item()}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Multi-token decode (spec verify: qo_len = 1 + draft_len tokens per request)
+# ---------------------------------------------------------------------------
+
+
+def _ladder_lens(kv_lens, qo_len):
+    """Per-token effective KV lengths: token t attends kv_len-qo_len+t+1."""
+    return [kv_len - qo_len + t + 1 for kv_len in kv_lens for t in range(qo_len)]
+
+
+def _torch_sparse_ladder_ref(inp, blocks_tok):
+    """Independent fp32 reference: gather selected blocks per token, clip
+    to the token's causal-ladder bound, softmax-attend. Semantic ground
+    truth for the multi-token sparse pass (tolerance compare: bf16 kernel
+    vs fp32 torch)."""
+    batch, qo_len = inp["batch"], inp["qo_len"]
+    kv_lens = inp["kv_lens_cpu"].tolist()
+    q = inp["q"].float()
+    k_paged, v_paged = inp["k_paged"].float(), inp["v_paged"].float()
+    kv_indices = inp["kv_indices"].cpu().tolist()
+    indptr = inp["kv_page_indptr"].cpu().tolist()
+    group = NUM_Q_HEADS // NUM_KV_HEADS
+    out = torch.zeros(batch * qo_len, NUM_Q_HEADS, HEAD_DIM, device=q.device)
+    for b in range(batch):
+        pages = kv_indices[indptr[b] : indptr[b + 1]]
+        k_rows = torch.cat([k_paged[p] for p in pages], dim=1)  # [Hkv, n*P, D]
+        v_rows = torch.cat([v_paged[p] for p in pages], dim=1)
+        for t in range(qo_len):
+            tok = b * qo_len + t
+            eff = kv_lens[b] - qo_len + t + 1
+            for kvh in range(NUM_KV_HEADS):
+                blks = [int(x) for x in blocks_tok[tok, kvh].tolist() if x >= 0]
+                pos_chunks = [
+                    torch.arange(blk * PAGE_SIZE, min((blk + 1) * PAGE_SIZE, eff))
+                    for blk in blks
+                    if blk * PAGE_SIZE < eff
+                ]
+                if not pos_chunks:
+                    continue
+                pos = torch.cat(pos_chunks).to(q.device)
+                qh = slice(kvh * group, (kvh + 1) * group)
+                scores = q[tok, qh] @ k_rows[kvh, pos].T * SM_SCALE
+                out[tok, qh] = torch.softmax(scores, dim=-1) @ v_rows[kvh, pos]
+    return out.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize(
+    "kv_lens", [UNIFORM_LENS, MT_BOUNDARY_LENS], ids=["uniform", "boundary"]
+)
+def test_multitoken_sparse_bitdiff_and_torch_ladder(kv_lens):
+    _require_env()
+    inp = _make_inputs(kv_lens, qo_len=QO_LEN)
+    state = _decode_state(max_batch=len(kv_lens) * QO_LEN)
+
+    ms = _intree_proxy(state, inp)
+    blocks = _intree_select(state, ms, inp)
+    out_new = _intree_sparse(state, inp, blocks)
+    out_ref = _msa_sparse(inp, blocks, causal=True)
+    torch.cuda.synchronize()
+
+    # Driver vs eager api: bit-exact (same kernel binaries).
+    assert out_ref.shape == out_new.shape
+    assert torch.equal(out_ref, out_new), (
+        f"sparse out mismatch vs eager api: max abs diff "
+        f"{(out_ref.float() - out_new.float()).abs().max().item()}"
+    )
+
+    # Semantic ground truth: torch fp32 ladder reference (tolerance: the
+    # kernel accumulates fp32 but rounds through bf16).
+    out_torch = _torch_sparse_ladder_ref(inp, blocks.cpu())
+    diff = (out_new.float() - out_torch.float()).abs()
+    rel = diff / out_torch.float().abs().clamp(min=1e-3)
+    assert (diff < 0.06).logical_or(rel < 0.05).all(), (
+        f"ladder semantics mismatch vs torch reference: max abs "
+        f"{diff.max().item():.4f}, max rel {rel.max().item():.4f}"
+    )
 
 
 if __name__ == "__main__":

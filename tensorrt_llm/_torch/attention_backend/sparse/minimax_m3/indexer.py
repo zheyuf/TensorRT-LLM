@@ -197,7 +197,8 @@ class MsaIndexer:
 
         config = self.config
         idx_k_paged = cache_view_to_msa_paged(idx_k_cache)
-        batch = int(idx_q.shape[0])
+        total_q = int(idx_q.shape[0])
+        qo_len = int(metadata.decode_qo_len)
         seq_lens = metadata.seq_lens.to(torch.int32)
 
         kv_indices = getattr(metadata, "msa_kv_indices", None)
@@ -213,14 +214,15 @@ class MsaIndexer:
                 )
             kv_indices, _ = build_kv_indices_and_lens(metadata, page_size)
             num_pages_cpu = (metadata.seq_lens_cpu.to(torch.long) + page_size - 1) // page_size
-            kv_page_indptr = torch.zeros(batch + 1, dtype=torch.int32)
+            num_reqs = total_q // qo_len
+            kv_page_indptr = torch.zeros(num_reqs + 1, dtype=torch.int32)
             kv_page_indptr[1:] = num_pages_cpu.to(torch.int32).cumsum(0)
             kv_page_indptr = kv_page_indptr.to(idx_q.device, non_blocking=True)
             max_batch = 0
             max_kv_len = 0
 
         if max_batch <= 0:
-            max_batch = max(64, 1 << (batch - 1).bit_length())
+            max_batch = max(64, 1 << (total_q - 1).bit_length())
         if max_kv_len <= 0:
             max_kv_len = int(metadata.req_to_token.shape[1])
 
@@ -239,8 +241,9 @@ class MsaIndexer:
             kv_page_indptr=kv_page_indptr,
             kv_indices=kv_indices,
             sm_scale=idx_sm_scale,
+            qo_len=qo_len,
         )
-        return decode_select_blocks(state, max_score, seq_lens=seq_lens)
+        return decode_select_blocks(state, max_score, seq_lens=seq_lens, qo_len=qo_len)
 
 
 __all__ = ["MsaIndexer"]
