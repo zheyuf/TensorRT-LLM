@@ -94,6 +94,13 @@ class MiniMaxM3TritonSparseAttentionMetadata:
     prefix_lens: Optional[torch.Tensor] = None
     cu_seqlens_q: Optional[torch.Tensor] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
+    # Query tokens per request on decode-shaped metadata (``is_prefill=False``).
+    # 1 for ordinary decode; 1 + draft_len under one-model Eagle3 spec verify
+    # when a pure-generation batch is kept decode-shaped. The reference
+    # backend routes multi-token gen batches through the extend path, so this
+    # stays 1 there; the dense SDPA decode branch consumes it for the causal
+    # ladder mask.
+    decode_qo_len: int = 1
     q_batch_row: Optional[torch.Tensor] = None
     q_positions: Optional[torch.Tensor] = None
     max_seqlen_q: int = field(default=1)
@@ -866,7 +873,12 @@ class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
         # specialization. (iter-131 regression: previously a wrong
         # predicate routed mixed batches into the decode branch and
         # crashed in index_copy_.)
-        is_extend = num_contexts > 0
+        # Multi-token generation rows (one-model Eagle3 spec verify emits
+        # 1 + draft_len query tokens per gen row) route through the extend
+        # path: the prefill kernels handle them as prefix+window extends.
+        # The decode branch stays reserved for batches where every row
+        # appends exactly one token.
+        is_extend = num_contexts > 0 or int(seq_lens_cpu[:batch_size].max().item()) > 1
         if is_extend:
             prefix_lens_list = [int(num_cached_per_seq[b]) for b in range(batch_size)]
             extend_seq_lens_cpu = [
