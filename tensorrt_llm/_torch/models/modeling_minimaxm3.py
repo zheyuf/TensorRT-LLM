@@ -1078,11 +1078,10 @@ class MiniMaxM3Attention(Attention):
                 output_view[start:end].copy_(out_b.squeeze(0).transpose(0, 1))
         else:
             # Decode: qo_len query tokens per request; token t of request b
-            # sits at position seq_lens[b] - qo_len + t, so its causal
-            # extent ladders up to the full seq_lens at the last token
-            # (qo_len=1 reduces to the classic one-token mask at
-            # seq_lens - 1). Every input tensor here is already on
-            # q.device (set up by prepare()), so SDPA captures cleanly.
+            # attends seq_lens[b] - qo_len + t + 1 positions (the causal
+            # ladder; qo_len=1 is the classic one-token mask). Every input
+            # tensor here is already on q.device (set up by prepare()), so
+            # SDPA captures cleanly.
             qo_len = int(m3_meta.decode_qo_len)
             ladder = torch.arange(1 - qo_len, 1, device=q.device, dtype=torch.long)
             # eff[b, t] = attendable position count for token t of row b.
@@ -1103,11 +1102,9 @@ class MiniMaxM3Attention(Attention):
                     dropout_p=0.0,
                     is_causal=False,
                 )  # [batch, H, qo, d]
-            # Copy through a token-major [batch, qo, num_heads, head_dim]
-            # view (copy_ respects the transposed source strides) rather
+            # Copy through a token-major [batch, qo, H, dh] view rather
             # than transpose(1, 2).reshape, which (with H != head_dim)
-            # copies in C-order and scrambles the (head, head_dim)
-            # ordering into o_proj.
+            # copies in C-order and scrambles (head, head_dim) into o_proj.
             output.view(batch, qo_len, self.num_heads, self.head_dim).copy_(
                 out_b.transpose(1, 2)
             )

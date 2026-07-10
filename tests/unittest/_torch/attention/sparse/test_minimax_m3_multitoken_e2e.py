@@ -189,6 +189,59 @@ def _randn(seed):
     return r
 
 
+def _pool_rows(manager, block_table, b, eff, which):
+    """fp32 rows for positions 0..eff-1 of request b ('k'/'v'/'i')."""
+    pages = block_table[b]
+    chunks, p = [], 0
+    while p * PAGE < eff:
+        n = min(PAGE, eff - p * PAGE)
+        if which == "k":
+            chunks.append(manager.pool[pages[p], 0, :n, 0])
+        elif which == "v":
+            chunks.append(manager.pool[pages[p], 1, :n, 0])
+        else:
+            chunks.append(manager.idx_pool[pages[p], :n, 0])
+        p += 1
+    return torch.cat(chunks, 0).float()
+
+
+def _sparse_ref(q_tok, k_rows, v_rows, blocks_row, eff):
+    """fp32 attention over the selected blocks clipped to the causal-ladder
+    bound `eff`; None if no block intersects the bound."""
+    blks = [int(x) for x in blocks_row.tolist() if x >= 0]
+    chunks = [
+        torch.arange(bk * PAGE, min((bk + 1) * PAGE, eff)) for bk in blks if bk * PAGE < eff
+    ]
+    if not chunks:
+        return None
+    pos = torch.cat(chunks).to(q_tok.device)
+    scores = q_tok @ k_rows[pos].T * SM_SCALE
+    return torch.softmax(scores, -1) @ v_rows[pos]
+
+
+def _staged_verify_batch(m, config):
+    """Optimistic builder + corrected-hook staging for the shared
+    adversarial verify batch: page-boundary-crossing true lens with
+    per-row pending rejections (optimistic cached = true + rejected)."""
+    torch.manual_seed(5)
+    true_cached = [122, 125, 252, 124, 33, 380]
+    rejected = [3, 3, 3, 3, 0, 3]
+    B = len(true_cached)
+    block_table, total_pages = _alloc_block_tables(
+        [(true_cached[b] + rejected[b] + QO_LEN + PAGE - 1) // PAGE for b in range(B)], spare=8
+    )
+    manager = FakeManager(total_pages, block_table)
+    seq_lens_cpu = torch.full((B,), QO_LEN, dtype=torch.int32)
+    cached_opt = [true_cached[b] + rejected[b] for b in range(B)]
+    meta = FakeMeta(manager, list(range(B)), seq_lens_cpu, cached_opt)
+    m3_meta = m.build_m3_sparse_metadata_and_plans(meta, geometry=config)
+    corrected = torch.tensor([c + QO_LEN for c in true_cached], dtype=torch.int32, device=DEV)
+    meta.kv_lens_cuda[:B] = corrected
+    m.rederive_msa_attachment(meta)
+    torch.cuda.synchronize()
+    return manager, meta, m3_meta, block_table, true_cached, corrected
+
+
 def test_verify_step_glue_at_page_boundaries():
     """One verify step: builder staged with OPTIMISTIC cached counts (as
     the overlap scheduler's prepare() sees them), then the real hook
@@ -197,33 +250,11 @@ def test_verify_step_glue_at_page_boundaries():
     read back from the pools."""
     _require_env()
     m = _m3()
-    torch.manual_seed(5)
     config = _config(m)
-
-    # true cached counts (post-correction) and per-row rejected counts
-    # (optimistic cached = true + rejected), crossing page boundaries.
-    true_cached = [122, 125, 252, 124, 33, 380]
-    rejected = [3, 3, 3, 3, 0, 3]
+    manager, meta, m3_meta, block_table, true_cached, corrected = _staged_verify_batch(m, config)
     B = len(true_cached)
-    block_table, total_pages = _alloc_block_tables(
-        [(true_cached[b] + rejected[b] + QO_LEN + PAGE - 1) // PAGE for b in range(B)], spare=8
-    )
-    manager = FakeManager(total_pages, block_table)
-
-    seq_lens_cpu = torch.full((B,), QO_LEN, dtype=torch.int32)
-    cached_opt = [true_cached[b] + rejected[b] for b in range(B)]
-    meta = FakeMeta(manager, list(range(B)), seq_lens_cpu, cached_opt)
-    m3_meta = m.build_m3_sparse_metadata_and_plans(meta, geometry=config)
-    assert m3_meta is not None and not m3_meta.is_prefill
+    assert not m3_meta.is_prefill
     assert m3_meta.decode_qo_len == QO_LEN
-
-    # overlap correction: kv_lens_cuda holds CORRECTED cached + QO_LEN
-    corrected = torch.tensor(
-        [true_cached[b] + QO_LEN for b in range(B)], dtype=torch.int32, device=DEV
-    )
-    meta.kv_lens_cuda[:B] = corrected
-    m.rederive_msa_attachment(meta)
-    torch.cuda.synchronize()
     assert torch.equal(m3_meta.seq_lens[:B].cpu(), corrected.cpu())
 
     # re-derived ladder slots vs block-table ground truth
@@ -253,23 +284,6 @@ def test_verify_step_glue_at_page_boundaries():
     out = m.run_msa_sparse_decode(config, manager, 0, m3_meta, q3, blocks, SM_SCALE).clone()
     torch.cuda.synchronize()
 
-    pool = manager.pool.float()
-    idx_pool = manager.idx_pool.float()
-
-    def gather_rows(b, eff, which):
-        pages = block_table[b]
-        chunks, p = [], 0
-        while p * PAGE < eff:
-            n = min(PAGE, eff - p * PAGE)
-            if which == "k":
-                chunks.append(pool[pages[p], 0, :n, 0])
-            elif which == "v":
-                chunks.append(pool[pages[p], 1, :n, 0])
-            else:
-                chunks.append(idx_pool[pages[p], :n, 0])
-            p += 1
-        return torch.cat(chunks, 0)
-
     # proxy max scores from the staged plan: semantically the fp32
     # per-block max times one CONSTANT scale (constancy is what per-token
     # top-k ordering needs). This is the guard that scores are computed
@@ -291,7 +305,7 @@ def test_verify_step_glue_at_page_boundaries():
         for t in range(QO_LEN):
             tok = b * QO_LEN + t
             eff = true_cached[b] + t + 1
-            scores = idx_q[tok, 0].float() @ gather_rows(b, eff, "i").T
+            scores = idx_q[tok, 0].float() @ _pool_rows(manager, block_table, b, eff, "i").T
             for blk in range((eff + PAGE - 1) // PAGE):
                 ref = scores[blk * PAGE : min((blk + 1) * PAGE, eff)].max()
                 if abs(ref) > 0.5:
@@ -325,18 +339,13 @@ def test_verify_step_glue_at_page_boundaries():
         for t in range(QO_LEN):
             tok = b * QO_LEN + t
             eff = true_cached[b] + t + 1
-            k_rows = gather_rows(b, eff, "k")
-            v_rows = gather_rows(b, eff, "v")
-            blks = [int(x) for x in blocks.cpu()[tok, 0].tolist() if x >= 0]
-            pos = torch.cat(
-                [
-                    torch.arange(blk * PAGE, min((blk + 1) * PAGE, eff))
-                    for blk in blks
-                    if blk * PAGE < eff
-                ]
+            ref = _sparse_ref(
+                q3[tok].float(),
+                _pool_rows(manager, block_table, b, eff, "k"),
+                _pool_rows(manager, block_table, b, eff, "v"),
+                blocks.cpu()[tok, 0],
+                eff,
             )
-            scores = q3[tok].float() @ k_rows[pos].T * SM_SCALE
-            ref = torch.softmax(scores, -1) @ v_rows[pos]
             d = (out3[tok] - ref).abs().max().item()
             assert d < 0.06, f"sparse mismatch tok={tok} (b={b},t={t}): {d}"
 
@@ -436,16 +445,7 @@ def test_multistep_verify_no_rot():
             for t in range(QO_LEN):
                 tok = b * QO_LEN + t
                 eff = true_len[b] + t + 1
-                blks = [int(x) for x in blocks[tok, 0].tolist() if x >= 0]
-                pos = torch.cat(
-                    [
-                        torch.arange(bk * PAGE, min((bk + 1) * PAGE, eff))
-                        for bk in blks
-                        if bk * PAGE < eff
-                    ]
-                ).to(DEV)
-                scores = q3[tok].float() @ GT_K[b, pos].T * SM_SCALE
-                ref = torch.softmax(scores, -1) @ GT_V[b, pos]
+                ref = _sparse_ref(q3[tok].float(), GT_K[b], GT_V[b], blocks[tok, 0], eff)
                 err = (out[tok].view(NUM_Q_HEADS, HEAD_DIM).float() - ref).abs().max().item()
                 assert err < 0.05, f"rot at step={step} b={b} t={t}: {err}"
 
@@ -548,7 +548,6 @@ def test_mixed_batch_correction_restages_page_table():
     )
     torch.cuda.synchronize()
 
-    pool = manager.pool.float()
     out3 = out.view(total_q, NUM_Q_HEADS, HEAD_DIM).float()
     row_start = [0, ctx_len, ctx_len + QO_LEN]
     prefix_true = [0] + gen_true_cached
@@ -556,20 +555,15 @@ def test_mixed_batch_correction_restages_page_table():
         for t in range(qo_lens[b]):
             tok = row_start[b] + t
             eff = prefix_true[b] + t + 1
-            slots = [flat_slot(block_table[b], p) for p in range(eff)]
-            ks = torch.stack([pool[s // PAGE, 0, s % PAGE, 0] for s in slots])
-            vs = torch.stack([pool[s // PAGE, 1, s % PAGE, 0] for s in slots])
-            blks = [int(x) for x in blocks.cpu()[tok, 0].tolist() if x >= 0]
-            pos_chunks = [
-                torch.arange(bl * PAGE, min((bl + 1) * PAGE, eff))
-                for bl in blks
-                if bl * PAGE < eff
-            ]
-            if not pos_chunks:
+            ref = _sparse_ref(
+                q3[tok].float(),
+                _pool_rows(manager, block_table, b, eff, "k"),
+                _pool_rows(manager, block_table, b, eff, "v"),
+                blocks.cpu()[tok, 0],
+                eff,
+            )
+            if ref is None:
                 continue
-            pos = torch.cat(pos_chunks)
-            scores = q3[tok].float() @ ks[pos].T * SM_SCALE
-            ref = torch.softmax(scores, -1) @ vs[pos]
             d = (out3[tok] - ref).abs().max().item()
             assert d < 0.06, f"row {b} tok {t}: max abs err {d}"
 
@@ -582,26 +576,9 @@ def test_dense_decode_ladder():
     m = _m3()
     from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3Attention
 
-    torch.manual_seed(11)
     config = _config(m)
-
-    true_cached = [122, 125, 252, 124, 33, 380]
-    rejected = [3, 3, 3, 3, 0, 3]
+    manager, meta, _, block_table, true_cached, _ = _staged_verify_batch(m, config)
     B = len(true_cached)
-    block_table, total_pages = _alloc_block_tables(
-        [(true_cached[b] + rejected[b] + QO_LEN + PAGE - 1) // PAGE for b in range(B)]
-    )
-    manager = FakeManager(total_pages, block_table)
-    seq_lens_cpu = torch.full((B,), QO_LEN, dtype=torch.int32)
-    cached_opt = [true_cached[b] + rejected[b] for b in range(B)]
-    meta = FakeMeta(manager, list(range(B)), seq_lens_cpu, cached_opt)
-    m.build_m3_sparse_metadata_and_plans(meta, geometry=config)
-    corrected = torch.tensor(
-        [true_cached[b] + QO_LEN for b in range(B)], dtype=torch.int32, device=DEV
-    )
-    meta.kv_lens_cuda[:B] = corrected
-    m.rederive_msa_attachment(meta)
-    torch.cuda.synchronize()
 
     r = _randn(3)
     total_q = B * QO_LEN
@@ -619,19 +596,21 @@ def test_dense_decode_ladder():
     MiniMaxM3Attention._dense_attention_core(fake_self, q, k, v, meta, output)
     torch.cuda.synchronize()
 
-    # fp32 reference from the cache pools (the method wrote K/V itself)
-    pool = manager.pool.float()
+    # fp32 reference from the cache pools (the method wrote K/V itself);
+    # dense = all pages selected up to the ladder bound.
     out3 = output.view(total_q, NUM_Q_HEADS, HEAD_DIM).float()
     for b in range(B):
         for t in range(QO_LEN):
             tok = b * QO_LEN + t
             eff = true_cached[b] + t + 1
-            slots = [flat_slot(block_table[b], p) for p in range(eff)]
-            ks = torch.stack([pool[s // PAGE, 0, s % PAGE, 0] for s in slots])
-            vs = torch.stack([pool[s // PAGE, 1, s % PAGE, 0] for s in slots])
-            qtok = q.view(total_q, NUM_Q_HEADS, HEAD_DIM)[tok].float()
-            scores = qtok @ ks.T * HEAD_DIM**-0.5
-            ref = torch.softmax(scores, -1) @ vs
+            all_blocks = torch.arange((eff + PAGE - 1) // PAGE)
+            ref = _sparse_ref(
+                q.view(total_q, NUM_Q_HEADS, HEAD_DIM)[tok].float(),
+                _pool_rows(manager, block_table, b, eff, "k"),
+                _pool_rows(manager, block_table, b, eff, "v"),
+                all_blocks,
+                eff,
+            )
             d = (out3[tok] - ref).abs().max().item()
             assert d < 0.06, f"dense decode mismatch tok={tok} (b={b},t={t}): {d}"
     # the K written by the method landed at the corrected ladder slots

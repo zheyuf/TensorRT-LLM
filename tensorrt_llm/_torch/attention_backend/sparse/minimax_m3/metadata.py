@@ -370,9 +370,8 @@ class MiniMaxM3SparseAttentionMetadata:
     q_positions: Optional[torch.Tensor] = None
     max_seqlen_q: int = field(default=1)
     max_seqlen_k: int = field(default=1)
-    # Query tokens per request on the decode path (uniform; spec verify on
-    # the MSA backend runs 1 + draft_len there). The reference backend
-    # routes multi-token batches to the extend path and keeps this at 1.
+    # Query tokens per request on the decode path (uniform; MSA spec
+    # verify runs 1 + draft_len; the reference backend keeps 1).
     decode_qo_len: int = field(default=1)
     # MSA per-step plan values, written by `_build_msa_plans_for_metadata`
     # when the KV cache manager has `use_msa=True` (None on the Triton
@@ -667,10 +666,9 @@ def derive_q_positions_and_cache_slots(
 def derive_decode_cache_slots(
     req_to_token: torch.Tensor, seq_lens: torch.Tensor, qo_len: int = 1
 ) -> torch.Tensor:
-    """Decode-row KV slot ids, ``qo_len`` new tokens per request.
+    """Decode-row KV slot ids: token ``t`` of request ``b`` sits at
+    position ``seq_lens[b] - qo_len + t`` (the causal ladder).
 
-    Token ``t`` of request ``b`` sits at position ``seq_lens[b] - qo_len
-    + t`` (the causal ladder; ``qo_len=1`` reduces to ``seq_lens - 1``).
     Same in-bounds-placeholder clamp contract as
     :func:`derive_q_positions_and_cache_slots`; the ``min=0`` floor
     additionally covers zero-length dummy rows indexing ``-1``.
@@ -886,9 +884,6 @@ def build_runtime_metadata_from_kv_manager(
             q_positions=q_positions,
         )
     else:
-        # Decode: token t of request b sits at position
-        # seq_lens[b] - decode_qo_len + t (qo_len=1: the classic
-        # seq_lens[b] - 1).
         total_q = batch * decode_qo_len
         out_cache_loc_src = derive_decode_cache_slots(
             req_to_token, seq_lens_dev, decode_qo_len
@@ -1054,17 +1049,14 @@ def build_m3_sparse_metadata_and_plans(
     if use_msa:
         # MSA: pure-generation multi-token batches (spec verify: uniform
         # 1 + draft_len tokens per row) stay DECODE-shaped — the decode
-        # driver handles them natively (proxy causal ladder) plus row
-        # expansion (sparse pass), keeping the captured/overlap-safe
-        # device-plan path. Mixed context+gen batches take the eager
-        # extend path, which handles arbitrary row shapes.
+        # driver handles the causal ladder natively, keeping the
+        # captured/overlap-safe device-plan path. Mixed context+gen
+        # batches take the eager extend path.
         if num_contexts == 0 and max_new > 1:
             if min(new_tokens_per_seq) != max_new:
                 raise NotImplementedError(
                     "MiniMax-M3 MSA decode requires a uniform per-row query "
-                    f"token count; got {sorted(set(new_tokens_per_seq))}. "
-                    "Non-uniform generation rows are not supported on the "
-                    "MSA backend."
+                    f"token count; got {sorted(set(new_tokens_per_seq))}."
                 )
             decode_qo_len = max_new
         is_extend = num_contexts > 0
@@ -1111,11 +1103,9 @@ def build_m3_sparse_metadata_and_plans(
     meta.m3_out_cache_loc = out_cache_loc
 
     if use_msa and geometry is not None:
-        # Row capacity for the decode state: the sparse pass row-expands
-        # multi-token verify batches to batch * qo_len pseudo-rows, and
-        # the geometry is an alloc-time key, so size by the CONFIG-level
-        # maximum (1 + max_total_draft_tokens; runtime draft lengths may
-        # vary per step below it without rebuilding the state).
+        # Decode-state row capacity: the sparse pass row-expands verify
+        # batches to batch * qo_len pseudo-rows; size by the config-level
+        # maximum (the geometry is an alloc-time key).
         max_qo_len = 1 + int(getattr(meta, "max_total_draft_tokens", None) or 0)
         max_batch = int(meta.max_num_sequences or meta.max_num_requests) * max_qo_len
         # Persist the (possibly first-allocated) staging buffers back onto
@@ -1211,11 +1201,8 @@ def rederive_m3_attachment(owner) -> None:
     """Re-derive the M3 attachment from the corrected ``kv_lens_cuda``.
 
     Shared by the Triton-path and MSA-path ``on_update_kv_lens`` hooks so
-    the builder and both hooks cannot drift. ``owner`` is the
-    TrtllmAttentionMetadata-derived object carrying ``kv_lens_cuda``,
-    ``m3_sparse_metadata`` and ``m3_out_cache_loc``. On-device, sync-free,
-    and idempotent (pure overwrites; the engine fires the hook pre- and
-    post-correction).
+    they cannot drift. On-device, sync-free, and idempotent (pure
+    overwrites; the engine fires the hook pre- and post-correction).
     """
     meta = owner.m3_sparse_metadata
     if meta is None:
@@ -1238,13 +1225,11 @@ def rederive_m3_attachment(owner) -> None:
         meta.q_positions[:total_q].copy_(q_positions)
         owner.m3_out_cache_loc[:total_q].copy_(out_cache_loc)
     else:
-        # Reference path: reached today only as an identity (the hook also
-        # fires pre-correction on ordinary decode steps); re-deriving keeps
-        # corrected 0-draft steps correct once dynamic draft lengths make
-        # them reachable. On the MSA path corrected multi-token verify
-        # batches are decode-shaped, so the ladder re-derivation is live
-        # (the MSA decode driver re-reads seq_lens on device per call, so
-        # everything else self-corrects).
+        # MSA path: corrected multi-token verify batches are decode-shaped,
+        # so the ladder re-derivation is live (the decode driver re-reads
+        # seq_lens on device, so everything else self-corrects). Reference
+        # path: identity today; keeps corrected 0-draft steps right once
+        # dynamic draft lengths make them reachable.
         qo_len = int(meta.decode_qo_len)
         owner.m3_out_cache_loc[: batch * qo_len].copy_(
             derive_decode_cache_slots(meta.req_to_token, kv_lens, qo_len)

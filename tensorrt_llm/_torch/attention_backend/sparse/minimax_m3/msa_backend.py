@@ -138,18 +138,12 @@ def rederive_msa_attachment(owner) -> None:
     overlap scheduler's on-device kv-len correction.
 
     Decode (spec verify included): sync-free and capture-legal — the
-    decode driver re-reads ``seq_lens`` on device per call, so
-    overwriting the attachment lengths + KV slots is sufficient.
-    Prefill (mixed context+gen batches): runs the EAGER fmha plan, which
-    consumes the CPU length mirrors AND the staged flat page table —
-    whose LAYOUT (cumulative page counts) depends on the corrected lens:
-    a correction that shrinks a row across a page boundary changes the
-    indptr the eager kernels rebuild from the lens, misbasing every
-    subsequent row's pages. Refresh both — host work is legal on this
-    branch precisely because mixed batches are never CUDA-graph captured.
-
-    Module-level so the multi-token unit tests exercise the same code
-    the metadata hook runs.
+    decode driver re-reads ``seq_lens`` on device per call. Prefill
+    (mixed context+gen): the EAGER fmha plan consumes the CPU length
+    mirrors AND the staged flat page table, whose layout (cumulative
+    page counts) depends on the corrected lens — a shrink across a page
+    boundary would misbase every subsequent row's pages. Refresh both;
+    host work is legal here because mixed batches are never captured.
     """
     rederive_m3_attachment(owner)
     meta = owner.m3_sparse_metadata

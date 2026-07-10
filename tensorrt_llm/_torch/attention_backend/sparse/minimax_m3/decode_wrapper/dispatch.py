@@ -239,12 +239,8 @@ def resolve_decode_state(
 def _qo_consts(
     state: M3DecodeState, batch: int, pack_factor: int, qo_len: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """(qo_segment_lens, qo_segment_offsets) for packed decode lens.
-
-    Each request is one segment of ``qo_len`` query tokens (spec verify:
-    ``1 + draft_len``); packing folds ``pack_factor`` heads into the qo
-    dim, so the packed segment length is ``qo_len * pack_factor``.
-    """
+    """(qo_segment_lens, qo_segment_offsets): one segment per request of
+    ``qo_len * pack_factor`` packed rows (heads fold into the qo dim)."""
     key = (batch, pack_factor, qo_len)
     cached = state.qo_const_cache.get(key)
     if cached is None:
@@ -287,12 +283,10 @@ def _qo_offset_view(
     """Per-request causal offset `kv_len - qo_len` (device op).
 
     The kernel's causal bound is inclusive (attend positions
-    `<= offset + q_idx`), so with `qo_len` query tokens per request the
-    offset `kv_len - qo_len` unmasks the causal ladder: token `t` attends
-    exactly `kv_len - qo_len + t + 1` positions, the last token the full
-    `kv_len`. `kv_len` itself would leak one stale slot from a
-    partially-filled last page in sparse mode, which has no secondary
-    seqlen clip.
+    `<= offset + q_idx`), so token `t` attends exactly
+    `kv_len - qo_len + t + 1` positions. `kv_len` itself would leak one
+    stale slot from a partially-filled last page in sparse mode, which
+    has no secondary seqlen clip.
     """
     view = state.qo_offset[:batch]
     torch.sub(seq_lens, qo_len, out=view)
@@ -302,12 +296,8 @@ def _qo_offset_view(
 def _ladder_valid_pages(
     state: M3DecodeState, seq_lens: torch.Tensor, batch: int, qo_len: int
 ) -> torch.Tensor:
-    """Per-token valid page counts for the causal ladder (device op).
-
-    Token ``t`` of request ``b`` attends ``seq_lens[b] - qo_len + t + 1``
-    positions; its valid block count is the ceil-div by page_size.
-    Returns a `[batch * qo_len]` int32 view into the persistent buffer.
-    """
+    """Per-token valid page count, ceil-div of the causal-ladder extent
+    ``seq_lens[b] - qo_len + t + 1``; `[batch * qo_len]` int32 view."""
     g = state.geom
     total_q = batch * qo_len
     view = state.valid_pages[:total_q]
@@ -315,6 +305,16 @@ def _ladder_valid_pages(
     lens = (seq_lens[:batch].view(batch, 1) + ladder).reshape(total_q)
     torch.div(lens + (g.page_size - 1), g.page_size, rounding_mode="floor", out=view)
     return view
+
+
+def _split_rows(state: M3DecodeState, total_q: int, qo_len: int) -> int:
+    """Validate `total_q = batch * qo_len` against the persistent buffer
+    capacity (plain slices give no bounds check) and return `batch`."""
+    if total_q % qo_len:
+        raise ValueError(f"total_q {total_q} not divisible by qo_len {qo_len}")
+    if total_q > state.geom.max_batch:
+        raise ValueError(f"total_q {total_q} exceeds buffer capacity {state.geom.max_batch}")
+    return total_q // qo_len
 
 
 # ---------------------------------------------------------------------------
@@ -355,11 +355,7 @@ def decode_proxy_max_score(
     """
     g = state.geom
     total_q = idx_q.shape[0]
-    if total_q % qo_len:
-        raise ValueError(f"total_q {total_q} not divisible by qo_len {qo_len}")
-    batch = total_q // qo_len
-    if total_q > g.max_batch:
-        raise ValueError(f"total_q {total_q} exceeds buffer capacity {g.max_batch}")
+    batch = _split_rows(state, total_q, qo_len)
     if qo_len * state.pf_proxy > _QO_TILE_SIZE:
         raise ValueError(f"qo_len {qo_len} * pack_factor {state.pf_proxy} exceeds the qo tile")
     seq_lens = seq_lens[:batch]
@@ -438,9 +434,7 @@ def decode_select_blocks(
     """
     g = state.geom
     total_q = max_score.shape[2]
-    if total_q % qo_len:
-        raise ValueError(f"total_q {total_q} not divisible by qo_len {qo_len}")
-    batch = total_q // qo_len
+    batch = _split_rows(state, total_q, qo_len)
 
     group = g.num_index_heads // g.num_kv_heads
     if group > 1:
@@ -498,13 +492,8 @@ def decode_sparse_attention(
     `[batch * qo_len, num_q_heads, 128]` bf16 view into the persistent
     output buffer.
     """
-    g = state.geom
     total_q = q.shape[0]
-    if total_q % qo_len:
-        raise ValueError(f"total_q {total_q} not divisible by qo_len {qo_len}")
-    batch = total_q // qo_len
-    if total_q > g.max_batch:
-        raise ValueError(f"total_q {total_q} exceeds buffer capacity {g.max_batch}")
+    batch = _split_rows(state, total_q, qo_len)
     seq_lens = seq_lens[:batch]
 
     out = state.out[:total_q]
@@ -513,14 +502,13 @@ def decode_sparse_attention(
         row_indptr = kv_page_indptr
         qo_offset = _qo_offset_view(state, seq_lens, batch)
     else:
-        # Row expansion: the kernel's sparse mode consumes kv_block_indexes
-        # per ROW, so each query token becomes its own qo_len=1 pseudo-row
-        # (the same transform `fmha_sm100.api._expand_for_per_token_sparse`
-        # applies on the eager path). A pseudo-row keeps its request's FULL
-        # kv_len and page-table BASE offset; the causal ladder lives solely
-        # in the per-row offset `kv_len - qo_len + t`. All device ops, so
-        # the expansion is CUDA-graph-capturable and tracks corrected
-        # seq_lens at replay.
+        # Row expansion: sparse mode consumes kv_block_indexes per ROW, so
+        # each query token becomes its own qo_len=1 pseudo-row (the same
+        # transform `fmha_sm100.api._expand_for_per_token_sparse` applies
+        # on the eager path). A pseudo-row keeps its request's FULL kv_len
+        # and page-table BASE; the causal ladder lives solely in the
+        # per-row offset `kv_len - qo_len + t`. All device ops:
+        # capture-safe and tracks corrected seq_lens at replay.
         row_seq_lens = torch.repeat_interleave(seq_lens, qo_len)
         row_indptr = torch.empty(
             total_q + 1, dtype=kv_page_indptr.dtype, device=kv_page_indptr.device
@@ -535,10 +523,9 @@ def decode_sparse_attention(
         qo_offset = state.qo_offset[:total_q]
         torch.add(row_seq_lens, ladder, out=qo_offset)
 
-    rows = total_q
-    qo_lens, qo_offsets = _qo_consts(state, rows, state.pf_sparse)
-    work_range, work_info = _worklist(state, rows, state.heads_packed_sparse)
-    kv_offsets = _kv_offsets_view(state, row_seq_lens, rows)
+    qo_lens, qo_offsets = _qo_consts(state, total_q, state.pf_sparse)
+    work_range, work_info = _worklist(state, total_q, state.heads_packed_sparse)
+    kv_offsets = _kv_offsets_view(state, row_seq_lens, total_q)
 
     state.sparse_module.run(
         state.workspace_buffer,
