@@ -7688,12 +7688,13 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("cuda_graph", [True])
     @parametrize_with_ids("use_msa", [True])
     @parametrize_with_ids("overlap_scheduler", [True])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
-                          overlap_scheduler, use_msa):
+                          overlap_scheduler, use_msa, cuda_graph):
         if use_msa:
             pytest.importorskip(
                 "fmha_sm100",
@@ -7718,7 +7719,11 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  moe_config=MoeConfig(backend="CUTLASS"),
                  max_seq_len=4096,
                  speculative_config=spec_config,
-                 cuda_graph_config=None,
+                 # Graphs + spec requires the MSA path: its verify batches
+                 # are decode-shaped and capture-safe (the reference path
+                 # rejects graphs+spec at creation).
+                 cuda_graph_config=CudaGraphConfig(
+                     enable_padding=True) if cuda_graph else None,
                  disable_overlap_scheduler=not overlap_scheduler,
                  enable_attention_dp=attention_dp,
                  trust_remote_code=True) as llm:

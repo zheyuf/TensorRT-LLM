@@ -1047,5 +1047,32 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
         assert_meaningful_text(text_ref)
 
 
+def test_one_model_worker_saves_kv_lens_cuda_during_graph_warmup():
+    """The drafting loop mutates kv_lens_cuda in place; during CUDA-graph
+    warmup (graph metadata, no active capture) it must be in the save/restore
+    set or the second warmup iteration and the capture run with drifted kv
+    lens (DFlash/PARD save it the same way)."""
+    from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
+
+    worker = Eagle3OneModelWorker.__new__(Eagle3OneModelWorker)
+    attn_metadata = MagicMock()
+    attn_metadata.spec_decoding_packed_mask = None
+    attn_metadata.spec_decoding_position_offsets = None
+    attn_metadata.spec_decoding_generation_lengths = None
+    attn_metadata.num_seqs = 2
+    spec_metadata = MagicMock()
+
+    spec_metadata.is_cuda_graph = True
+    worker._prepare_attn_metadata_for_spec_dec(attn_metadata, spec_metadata)
+    attn_metadata.prepare_for_spec_dec.assert_called_once_with(
+        "_seq_lens", "_seq_lens_cuda", "kv_lens_cuda")
+
+    attn_metadata.prepare_for_spec_dec.reset_mock()
+    spec_metadata.is_cuda_graph = False
+    worker._prepare_attn_metadata_for_spec_dec(attn_metadata, spec_metadata)
+    attn_metadata.prepare_for_spec_dec.assert_called_once_with(
+        "_seq_lens", "_seq_lens_cuda")
+
+
 if __name__ == "__main__":
     unittest.main()

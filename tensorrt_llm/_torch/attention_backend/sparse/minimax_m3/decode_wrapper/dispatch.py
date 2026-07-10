@@ -221,6 +221,13 @@ def resolve_decode_state(
     state = getattr(m3_meta, "decode_state", None)
     if state is not None and state.geom == geometry and state.device == device:
         return state
+    if torch.cuda.is_current_stream_capturing():
+        # Building here would JIT-load kernels and allocate buffers inside
+        # the capture; prepare() must have attached a matching state.
+        raise RuntimeError(
+            "MiniMax-M3 decode state missing or geometry-mismatched during "
+            "CUDA-graph capture; prepare() attaches it outside capture."
+        )
     state = build_m3_decode_state(geometry, device)
     try:
         m3_meta.decode_state = state
