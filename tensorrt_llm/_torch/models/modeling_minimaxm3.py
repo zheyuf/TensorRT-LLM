@@ -1027,8 +1027,7 @@ class MiniMaxM3Attention(Attention):
         # Build the per-query attention mask that masks out padded KV
         # positions beyond each sequence's true ``seq_lens`` and (for
         # prefill) preserves causality. ``q_positions`` from the prefill
-        # metadata names each Q token's K-side position; for decode
-        # there is one Q token per request at position ``seq_lens - 1``.
+        # metadata names each Q token's K-side position.
         # The metadata tensors are produced by
         # :meth:`MiniMaxM3AttentionMetadata.prepare` on the cache
         # device, so ``.to(dtype=torch.long)`` is a same-device dtype
@@ -1077,14 +1076,22 @@ class MiniMaxM3Attention(Attention):
                     )  # [1, H, q, d]
                 output_view[start:end].copy_(out_b.squeeze(0).transpose(0, 1))
         else:
-            # Decode: one Q token per request at position seq_lens - 1.
-            # Every input tensor here is already on q.device (set up by
-            # prepare()), so SDPA captures cleanly.
-            valid = kv_positions < seq_lens_dev.unsqueeze(-1)  # [batch, max_k]
-            q_b = q_view.unsqueeze(1).transpose(1, 2)  # [batch, H, 1, d]
+            # Decode: qo_len query tokens per request; token t of request b
+            # attends seq_lens[b] - qo_len + t + 1 positions (the causal
+            # ladder; qo_len=1 is the classic one-token mask). Every input
+            # tensor here is already on q.device (set up by prepare()), so
+            # SDPA captures cleanly.
+            qo_len = int(m3_meta.decode_qo_len)
+            ladder = torch.arange(1 - qo_len, 1, device=q.device, dtype=torch.long)
+            # eff[b, t] = attendable position count for token t of row b.
+            eff = seq_lens_dev.unsqueeze(-1) + ladder  # [batch, qo]
+            valid = kv_positions.unsqueeze(1) < eff.unsqueeze(-1)  # [batch, qo, max_k]
+            q_b = q_view.view(batch, qo_len, self.num_heads, self.head_dim).transpose(
+                1, 2
+            )  # [batch, H, qo, d]
             k_b = k_padded.transpose(1, 2)  # [batch, H, k, d]
             v_b = v_padded.transpose(1, 2)  # [batch, H, k, d]
-            mask_b = valid.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, k]
+            mask_b = valid.unsqueeze(1)  # [batch, 1, qo, k]
             with sdpa_kernel(_DENSE_SDPA_BACKENDS):
                 out_b = torch.nn.functional.scaled_dot_product_attention(
                     q_b.to(q.dtype),
@@ -1093,12 +1100,13 @@ class MiniMaxM3Attention(Attention):
                     attn_mask=mask_b,
                     dropout_p=0.0,
                     is_causal=False,
-                )  # [batch, H, 1, d]
-            # Drop the singleton Q-length axis. Use squeeze(2) + a
-            # [batch, num_heads, head_dim] view rather than
-            # transpose(1, 2).reshape, which (with H != head_dim) copies in
-            # C-order and scrambles the (head, head_dim) ordering into o_proj.
-            output.view(batch, self.num_heads, self.head_dim).copy_(out_b.squeeze(2))
+                )  # [batch, H, qo, d]
+            # Copy through a token-major [batch, qo, H, dh] view rather
+            # than transpose(1, 2).reshape, which (with H != head_dim)
+            # copies in C-order and scrambles (head, head_dim) into o_proj.
+            output.view(batch, qo_len, self.num_heads, self.head_dim).copy_(
+                out_b.transpose(1, 2)
+            )
 
         return output
 
