@@ -7718,7 +7718,11 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  moe_config=MoeConfig(backend="CUTLASS"),
                  max_seq_len=4096,
                  speculative_config=spec_config,
-                 cuda_graph_config=None,
+                 # MSA routes verify through the capture-safe decode driver,
+                 # so it runs the endgame config (graphs on); the reference
+                 # path rejects graphs+spec at creation.
+                 cuda_graph_config=CudaGraphConfig(
+                     enable_padding=True) if use_msa else None,
                  disable_overlap_scheduler=not overlap_scheduler,
                  enable_attention_dp=attention_dp,
                  trust_remote_code=True) as llm:
