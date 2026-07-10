@@ -644,12 +644,15 @@ def create_py_executor(
                 "attention: the M3 sparse kernels implement linear-chain "
                 "verification only. Remove eagle_choices / use_dynamic_tree "
                 "from the speculative config.")
-        if llm_args.cuda_graph_config is not None:
+        if (llm_args.cuda_graph_config is not None
+                and not sparse_attention_config.sparse_use_msa):
             raise NotImplementedError(
-                "CUDA graphs are not supported with MiniMax-M3 sparse "
-                "attention and speculative decoding: multi-token verify "
-                "routes through the M3 extend path, which is not "
-                "capture-safe yet. Set cuda_graph_config to null.")
+                "CUDA graphs are not supported with MiniMax-M3 reference "
+                "sparse attention and speculative decoding: multi-token "
+                "verify routes through the M3 extend path, which is not "
+                "capture-safe. Set sparse_use_msa=True (SM100) to run "
+                "verify through the capture-safe MSA decode driver, or set "
+                "cuda_graph_config to null.")
         if not should_use_separate_draft_kv_cache(spec_config):
             raise NotImplementedError(
                 "One-model speculative decoding with MiniMax-M3 sparse "
