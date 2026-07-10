@@ -7666,16 +7666,16 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("cuda_graph", [True])
     @parametrize_with_ids("use_msa", [True])
     @parametrize_with_ids("overlap_scheduler", [True])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
-                          overlap_scheduler, use_msa):
+                          overlap_scheduler, use_msa, cuda_graph):
         if use_msa:
-            pytest.importorskip(
-                "fmha_sm100",
-                reason="MSA kernels (fmha_sm100) not installed")
+            pytest.importorskip("fmha_sm100",
+                                reason="MSA kernels (fmha_sm100) not installed")
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         max_draft_len = 3
@@ -7687,19 +7687,26 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
                                         tokens_per_block=128 if use_msa else 32)
-        with LLM(model_path,
-                 tensor_parallel_size=tp_size,
-                 moe_expert_parallel_size=ep_size,
-                 kv_cache_config=kv_cache_config,
-                 sparse_attention_config=MiniMaxM3SparseAttentionConfig(
-                     sparse_use_msa=use_msa),
-                 moe_config=MoeConfig(backend="CUTLASS"),
-                 max_seq_len=4096,
-                 speculative_config=spec_config,
-                 cuda_graph_config=None,
-                 disable_overlap_scheduler=not overlap_scheduler,
-                 enable_attention_dp=attention_dp,
-                 trust_remote_code=True) as llm:
+        with LLM(
+                model_path,
+                tensor_parallel_size=tp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+                    sparse_use_msa=use_msa),
+                moe_config=MoeConfig(backend="CUTLASS"),
+                max_seq_len=4096,
+                speculative_config=spec_config,
+                # Graphs + spec requires the MSA path: its verify batches
+                # are decode-shaped and capture-safe (the reference path
+                # rejects graphs+spec at creation).
+                cuda_graph_config=CudaGraphConfig(
+                    enable_padding=True,
+                    max_batch_size=64 if attention_dp else 128,
+                ) if cuda_graph else None,
+                disable_overlap_scheduler=not overlap_scheduler,
+                enable_attention_dp=attention_dp,
+                trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = MMLU(model_name)
             task.evaluate(llm)

@@ -1111,7 +1111,22 @@ class MiniMaxM3Attention(Attention):
 
         # 7. Gather padded K/V for every batch row and run dense GQA.
         batch = int(m3_meta.slot_ids.shape[0])
-        max_k = int(m3_meta.max_seqlen_k)
+        # Under CUDA-graph capture the gather/mask width is baked into the
+        # graph, while max_seqlen_k is a prepare-time host upper bound that
+        # later replays can outgrow (silent attention truncation). Bake the
+        # static bound instead: no row's kv can exceed the engine
+        # max_seq_len (manager-derived, includes the spec-dec margin), and
+        # the page-table width caps it when smaller. The raw page-table
+        # width alone is NOT usable — the KV-estimation pass inflates it
+        # far past max_seq_len and the [batch, max_k, heads] gather would
+        # OOM. The seq_lens mask below invalidates positions past each
+        # row's true length.
+        if getattr(attn_metadata, "is_cuda_graph", False):
+            capacity = int(m3_meta.req_to_token.shape[1])
+            engine_bound = int(getattr(attn_metadata, "max_seq_len", None) or capacity)
+            max_k = min(capacity, engine_bound)
+        else:
+            max_k = int(m3_meta.max_seqlen_k)
         if max_k <= 0:
             max_k = 1
         # ``_gather_paged_batched`` decomposes the flat slot id into
@@ -1138,9 +1153,6 @@ class MiniMaxM3Attention(Attention):
                 f"by num_key_value_heads ({self.num_key_value_heads})"
             )
         group = self.num_heads // max(self.num_key_value_heads, 1)
-        if group > 1:
-            k_padded = k_padded.repeat_interleave(group, dim=2)
-            v_padded = v_padded.repeat_interleave(group, dim=2)
 
         # Build the per-query attention mask that masks out padded KV
         # positions beyond each sequence's true ``seq_lens`` and (for
@@ -1154,6 +1166,9 @@ class MiniMaxM3Attention(Attention):
         kv_positions = torch.arange(max_k, device=q.device).unsqueeze(0)  # [1, max_k]
 
         if m3_meta.is_prefill:
+            if group > 1:
+                k_padded = k_padded.repeat_interleave(group, dim=2)
+                v_padded = v_padded.repeat_interleave(group, dim=2)
             # Prefill: build [total_q, max_k] mask using q_positions / q_batch_row.
             # Prefill never runs inside the CUDA-graph capture window
             # (capture is decode-only), so the per-batch Python loop and
@@ -1207,18 +1222,28 @@ class MiniMaxM3Attention(Attention):
             q_b = q_view.view(batch, qo_len, self.num_heads, self.head_dim).transpose(
                 1, 2
             )  # [batch, H, qo, d]
-            k_b = k_padded.transpose(1, 2)  # [batch, H, k, d]
-            v_b = v_padded.transpose(1, 2)  # [batch, H, k, d]
             mask_b = valid.unsqueeze(1)  # [batch, 1, qo, k]
+            # Expand K/V per KV head rather than all heads at once: this
+            # branch is CUDA-graph captured, so the expansion lives in the
+            # graph pool, and the full-head copy is O(batch * max_k *
+            # num_heads) - under attention DP (unsharded heads) that one
+            # transient exceeds the pool budget at large graph buckets.
+            # Per-head chunks are freed between iterations; with TP-sharded
+            # KV heads (1 per rank) the loop is a single iteration.
+            out_b = q.new_empty(batch, self.num_heads, qo_len, self.head_dim)
             with sdpa_kernel(_DENSE_SDPA_BACKENDS):
-                out_b = torch.nn.functional.scaled_dot_product_attention(
-                    q_b.to(q.dtype),
-                    k_b.to(q.dtype),
-                    v_b.to(q.dtype),
-                    attn_mask=mask_b,
-                    dropout_p=0.0,
-                    is_causal=False,
-                )  # [batch, H, qo, d]
+                for h in range(max(self.num_key_value_heads, 1)):
+                    qh = slice(h * group, (h + 1) * group)
+                    k_h = k_padded[:, :, h : h + 1].repeat_interleave(group, dim=2)
+                    v_h = v_padded[:, :, h : h + 1].repeat_interleave(group, dim=2)
+                    out_b[:, qh] = torch.nn.functional.scaled_dot_product_attention(
+                        q_b[:, qh].to(q.dtype),
+                        k_h.transpose(1, 2).to(q.dtype),
+                        v_h.transpose(1, 2).to(q.dtype),
+                        attn_mask=mask_b,
+                        dropout_p=0.0,
+                        is_causal=False,
+                    )  # [batch, group, qo, d]
             # Copy through a token-major [batch, qo, H, dh] view rather
             # than transpose(1, 2).reshape, which (with H != head_dim)
             # copies in C-order and scrambles (head, head_dim) into o_proj.
