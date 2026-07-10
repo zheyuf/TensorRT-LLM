@@ -1145,8 +1145,7 @@ class MiniMaxM3Attention(Attention):
         # Build the per-query attention mask that masks out padded KV
         # positions beyond each sequence's true ``seq_lens`` and (for
         # prefill) preserves causality. ``q_positions`` from the prefill
-        # metadata names each Q token's K-side position; for decode
-        # there is one Q token per request at position ``seq_lens - 1``.
+        # metadata names each Q token's K-side position.
         # The metadata tensors are produced by
         # :meth:`MiniMaxM3AttentionMetadata.prepare` on the cache
         # device, so ``.to(dtype=torch.long)`` is a same-device dtype
@@ -1195,14 +1194,22 @@ class MiniMaxM3Attention(Attention):
                     )  # [1, H, q, d]
                 output_view[start:end].copy_(out_b.squeeze(0).transpose(0, 1))
         else:
-            # Decode: one Q token per request at position seq_lens - 1.
-            # Every input tensor here is already on q.device (set up by
-            # prepare()), so SDPA captures cleanly.
-            valid = kv_positions < seq_lens_dev.unsqueeze(-1)  # [batch, max_k]
-            q_b = q_view.unsqueeze(1).transpose(1, 2)  # [batch, H, 1, d]
+            # Decode: qo_len query tokens per request; token t of request b
+            # attends seq_lens[b] - qo_len + t + 1 positions (the causal
+            # ladder; qo_len=1 is the classic one-token mask). Every input
+            # tensor here is already on q.device (set up by prepare()), so
+            # SDPA captures cleanly.
+            qo_len = int(m3_meta.decode_qo_len)
+            ladder = torch.arange(1 - qo_len, 1, device=q.device, dtype=torch.long)
+            # eff[b, t] = attendable position count for token t of row b.
+            eff = seq_lens_dev.unsqueeze(-1) + ladder  # [batch, qo]
+            valid = kv_positions.unsqueeze(1) < eff.unsqueeze(-1)  # [batch, qo, max_k]
+            q_b = q_view.view(batch, qo_len, self.num_heads, self.head_dim).transpose(
+                1, 2
+            )  # [batch, H, qo, d]
             k_b = k_padded.transpose(1, 2)  # [batch, H, k, d]
             v_b = v_padded.transpose(1, 2)  # [batch, H, k, d]
-            mask_b = valid.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, k]
+            mask_b = valid.unsqueeze(1)  # [batch, 1, qo, k]
             with sdpa_kernel(_DENSE_SDPA_BACKENDS):
                 out_b = torch.nn.functional.scaled_dot_product_attention(
                     q_b.to(q.dtype),
@@ -1211,19 +1218,11 @@ class MiniMaxM3Attention(Attention):
                     attn_mask=mask_b,
                     dropout_p=0.0,
                     is_causal=False,
-                )  # [batch, H, 1, d]
-            # Drop the singleton Q-length axis and write the resulting
-            # ``[batch, num_heads, head_dim]`` tensor into the final buffer.
-            # The prior ``.transpose(1, 2).reshape(batch, H, d)`` pattern
-            # was wrong: with ``H != head_dim`` (M3 TP=8 has H=8, d=128)
-            # the non-contiguous transpose forces ``reshape`` to copy the
-            # data in C-order under its current ``[batch, d, H]`` shape,
-            # then reinterpret as ``[batch, H, d]`` — which scrambles
-            # ``(head, head_dim)`` ordering and feeds permuted activations
-            # into ``o_proj``. Prefill is unaffected because its
-            # ``transpose(0, 1)`` runs between q-len and num_heads axes
-            # which the per-batch loop already laid out correctly.
-            output.view(batch, self.num_heads, self.head_dim).copy_(out_b.squeeze(2))
+                )  # [batch, H, qo, d]
+            # Copy through a token-major [batch, qo, H, dh] view rather
+            # than transpose(1, 2).reshape, which (with H != head_dim)
+            # copies in C-order and scrambles (head, head_dim) into o_proj.
+            output.view(batch, qo_len, self.num_heads, self.head_dim).copy_(out_b.transpose(1, 2))
 
         return output
 
@@ -1705,7 +1704,6 @@ class MiniMaxM3Model(DecoderModel):
         hidden_states = inputs_embeds
 
         residual = None
-<<<<<<< HEAD
         for layer_idx, decoder_layer in enumerate(self.layers):
             # Per-layer NVTX range (layer0, layer1, ...). Emitted only when
             # TLLM_NVTX_DEBUG=1 (or TLLM_LLMAPI_ENABLE_NVTX=1) is set.
@@ -1715,17 +1713,8 @@ class MiniMaxM3Model(DecoderModel):
                     hidden_states=hidden_states,
                     attn_metadata=attn_metadata,
                     residual=residual,
+                    spec_metadata=spec_metadata,
                 )
-=======
-        for decoder_layer in self.layers:
-            hidden_states, residual = decoder_layer(
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                residual=residual,
-                spec_metadata=spec_metadata,
-            )
->>>>>>> bad119b1ce ([TRTLLM-14093][feat] Enable one-model Eagle3 speculative decoding for MiniMax-M3)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states

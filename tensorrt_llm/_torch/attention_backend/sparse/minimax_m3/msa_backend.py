@@ -385,37 +385,55 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             )
             self._alloc_msa_proxy_scratch(
                 num_index_heads=params.num_index_heads,
-                max_batch=max_num_sequences,
+                max_tokens=self._msa_max_decode_tokens(),
                 max_k_tiles=max_k_tiles,
                 capture_graph=capture_graph,
             )
         self._msa_buffers_ready = True
 
+    def _msa_max_decode_tokens(self) -> int:
+        """Worst-case decode-step query-token count for scratch sizing.
+
+        Non-spec decode has one query token per sequence; one-model Eagle3
+        spec verify has 1 + draft_len per gen row. max_num_tokens bounds the
+        step's total token count in both cases and keeps the scratch a few
+        MB, so it is used directly rather than plumbing the draft length.
+        Falls back to 0 on partially built metadata (structural tests);
+        callers floor the result with their own batch/token counts.
+        """
+        max_seqs = int(getattr(self, "max_num_sequences", 0) or 0)
+        max_toks = int(getattr(self, "max_num_tokens", 0) or 0)
+        if max_toks <= 0:
+            return max_seqs
+        return max(max_seqs, min(max_toks, 16384))
+
     def _alloc_msa_proxy_scratch(
         self,
         *,
         num_index_heads: int,
-        max_batch: int,
+        max_tokens: int,
         max_k_tiles: int,
         capture_graph: bool,
     ) -> None:
         """Allocate the flat proxy max-score store and the valid-block scratch.
 
-        The store is sized for the worst-case max_k_tiles so one allocation
-        serves every decode step. msa_proxy_max_score_view slices the per-step
-        shape out of it.
+        The store is sized for the worst-case max_k_tiles and the worst-case
+        per-step query-token count (which exceeds the batch size under
+        speculative multi-token verify), so one allocation serves every
+        decode step. msa_proxy_max_score_view slices the per-step shape out
+        of it.
         """
         buffers = self.cuda_graph_buffers
         self.msa_max_score = self.get_empty(
             buffers,
-            (num_index_heads * max_k_tiles * max_batch,),
+            (num_index_heads * max_k_tiles * max_tokens,),
             cache_name="msa_max_score",
             dtype=torch.float32,
             capture_graph=capture_graph,
         )
         self.msa_n_valid_blocks = self.get_empty(
             buffers,
-            (max_batch,),
+            (max_tokens,),
             cache_name="msa_n_valid_blocks",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -430,14 +448,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         required_max_k_tiles: int,
     ) -> None:
         """Ensure proxy scratch buffers exist and cover the current plan."""
-        required_numel = num_index_heads * required_max_k_tiles * max_batch
+        max_tokens = max(int(max_batch), self._msa_max_decode_tokens())
+        required_numel = num_index_heads * required_max_k_tiles * max_tokens
         if self.msa_max_score is not None:
             if self.msa_max_score.numel() < required_numel:
                 raise ValueError(
                     f"msa_max_score backing store ({self.msa_max_score.numel()} "
                     f"elements) is smaller than the decode plan needs "
                     f"({required_numel} = {num_index_heads} heads * "
-                    f"{required_max_k_tiles} k-tiles * {max_batch} batch)."
+                    f"{required_max_k_tiles} k-tiles * {max_tokens} tokens)."
                 )
             return
 
@@ -459,7 +478,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             )
         self._alloc_msa_proxy_scratch(
             num_index_heads=num_index_heads,
-            max_batch=max_batch,
+            max_tokens=max_tokens,
             max_k_tiles=max_k_tiles,
             capture_graph=capture_graph,
         )
@@ -614,7 +633,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         n_valid = per_token_valid_blocks(
             qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, causal=True, block_size=page_size
         )
-        self.msa_n_valid_blocks[:batch].copy_(n_valid.to(torch.int32), non_blocking=True)
+        # Per-TOKEN entries: under speculative multi-token verify the decode
+        # step carries qo_len > 1 query tokens per request.
+        total_q = int(n_valid.shape[0])
+        self.msa_n_valid_blocks[:total_q].copy_(n_valid.to(torch.int32), non_blocking=True)
 
     def _build_msa_fields(self) -> None:
         """Populate the MSA cache-write buffers for this step.
@@ -640,13 +662,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         cache_device = _cache_device(self)
         page_size = int(kv_cache_manager.tokens_per_block)
 
-        is_prefill = int(self.num_contexts or 0) > 0
-        if not is_prefill and int(qo_lens_cpu.max().item()) > 1:
-            raise NotImplementedError(
-                "MiniMax-M3 MSA attention does not support speculative decoding "
-                "(multiple query tokens per decode step). Disable speculative "
-                "decoding or use the non-MSA MiniMax-M3 backend."
-            )
+        # Multi-token generation rows (one-model Eagle3 spec verify emits
+        # 1 + draft_len query tokens per gen row) are expressed naturally:
+        # qo_lens carries the per-request query counts and every consumer
+        # below (fmha_sm100 plans, slot mapping, per-token valid blocks) is
+        # varlen. Decode batches therefore stay decode-shaped under spec.
 
         # Built in prepare() (outside capture), so these transients are
         # fine: forwards read only the persistent buffers filled below.
