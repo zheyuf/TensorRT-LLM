@@ -2716,39 +2716,22 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 draft_kv_cache = None
                 if draft_kv_cache_manager is not None:
-                    if isinstance(draft_kv_cache_manager, KVCacheManagerV2):
-                        draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
-                            req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
-                        )
-                        # Dummy path: see comment above, no salt.
-                        if draft_kv_cache is None:
-                            release_resources(req)
-                            return None
-                        success = draft_kv_cache.resume(draft_kv_cache_manager._stream.cuda_stream)
-                        if not success:
-                            release_resources(req, free_draft_resources=True)
-                            return None
-                        draft_kv_cache.stop_committing()
-                        success = draft_kv_cache.resize(dummy_capacity)
-                        if not success:
-                            release_resources(req, free_draft_resources=True)
-                            return None
-                    else:
-                        # V1-family draft manager (no per-request cache handles);
-                        # mirrors KVCacheManager.add_dummy_requests. The C++ side
-                        # raises on allocation failure rather than returning a
-                        # status, so release before propagating.
-                        draft_seq_added = False
-                        try:
-                            draft_kv_cache_manager.impl.add_sequence_batch(
-                                [(req.py_request_id, token_num, beam_width)], [req]
-                            )
-                            draft_seq_added = True
-                            for _ in range(self.num_extra_kv_tokens):
-                                draft_kv_cache_manager.impl.add_token(req.py_request_id)
-                        except Exception:
-                            release_resources(req, free_draft_resources=draft_seq_added)
-                            raise
+                    draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
+                        req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
+                    )
+                    # Dummy path: see comment above, no salt.
+                    if draft_kv_cache is None:
+                        release_resources(req)
+                        return None
+                    success = draft_kv_cache.resume(draft_kv_cache_manager._stream.cuda_stream)
+                    if not success:
+                        release_resources(req, free_draft_resources=True)
+                        return None
+                    draft_kv_cache.stop_committing()
+                    success = draft_kv_cache.resize(dummy_capacity)
+                    if not success:
+                        release_resources(req, free_draft_resources=True)
+                        return None
 
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -2759,28 +2742,13 @@ class KVCacheManagerV2(BaseResourceManager):
                     new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
                     if not success:
-                        # V1-family draft allocations have no draft_kv_cache
-                        # handle, so key on the manager, not the handle.
-                        release_resources(
-                            req,
-                            free_draft_resources=draft_kv_cache_manager is not None,
-                        )
+                        release_resources(req, free_draft_resources=draft_kv_cache is not None)
                         return None
                     if draft_kv_cache is not None:
                         success = draft_kv_cache.resize(new_capacity)
                         if not success:
                             release_resources(req, free_draft_resources=True)
                             return None
-                    elif draft_kv_cache_manager is not None:
-                        # Gen dummies must expose a 1 + draft_len kv span to
-                        # the draft layers; a V1 manager only grows a
-                        # sequence via add_token.
-                        try:
-                            for _ in range(_kv_draft):
-                                draft_kv_cache_manager.impl.add_token(req.py_request_id)
-                        except Exception:
-                            release_resources(req, free_draft_resources=True)
-                            raise
 
             if use_mrope:
                 _populate_dummy_mrope_config(req, token_num, is_gen)

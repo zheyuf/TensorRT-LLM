@@ -421,10 +421,8 @@ class KvCacheCreator:
                 # External drafter: layers start from 0, normal PP distribution
                 # Resolve draft manager class from draft config — may differ
                 # from target (e.g. hybrid target + plain transformer draft).
-                draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-                    effective_draft_config,
-                    kv_cache_config,
-                    is_disagg=self._is_disagg)
+                draft_kv_cache_manager_cls = self._get_draft_kv_cache_manager_cls(
+                    effective_draft_config, kv_cache_config)
                 total += self._per_manager_cache_cost(
                     draft_kv_cache_manager_cls, effective_draft_config,
                     kv_cache_config)
@@ -989,6 +987,17 @@ class KvCacheCreator:
             return self._draft_config.pretrained_config.num_hidden_layers
         return get_num_spec_layers(self._speculative_config)
 
+    def _get_draft_kv_cache_manager_cls(self, effective_draft_config,
+                                        draft_kv_config):
+        """Resolve the draft manager class from the draft config, promoted
+        to V2 when the target manager is V2."""
+        draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
+            effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
+        if self._is_kv_cache_manager_v2 and not issubclass(
+                draft_kv_cache_manager_cls, KVCacheManagerV2):
+            draft_kv_cache_manager_cls = KVCacheManagerV2
+        return draft_kv_cache_manager_cls
+
     def _create_one_model_draft_kv_cache_manager(
         self,
         estimating_kv_cache: bool = False,
@@ -1020,8 +1029,8 @@ class KvCacheCreator:
         draft_kv_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
         # Get the appropriate KV cache manager class for the draft model
-        draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
+        draft_kv_cache_manager_cls = self._get_draft_kv_cache_manager_cls(
+            effective_draft_config, draft_kv_config)
         draft_kv_cache_manager_cls = self._fallback_if_unsupported_kv_cache_manager_v2(
             draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
 
