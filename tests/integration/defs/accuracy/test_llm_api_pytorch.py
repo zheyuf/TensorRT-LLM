@@ -7668,14 +7668,16 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("cuda_graph", [True])
     @parametrize_with_ids("use_msa", [True])
-    @parametrize_with_ids("overlap_scheduler", [True])
+    @parametrize_with_ids("overlap_scheduler", [False, True])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
                           overlap_scheduler, use_msa, cuda_graph):
         if use_msa:
-            pytest.importorskip("fmha_sm100",
-                                reason="MSA kernels (fmha_sm100) not installed")
+            from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import \
+                msa_package_available
+            if not msa_package_available():
+                pytest.skip("MSA kernels (fmha_sm100) not available")
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         max_draft_len = 3
@@ -7683,19 +7685,24 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             max_draft_len=max_draft_len,
             speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",
         )
-        # The MSA kernels require page_size == sparse_block_size (128).
+        # The runtime forces tokens_per_block per implementation (128 MSA / 32
+        # reference).
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                        enable_block_reuse=False,
-                                        tokens_per_block=128 if use_msa else 32)
+                                        enable_block_reuse=False)
         with LLM(
                 model_path,
                 tensor_parallel_size=tp_size,
                 moe_expert_parallel_size=ep_size,
                 kv_cache_config=kv_cache_config,
                 sparse_attention_config=MiniMaxM3SparseAttentionConfig(
-                    sparse_use_msa=use_msa),
+                    implementation="msa" if use_msa else "triton"),
                 moe_config=MoeConfig(backend="CUTLASS"),
                 max_seq_len=4096,
+                # The fmha_sm100 decode planner caps total_q x num_qo_heads at
+                # 65536; with 1 + draft_len = 4 verify tokens per row that
+                # bounds the batch at 1024 / TP-sharded heads (256 unsharded
+                # under attention DP).
+                max_batch_size=256 if attention_dp else 512,
                 speculative_config=spec_config,
                 # Graphs + spec requires the MSA path: its verify batches
                 # are decode-shaped and capture-safe (the reference path
@@ -7706,52 +7713,55 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 ) if cuda_graph else None,
                 disable_overlap_scheduler=not overlap_scheduler,
                 enable_attention_dp=attention_dp,
+                enable_iter_perf_stats=True,
                 trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+
+            def drain_spec_stats(llm):
+                drafted = accepted = steps = 0
+                for s in llm.get_stats(timeout=2):
+                    s = json.loads(s) if isinstance(s, str) else s
+                    sd = s.get("specDecodingStats") or {}
+                    drafted += sd.get("numDraftTokens", 0)
+                    accepted += sd.get("numAcceptedTokens", 0)
+                    steps += sd.get("numRequestsWithDraftTokens", 0)
+                return drafted, accepted, steps
+
             task = MMLU(model_name)
             task.evaluate(llm)
             task = GSM8K(model_name)
             task.evaluate(llm)
 
-            # Acceptance probe (pattern: TestNemotronV3Ultra
-            # test_nvfp4_4gpu_mtp_ar): stream a few greedy prompts and
-            # derive per-step acceptance from the token increments.
-            raw_prompts = [
-                "Solve step by step: what is 12 times 17?",
-                "Write a Python function that reverses a linked list.",
-                "The capital of France is",
+            # Chat-format acceptance — the drafter's training distribution
+            # (Inferact/MiniMax-M3-EAGLE3 card: 0.839 / 3.518). Reuses the
+            # live engine and the cached dataset; ~20 s under CUDA graphs.
+            questions = [
+                r["question"]
+                for r in load_dataset("gsm8k", "main", split="test")
+            ][:200]
+            chat_prompts = [
+                llm.tokenizer.apply_chat_template([{
+                    "role": "user",
+                    "content": q
+                }],
+                                                  tokenize=False,
+                                                  add_generation_prompt=True)
+                for q in questions
             ]
-            prompts = [
-                llm.tokenizer.apply_chat_template(
-                    [{
-                        "role": "user",
-                        "content": p
-                    }],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                ) for p in raw_prompts
-            ]
-            tok_ids = [llm.tokenizer.encode(p) for p in prompts]
-            sampling_params = SamplingParams(max_tokens=128, temperature=0)
-            total_drafted = 0
-            total_accepted = 0
-            total_steps = 0
-            for i in range(len(tok_ids)):
-                num_tokens = 0
-                for output in llm.generate_async(tok_ids[i],
-                                                 sampling_params,
-                                                 streaming=True):
-                    new_tokens = output.outputs[0].token_ids
-                    total_drafted += max_draft_len
-                    total_accepted += len(new_tokens) - num_tokens - 1
-                    total_steps += 1
-                    num_tokens = len(new_tokens)
-            accept_rate = total_accepted / total_drafted
-            accept_length = 1 + total_accepted / total_steps
-            print(f"MiniMax-M3 Eagle3 acceptance: rate={accept_rate:.3f}, "
-                  f"mean acceptance length={accept_length:.3f}")
-            assert accept_rate > 0.25, \
-                f"Eagle3 acceptance rate too low: {accept_rate:.3f}"
+            drain_spec_stats(llm)
+            llm.generate(chat_prompts,
+                         SamplingParams(max_tokens=512, temperature=0))
+            drafted, accepted, steps = drain_spec_stats(llm)
+            assert steps > 0, "no speculative iterations recorded"
+            chat_rate = accepted / drafted
+            chat_length = 1 + accepted / steps
+            print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
+                  f"{chat_rate:.3f}, mean acceptance length="
+                  f"{chat_length:.3f} ({steps} spec iterations)")
+            assert chat_rate > 0.78, \
+                f"Eagle3 chat-GSM8K acceptance rate too low: {chat_rate:.3f}"
+            assert chat_length > 3.3, \
+                f"Eagle3 chat-GSM8K acceptance length too low: {chat_length:.3f}"
 
 
 @skip_pre_blackwell

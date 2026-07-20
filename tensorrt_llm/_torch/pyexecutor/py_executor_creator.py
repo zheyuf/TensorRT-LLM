@@ -35,8 +35,7 @@ from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
-                           get_spec_resource_manager,
-                           should_use_separate_draft_kv_cache)
+                           get_spec_resource_manager)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
@@ -675,35 +674,6 @@ def create_py_executor(
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
-
-    if (sparse_attention_config is not None
-            and sparse_attention_config.algorithm == "minimax_m3"
-            and spec_config is not None
-            and spec_config.spec_dec_mode.is_eagle3_one_model()):
-        if not spec_config.is_linear_tree:
-            raise NotImplementedError(
-                "Tree-based speculative decoding (eagle_choices / "
-                "use_dynamic_tree) is not supported with MiniMax-M3 sparse "
-                "attention: the M3 sparse kernels implement linear-chain "
-                "verification only. Remove eagle_choices / use_dynamic_tree "
-                "from the speculative config.")
-        if (llm_args.cuda_graph_config is not None
-                and not sparse_attention_config.sparse_use_msa):
-            raise NotImplementedError(
-                "CUDA graphs are not supported with MiniMax-M3 reference "
-                "sparse attention and speculative decoding: multi-token "
-                "verify routes through the M3 extend path, which is not "
-                "capture-safe. Set sparse_use_msa=True (SM100) to run "
-                "verify through the capture-safe MSA decode driver, or set "
-                "cuda_graph_config to null.")
-        if not should_use_separate_draft_kv_cache(spec_config):
-            raise NotImplementedError(
-                "One-model speculative decoding with MiniMax-M3 sparse "
-                "attention requires a separate draft KV cache manager, but "
-                "it is disabled for this configuration (e.g. disaggregated "
-                "serving disables it as a WAR for nvbug 5807902). Use "
-                "two-model speculative decoding (eagle3_one_model=False) "
-                "instead.")
 
     # Set default value for cache_transceiver_config.max_tokens_in_buffer
     if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:

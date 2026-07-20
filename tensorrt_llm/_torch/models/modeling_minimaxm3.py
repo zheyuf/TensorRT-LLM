@@ -71,12 +71,7 @@ from ..utils import (
     is_torch_compiling,
 )
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import (
-    DecoderModel,
-    ModelConfig,
-    filter_weights,
-    register_auto_model,
-)
+from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_auto_model
 
 # Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
@@ -1111,20 +1106,15 @@ class MiniMaxM3Attention(Attention):
 
         # 7. Gather padded K/V for every batch row and run dense GQA.
         batch = int(m3_meta.slot_ids.shape[0])
-        # Under CUDA-graph capture the gather/mask width is baked into the
-        # graph, while max_seqlen_k is a prepare-time host upper bound that
-        # later replays can outgrow (silent attention truncation). Bake the
-        # static bound instead: no row's kv can exceed the engine
-        # max_seq_len (manager-derived, includes the spec-dec margin), and
-        # the page-table width caps it when smaller. The raw page-table
-        # width alone is NOT usable — the KV-estimation pass inflates it
-        # far past max_seq_len and the [batch, max_k, heads] gather would
-        # OOM. The seq_lens mask below invalidates positions past each
-        # row's true length.
-        if getattr(attn_metadata, "is_cuda_graph", False):
+        # Graph capture bakes the gather/mask width, and max_seqlen_k is a
+        # per-step host bound later replays can outgrow. Bake
+        # min(page-table width, engine max_seq_len): the raw table width
+        # alone is inflated far past max_seq_len by the KV-estimation pass
+        # and would OOM the [batch, max_k, heads] gather. The seq_lens mask
+        # below invalidates the slack.
+        if attn_metadata.is_cuda_graph:
             capacity = int(m3_meta.req_to_token.shape[1])
-            engine_bound = int(getattr(attn_metadata, "max_seq_len", None) or capacity)
-            max_k = min(capacity, engine_bound)
+            max_k = min(capacity, int(attn_metadata.max_seq_len or capacity))
         else:
             max_k = int(m3_meta.max_seqlen_k)
         if max_k <= 0:
@@ -1223,13 +1213,10 @@ class MiniMaxM3Attention(Attention):
                 1, 2
             )  # [batch, H, qo, d]
             mask_b = valid.unsqueeze(1)  # [batch, 1, qo, k]
-            # Expand K/V per KV head rather than all heads at once: this
-            # branch is CUDA-graph captured, so the expansion lives in the
-            # graph pool, and the full-head copy is O(batch * max_k *
-            # num_heads) - under attention DP (unsharded heads) that one
-            # transient exceeds the pool budget at large graph buckets.
-            # Per-head chunks are freed between iterations; with TP-sharded
-            # KV heads (1 per rank) the loop is a single iteration.
+            # Expand K/V one KV head at a time: the all-heads transient is
+            # O(batch * max_k * num_heads) inside the CUDA-graph pool and
+            # exceeds the pool budget under attention DP (unsharded heads);
+            # with TP-sharded KV heads this is one iteration.
             out_b = q.new_empty(batch, self.num_heads, qo_len, self.head_dim)
             with sdpa_kernel(_DENSE_SDPA_BACKENDS):
                 for h in range(max(self.num_key_value_heads, 1)):

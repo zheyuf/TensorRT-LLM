@@ -224,6 +224,7 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed():
     assert index_k_strided.stride(0) == coalescing_scale * page_size * head_dim
     assert torch.equal(strided_scores, packed_scores)
 
+
 def test_msa_scratch_sizing_covers_spec_verify_tokens():
     """Under one-model Eagle3 spec verify a decode step carries
     1 + draft_len query tokens per request, so the proxy scratch must be
@@ -252,7 +253,8 @@ def test_per_token_valid_blocks_multi_token_decode():
     """Spec-verify decode rows expose one entry per query TOKEN, walking the
     causal ladder within the verify window."""
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
-        per_token_valid_blocks, )
+        per_token_valid_blocks,
+    )
 
     # One request verifying 4 tokens against kv_len 10 (offset 6): token t
     # attends 7 + t positions; with 2-token blocks that is ceil((7+t)/2).

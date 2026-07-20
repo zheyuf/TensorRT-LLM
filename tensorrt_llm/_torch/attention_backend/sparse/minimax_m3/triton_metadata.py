@@ -20,7 +20,6 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from ...interface import AttentionMetadata
 from ...trtllm import TrtllmAttentionMetadata
 from .common import build_paged_kv_slot_mapping
 
@@ -94,12 +93,9 @@ class MiniMaxM3TritonSparseAttentionMetadata:
     prefix_lens: Optional[torch.Tensor] = None
     cu_seqlens_q: Optional[torch.Tensor] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
-    # Query tokens per request on decode-shaped metadata (``is_prefill=False``).
-    # 1 for ordinary decode; 1 + draft_len under one-model Eagle3 spec verify
-    # when a pure-generation batch is kept decode-shaped. The reference
-    # backend routes multi-token gen batches through the extend path, so this
-    # stays 1 there; the dense SDPA decode branch consumes it for the causal
-    # ladder mask.
+    # Query tokens per request on decode-shaped metadata: 1 normally,
+    # 1 + draft_len under one-model Eagle3 verify. Consumed by the dense
+    # SDPA decode ladder mask.
     decode_qo_len: int = 1
     q_batch_row: Optional[torch.Tensor] = None
     q_positions: Optional[torch.Tensor] = None
@@ -175,10 +171,8 @@ class MiniMaxM3TritonSparseAttentionMetadata:
         else:
             max_k = int(self.seq_lens_cpu[:batch_size].max().item())
             # Optimistic overlap+spec lengths can overhang the page table at
-            # a page boundary (see derive_q_positions_and_cache_slots); the
-            # dense fallback consumes max_seqlen_k as the exact SDPA
-            # mask/gather width, so an unclamped overhang crashes SDPA
-            # (mask 385 vs K 384 on MMLU).
+            # a page boundary; SDPA consumes max_seqlen_k as the exact
+            # mask/gather width, so clamp to the table.
             self.max_seqlen_k = min(max_k, int(self.req_to_token.shape[1]))
 
 
@@ -391,25 +385,18 @@ def derive_q_positions_and_cache_slots(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-Q-token K-side positions and KV slot ids, on device, sync-free.
 
-    ``q_positions[t] = prefix_lens[row(t)] + (t - cu_seqlens_q[row(t)])``;
-    ``out_cache_loc[t] = req_to_token[row(t), q_positions[t]]``. Shared by
-    the metadata builder and the ``on_update_kv_lens`` re-derivation so the
-    two cannot drift.
+    Shared by the metadata builder and the ``on_update_kv_lens``
+    re-derivation so the two cannot drift.
     """
     total_q = int(q_batch_row.shape[0])
     qbr = q_batch_row.to(torch.long)
     tok = torch.arange(total_q, dtype=torch.int32, device=q_batch_row.device)
     q_positions = prefix_lens[qbr] + (tok - cu_seqlens_q[qbr])
-    # Overlap+spec: the first derivation runs with optimistic
-    # (full-acceptance) prefix_lens, which overhang the last allocated page
-    # when a request's true length sits at a page boundary. The overhanging
-    # slots are placeholders (on_update_kv_lens re-derives them from the
-    # corrected kv_lens before any forward consumes them), but the gather
-    # must stay in bounds: unclamped, the last row trips the CUDA gather
-    # assert and inner rows silently read the next request's slots. Clamp
-    # the table index only (non-inplace: ``.to`` aliases int64 inputs) —
-    # q_positions keep the optimistic values, whose mask width prepare()
-    # bounds separately.
+    # Optimistic prefix_lens can overhang the last allocated page; the
+    # overhanging slots are placeholders (on_update_kv_lens re-derives them
+    # before any forward reads them) but the gather must stay in bounds.
+    # Clamp only the table index — non-inplace, since ``.to`` aliases int64
+    # inputs.
     idx = q_positions.to(torch.long).clamp(min=0, max=req_to_token.shape[1] - 1)
     flat = qbr * req_to_token.shape[1] + idx
     return q_positions, req_to_token.reshape(-1).index_select(0, flat)
@@ -426,8 +413,6 @@ def derive_decode_cache_slots(req_to_token: torch.Tensor, seq_lens: torch.Tensor
     idx = (seq_lens.to(torch.long) - 1).clamp_(min=0, max=req_to_token.shape[1] - 1)
     flat = rows * req_to_token.shape[1] + idx
     return req_to_token.reshape(-1).index_select(0, flat)
-
-
 
 
 def build_runtime_metadata_from_kv_manager(
@@ -691,17 +676,10 @@ def build_runtime_metadata_from_kv_manager(
 class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
     """:class:`TrtllmAttentionMetadata` that pre-builds MiniMax-M3 metadata.
 
-    Subclassing :class:`TrtllmAttentionMetadata` (precedent:
-    ``DSAtrtllmAttentionMetadata``, and the MSA-path metadata) rather than
-    the plain :class:`AttentionMetadata` is required for one-model
-    speculative decoding (Eagle3): the draft layers live in the same engine
-    and run :class:`TrtllmAttention` against this shared per-step metadata,
-    so it must carry the TRTLLM surface (``kv_lens_cuda``,
-    ``host_request_types``, ``kv_cache_block_offsets``,
-    ``draft_kv_cache_block_offsets``, ``update_spec_dec_param``, ...). The
-    engine also gates spec-dec plumbing (draft KV cache swap,
-    overlap-scheduler ``kv_lens_cuda`` fixups) on
-    ``isinstance(..., TrtllmAttentionMetadata)``.
+    Subclasses :class:`TrtllmAttentionMetadata` (precedent:
+    ``DSAtrtllmAttentionMetadata``): one-model Eagle3 draft layers run
+    :class:`TrtllmAttention` against this shared per-step metadata, and the
+    engine gates spec-dec plumbing on the TRTLLM ``isinstance``.
 
     Overrides :meth:`prepare` so the M3-sparse
     :class:`MiniMaxM3TritonSparseAttentionMetadata` and the per-new-token
@@ -873,11 +851,8 @@ class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
         # specialization. (iter-131 regression: previously a wrong
         # predicate routed mixed batches into the decode branch and
         # crashed in index_copy_.)
-        # Multi-token generation rows (one-model Eagle3 spec verify emits
-        # 1 + draft_len query tokens per gen row) route through the extend
-        # path: the prefill kernels handle them as prefix+window extends.
-        # The decode branch stays reserved for batches where every row
-        # appends exactly one token.
+        # Multi-token gen rows (spec verify) also route through the extend
+        # path as prefix+window extends; decode stays one-token-per-row.
         is_extend = num_contexts > 0 or int(seq_lens_cpu[:batch_size].max().item()) > 1
         if is_extend:
             prefix_lens_list = [int(num_cached_per_seq[b]) for b in range(batch_size)]
@@ -951,13 +926,9 @@ class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
             meta.q_positions[:total_q].copy_(q_positions)
             out_cache_loc[:total_q].copy_(cache_slots)
         else:
-            # Reached today only as an identity (the hook also fires
-            # pre-correction on ordinary decode steps); re-deriving
-            # keeps corrected 0-draft steps correct once dynamic
-            # draft lengths make them reachable.
-            out_cache_loc[:batch].copy_(
-                derive_decode_cache_slots(meta.req_to_token, kv_lens)
-            )
+            # Identity today; keeps 0-draft corrections right if they
+            # become reachable.
+            out_cache_loc[:batch].copy_(derive_decode_cache_slots(meta.req_to_token, kv_lens))
 
 
 __all__ = [
