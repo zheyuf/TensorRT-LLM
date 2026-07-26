@@ -165,6 +165,140 @@ def test_msa_indexer_preserves_strided_hnd_index_k(monkeypatch):
     assert result is expected
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_msa_fp8_cache_converts_live_index_query_before_scoring():
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
+
+    config = MiniMaxM3SparseConfig(
+        num_q_heads=4,
+        num_kv_heads=4,
+        head_dim=128,
+        num_index_heads=4,
+        sparse_index_dim=128,
+        block_size=128,
+        topk=16,
+    )
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.m3_config = config
+    attention.layer_idx = 3
+    captured = {}
+
+    class FakeIndexer:
+        def select_blocks(self, idx_q, idx_k, **kwargs):
+            captured["idx_q"] = idx_q
+            captured["idx_k"] = idx_k
+            captured["kwargs"] = kwargs
+            return torch.zeros(2, 4, 16, dtype=torch.int32, device="cuda")
+
+    attention.indexer = FakeIndexer()
+
+    class FakeMetadata:
+        msa_decode_proxy_plan = None
+        msa_eager_proxy_plan = (False, 0, 2, {}, None)
+        # Two decode requests. run_indexer reads both counts to route the
+        # selection output head-major or token-major.
+        num_contexts = 0
+        num_generations = 2
+        msa_eager_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
+        msa_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
+        msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
+        msa_kv_lens_cpu = torch.full((2,), 128, dtype=torch.int32)
+        msa_qo_offset_cpu = torch.full((2,), 127, dtype=torch.int32)
+
+        def __init__(self):
+            self.cache = torch.empty(2, 1, 128, 128, dtype=torch.float8_e4m3fn, device="cuda")
+
+        def msa_write_idx_k(self, layer_idx, idx_k):
+            captured["write"] = (layer_idx, idx_k)
+
+        def msa_idx_k_cache(self, layer_idx):
+            captured["read_layer"] = layer_idx
+            return self.cache
+
+    idx_q = torch.randn(2, 4 * 128, dtype=torch.bfloat16, device="cuda")
+    idx_k = torch.randn(2, 128, dtype=torch.bfloat16, device="cuda")
+    result = attention.run_indexer(idx_q, idx_k, FakeMetadata())
+
+    assert result.shape == (2, 4, 16)
+    assert captured["idx_q"].dtype == torch.float8_e4m3fn
+    assert captured["idx_k"].dtype == torch.float8_e4m3fn
+    assert captured["idx_k"].stride(0) > captured["idx_k"].shape[-1]
+    assert captured["write"][0] == 3
+    assert captured["write"][1].data_ptr() == idx_k.data_ptr()
+
+    # The production fused producer has already inserted K and passes no live
+    # K tensor; E4M3 Q must flow to the scorer without a duplicate cache write.
+    captured.pop("write")
+    fused_q = idx_q.to(torch.float8_e4m3fn)
+    result = attention.run_indexer(fused_q, None, FakeMetadata())
+    assert result.shape == (2, 4, 16)
+    assert captured["idx_q"].data_ptr() == fused_q.data_ptr()
+    assert "write" not in captured
+
+
+@pytest.mark.parametrize(
+    ("num_contexts", "num_generations", "expected_head_major"),
+    [(2, 0, True), (1, 1, False), (0, 2, False)],
+)
+def test_run_indexer_routes_head_major_output_by_batch_mode(
+    num_contexts, num_generations, expected_head_major
+):
+    num_tokens, num_index_heads, sparse_index_dim = 3, 4, 128
+    captured = {}
+
+    class FakeIndexer:
+        def select_blocks(self, *args, **kwargs):
+            del args
+            captured["head_major_output"] = kwargs["head_major_output"]
+            return torch.zeros(num_tokens, 1, 16, dtype=torch.int32)
+
+    class FakeMetadata:
+        msa_decode_proxy_plan = None
+        msa_eager_proxy_plan = ("eager",)
+        msa_eager_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
+        msa_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
+        msa_qo_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
+        msa_kv_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
+        msa_qo_offset_cpu = torch.tensor([0], dtype=torch.int32)
+
+        def __init__(self):
+            self.num_contexts = num_contexts
+            self.num_generations = num_generations
+            # run_indexer reads the index-K cache before it writes this layer's
+            # index-K, so the fake has to hold a tensor from the start, as the
+            # persistent cache does in production.
+            self.idx_k_cache = torch.zeros(num_tokens, 1, sparse_index_dim)
+
+        def msa_write_idx_k(self, layer_idx, idx_k):
+            del layer_idx
+            self.idx_k_cache.copy_(idx_k)
+
+        def msa_idx_k_cache(self, layer_idx):
+            del layer_idx
+            return self.idx_k_cache
+
+    attention = SimpleNamespace(
+        layer_idx=0,
+        m3_config=SimpleNamespace(
+            sparse_index_dim=sparse_index_dim,
+            num_index_heads=num_index_heads,
+            num_kv_heads=1,
+        ),
+        indexer=FakeIndexer(),
+    )
+    metadata = FakeMetadata()
+
+    result = MiniMaxM3MsaSparseAttention.run_indexer(
+        attention,
+        torch.zeros(num_tokens, num_index_heads * sparse_index_dim),
+        torch.zeros(num_tokens, sparse_index_dim),
+        metadata,
+    )
+
+    assert result.shape == (num_tokens, 1, 16)
+    assert captured["head_major_output"] is expected_head_major
+
+
 def test_msa_proxy_max_score_strided_index_k_matches_packed():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -271,3 +405,155 @@ def test_per_token_valid_blocks_multi_token_decode():
     n_valid = per_token_valid_blocks(qo, kv, off, causal=True, block_size=4)
     # Row 0: 9 positions -> 3 blocks. Row 1 tokens attend 4, 5, 6 -> 1, 2, 2.
     assert n_valid.tolist() == [3, 1, 2, 2]
+
+
+def _expand_slot_rows(block_ids: torch.Tensor, tokens_per_block: int) -> torch.Tensor:
+    """req_to_token reference: block_id * tokens_per_block + offset_in_block."""
+    within = torch.arange(tokens_per_block, dtype=torch.int64)
+    grid = block_ids.to(torch.int64).unsqueeze(-1) * tokens_per_block + within
+    return grid.reshape(block_ids.shape[0], -1).to(torch.int32)
+
+
+def test_build_kv_page_indices_matches_first_slot_of_each_page():
+    """The host page table must equal the page ids each request's req_to_token
+    row holds at its page boundaries, since both use the manager's
+    tokens_per_block as the page size. Rows are ragged (0-padded block ids,
+    global and non-contiguous) and one request has no KV at all."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        build_kv_page_indices,
+    )
+
+    page_size = 8
+    block_ids = torch.tensor(
+        [[11, 4, 7, 0], [5, 9, 0, 0], [3, 0, 0, 0], [21, 13, 6, 2]],
+        dtype=torch.int32,
+    )
+    # 3 pages (partial last), 2 pages (exact), no pages, 4 pages.
+    kv_lens = torch.tensor([17, 16, 0, 32], dtype=torch.int32)
+    req_to_token = _expand_slot_rows(block_ids, page_size)
+
+    reference = torch.cat(
+        [
+            req_to_token[b, : int(kv_lens[b]) : page_size] // page_size
+            for b in range(block_ids.shape[0])
+        ]
+    )
+    page_indices = build_kv_page_indices(block_ids, kv_lens, page_size)
+
+    assert page_indices.dtype == torch.int32
+    assert page_indices.tolist() == [11, 4, 7, 5, 9, 21, 13, 6, 2]
+    torch.testing.assert_close(page_indices, reference, rtol=0, atol=0)
+
+
+def test_build_paged_kv_slot_mapping_out_cache_loc_matches_slot_grid():
+    """out_cache_loc must name the same slots as indexing req_to_token per new
+    token, for a mixed batch of one context request plus decode rows."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import (
+        build_paged_kv_slot_mapping,
+    )
+
+    tokens_per_block = 4
+    block_ids = torch.tensor([[6, 2, 9], [4, 0, 0], [7, 1, 0]], dtype=torch.int32)
+
+    class FakeCacheManager:
+        tokens_per_block = 4
+
+        def get_block_ids_per_seq(self, request_ids):
+            assert request_ids == [0, 1, 2]
+            return block_ids
+
+    # Request 0 prefills 6 tokens over a 3-token prefix; 1 and 2 decode.
+    qo_lens_cpu = torch.tensor([6, 1, 1], dtype=torch.int32)
+    kv_lens_cpu = torch.tensor([9, 3, 5], dtype=torch.int32)
+    qo_offset_cpu = kv_lens_cpu - qo_lens_cpu
+
+    mapping = build_paged_kv_slot_mapping(
+        kv_cache_manager=FakeCacheManager(),
+        request_ids=[0, 1, 2],
+        qo_lens_cpu=qo_lens_cpu,
+        qo_offset_cpu=qo_offset_cpu,
+        device=torch.device("cpu"),
+    )
+
+    req_to_token = _expand_slot_rows(block_ids, tokens_per_block)
+    reference = [
+        int(req_to_token[b, int(qo_offset_cpu[b]) + offset])
+        for b in range(3)
+        for offset in range(int(qo_lens_cpu[b]))
+    ]
+
+    torch.testing.assert_close(mapping.req_to_token, req_to_token, rtol=0, atol=0)
+    assert mapping.slot_ids.tolist() == [0, 1, 2]
+    assert mapping.out_cache_loc.dtype == torch.int32
+    assert mapping.out_cache_loc.tolist() == reference
+    assert mapping.block_ids_cpu.tolist() == block_ids.tolist()
+
+    # A zero-length CUDA-graph padding row offsets to -1. Its slot is a
+    # placeholder that on_update_kv_lens re-derives, so it only has to stay
+    # inside the row rather than index off the table.
+    padded = build_paged_kv_slot_mapping(
+        kv_cache_manager=FakeCacheManager(),
+        request_ids=[0, 1, 2],
+        qo_lens_cpu=torch.tensor([1, 1, 1], dtype=torch.int32),
+        qo_offset_cpu=torch.tensor([0, -1, -1], dtype=torch.int32),
+        device=torch.device("cpu"),
+    )
+    for b, slot in enumerate(padded.out_cache_loc.tolist()):
+        assert slot in req_to_token[b].tolist()
+
+
+def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k):
+    num_tokens = int(slots.shape[0])
+    num_heads, head_dim = int(k_cache.shape[1]), int(k_cache.shape[3])
+    write_kv_slots(k_cache, slots, k.reshape(num_tokens, num_heads, head_dim), layout="HND")
+    write_kv_slots(v_cache, slots, v.reshape(num_tokens, num_heads, head_dim), layout="HND")
+    if idx_k is not None:
+        write_kv_slots(idx_cache, slots, idx_k.reshape(num_tokens, 1, head_dim), layout="HND")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("num_kv_heads", [1, 4])
+@pytest.mark.parametrize("with_idx", [True, False])
+def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx):
+    """The fused per-layer cache scatter must match the legacy write_kv_slots
+    path exactly on production-shaped inputs: non-contiguous HND cache views
+    carved from a pooled allocation and strided source rows sliced from a fused
+    projection, including the bf16 -> fp8 cache cast. Asserting on the whole
+    pool also catches stray writes outside the targeted slots."""
+    torch.manual_seed(0)
+    device = "cuda"
+    num_pages, tokens_per_block, head_dim = 6, 32, 128
+    num_tokens = 17
+    inner = num_kv_heads * head_dim
+
+    # Paged HND caches carved from a pool with a coalescing axis, so the
+    # views are non-contiguous like production get_buffers(...) output.
+    pool = torch.zeros(
+        num_pages, 2, num_kv_heads, tokens_per_block, head_dim, dtype=cache_dtype, device=device
+    )
+    k_cache, v_cache = pool[:, 0], pool[:, 1]
+    idx_pool = torch.zeros(
+        num_pages, 2, 1, tokens_per_block, head_dim, dtype=torch.bfloat16, device=device
+    )
+    idx_cache = idx_pool[:, 0]
+
+    # Strided sources: rows sliced out of a wider fused-projection tensor.
+    qkv = torch.randn(num_tokens, 3 * inner + 64, dtype=torch.bfloat16, device=device)
+    k = qkv[:, :inner]
+    v = qkv[:, inner : 2 * inner]
+    idx_k = qkv[:, 2 * inner : 2 * inner + head_dim] if with_idx else None
+
+    slots = torch.randperm(num_pages * tokens_per_block, device=device)[:num_tokens].to(torch.int32)
+
+    ref_pool = pool.clone()
+    ref_idx_pool = idx_pool.clone()
+    _reference_scatter_write(ref_pool[:, 0], ref_pool[:, 1], ref_idx_pool[:, 0], slots, k, v, idx_k)
+
+    wrote = fused_write_layer_caches(
+        k_cache, v_cache, idx_cache if with_idx else None, slots, k, v, idx_k
+    )
+    assert wrote
+
+    torch.testing.assert_close(pool.to(torch.float32), ref_pool.to(torch.float32))
+    torch.testing.assert_close(idx_pool, ref_idx_pool)
