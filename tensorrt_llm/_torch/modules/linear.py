@@ -3051,6 +3051,18 @@ def _mxfp8_cutlass_op_available() -> bool:
 
 
 _MXFP8_CUTEDSL_DECODE_MAX_M = 32
+_MXFP8_FLASHINFER_QUANT_DECODE_M = frozenset(
+    (1, 2, 4, 8, 16, *range(24, 257, 8)))
+# Four-node B300 crossover qualification requires every node's median to save
+# more than 0.015 us.  Keep only contiguous regions and fail closed at
+# unmeasured shapes; isolated wins at M=56 for K=384/1536 are not selected.
+_MXFP8_FLASHINFER_QUANT_ALL_M_K = frozenset(
+    (1024, 2048, 3072, 6144, 8192, 12288))
+_MXFP8_FLASHINFER_QUANT_PARTIAL_M_BY_K = {
+    384: frozenset((2, 4, 8, 16, 24, 32, *range(184, 257, 8))),
+    768: frozenset((1, 2, 4, 8, 16, *range(104, 257, 8))),
+    1536: frozenset((1, 2, 4, 8, *range(88, 257, 8))),
+}
 _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_autotune_active", default=False)
 _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
@@ -3094,11 +3106,15 @@ class MXFP8LinearMethod(LinearMethodBase):
         while tuning or capturing decode CUDA graphs; eager execution remains
         on the native TensorRT-LLM op. When CuTeDSL is configured, automatic
         decode-graph dispatch uses it for M <= 32 and retains CUTLASS for
-        larger shapes.
+        larger shapes. On B300, qualified MiniMax-M3 decode graph shapes use
+        the FlashInfer CuTeDSL activation quantizer and otherwise fail closed
+        to the native TensorRT-LLM quantizer.
 
     ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
     ``flashinfer``, or ``auto``. The reference layout is 2D [O,K/32]; both
     compiled backends consume the same 1D padded swizzled scale layout.
+    ``TRTLLM_MXFP8_FLASHINFER_QUANT_BACKEND`` can select ``trtllm``, ``cuda``,
+    or ``cute-dsl`` for qualified FlashInfer calls.
     When the TensorRT-LLM autotuner is enabled, the native backend profiles
     its compiled tactics during startup. Learned tactics are registered in
     the native op so serving avoids the Python autotuner lookup; the generic
@@ -3115,6 +3131,8 @@ class MXFP8LinearMethod(LinearMethodBase):
         self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
         self.flashinfer_backend = os.environ.get(
             "TRTLLM_MXFP8_FLASHINFER_BACKEND", "cutlass")
+        self.flashinfer_quant_backend = os.environ.get(
+            "TRTLLM_MXFP8_FLASHINFER_QUANT_BACKEND", "cute-dsl")
         self.use_native_autotuner = True
         self._native_autotuned = False
         if self.backend not in ("trtllm", "flashinfer", "auto"):
@@ -3124,7 +3142,12 @@ class MXFP8LinearMethod(LinearMethodBase):
             raise ValueError(
                 "TRTLLM_MXFP8_FLASHINFER_BACKEND must be 'cutlass' or "
                 f"'cute-dsl', got {self.flashinfer_backend!r}")
+        if self.flashinfer_quant_backend not in ("trtllm", "cuda", "cute-dsl"):
+            raise ValueError(
+                "TRTLLM_MXFP8_FLASHINFER_QUANT_BACKEND must be 'trtllm', "
+                f"'cuda', or 'cute-dsl', got {self.flashinfer_quant_backend!r}")
         self._flashinfer_mxfp8 = None
+        self._flashinfer_mxfp8_quantize = None
         self._flashinfer_autotuned = False
         if self.backend == "flashinfer":
             self._load_flashinfer(required=True)
@@ -3167,7 +3190,74 @@ class MXFP8LinearMethod(LinearMethodBase):
                 key="flashinfer_mxfp8_unavailable")
             return False
         self._flashinfer_mxfp8 = mm_mxfp8
+        if self.flashinfer_quant_backend != "trtllm":
+            try:
+                from flashinfer import mxfp8_quantize
+                if self.flashinfer_quant_backend == "cute-dsl":
+                    from flashinfer.cute_dsl import is_cute_dsl_available
+                    if not is_cute_dsl_available():
+                        raise ImportError("FlashInfer CuTeDSL is unavailable")
+            except ImportError as error:
+                if "TRTLLM_MXFP8_FLASHINFER_QUANT_BACKEND" in os.environ:
+                    raise RuntimeError(
+                        "TRTLLM_MXFP8_FLASHINFER_QUANT_BACKEND requires a "
+                        "FlashInfer package with MXFP8 quantization support"
+                    ) from error
+                logger.warning_once(
+                    "FlashInfer MXFP8 quantization is unavailable; using the "
+                    "native TensorRT-LLM quantizer.",
+                    key="flashinfer_mxfp8_quant_unavailable")
+                self.flashinfer_quant_backend = "trtllm"
+            else:
+                self._flashinfer_mxfp8_quantize = mxfp8_quantize
         return True
+
+    @staticmethod
+    def _flashinfer_quant_eligible(input: torch.Tensor) -> bool:
+        if not (input.is_cuda and input.dtype == torch.bfloat16
+                and input.dim() == 2):
+            return False
+        m, k = input.shape
+        shape_is_qualified = (
+            m in _MXFP8_FLASHINFER_QUANT_DECODE_M
+            and (k in _MXFP8_FLASHINFER_QUANT_ALL_M_K
+                 or m in (_MXFP8_FLASHINFER_QUANT_PARTIAL_M_BY_K.get(k, ()))))
+        return (shape_is_qualified
+                and torch.cuda.get_device_capability(input.device) == (10, 3))
+
+    def _flashinfer_quant_backend_for_call(
+            self, input: torch.Tensor) -> Optional[str]:
+        if (self.flashinfer_quant_backend == "trtllm"
+                or self._flashinfer_mxfp8_quantize is None):
+            return None
+        if not _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get():
+            return None
+        if self.backend == "auto":
+            if not self._flashinfer_autotuned:
+                return None
+        elif self.backend != "flashinfer":
+            return None
+        if not self._flashinfer_quant_eligible(input):
+            input_shape = tuple(input.shape)
+            if len(input_shape) == 2:
+                shape_log = f"m={input_shape[0]}, k={input_shape[1]}"
+            else:
+                shape_log = f"shape={input_shape}"
+            shape_key = "_".join(str(dim) for dim in input_shape) or "scalar"
+            logger.info_once(
+                "MXFP8 decode-graph quant dispatch: backend=trtllm, "
+                f"{shape_log}, reason=unqualified-shape",
+                key=("mxfp8_decode_quant_trtllm_"
+                     f"{shape_key}_{input.dtype}"))
+            return None
+        logger.info_once(
+            "MXFP8 decode-graph quant dispatch: "
+            f"backend={self.flashinfer_quant_backend}, m={input.shape[0]}, "
+            f"k={input.shape[1]}, reason=qualified-sm103-shape",
+            key=("mxfp8_decode_quant_flashinfer_"
+                 f"{self.flashinfer_quant_backend}_{input.shape[0]}_"
+                 f"{input.shape[1]}"))
+        return self.flashinfer_quant_backend
 
     def _flashinfer_backend_for_call(self,
                                      input: torch.Tensor) -> Optional[str]:
@@ -3251,8 +3341,21 @@ class MXFP8LinearMethod(LinearMethodBase):
         if self.use_cutlass:
             # Dynamic MXFP8 activation quantization (swizzled SF layout), then
             # the CUTLASS block-scaled e4m3xe4m3 GEMM.
-            act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
-                input.contiguous(), True)
+            input = input.contiguous()
+            flashinfer_quant_backend = \
+                self._flashinfer_quant_backend_for_call(input)
+            if flashinfer_quant_backend is not None:
+                flashinfer_mxfp8_quantize = self._flashinfer_mxfp8_quantize
+                assert flashinfer_mxfp8_quantize is not None
+                act_e4m3, act_sf = flashinfer_mxfp8_quantize(
+                    input,
+                    is_sf_swizzled_layout=True,
+                    alignment=self.BLOCK_SIZE,
+                    enable_pdl=None,
+                    backend=flashinfer_quant_backend,
+                )
+            else:
+                act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
             flashinfer_backend = self._flashinfer_backend_for_call(input)
             if flashinfer_backend is not None:
                 flashinfer_mxfp8 = self._flashinfer_mxfp8

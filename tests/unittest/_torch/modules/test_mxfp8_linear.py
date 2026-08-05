@@ -38,6 +38,11 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
+@pytest.fixture(autouse=True)
+def _clear_flashinfer_quant_backend(monkeypatch):
+    monkeypatch.delenv("TRTLLM_MXFP8_FLASHINFER_QUANT_BACKEND", raising=False)
+
+
 def test_quant_dequant_roundtrip_is_close():
     torch.manual_seed(0)
     out_features, in_features = 64, 128  # in_features divisible by 32
@@ -163,6 +168,108 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     # Leaving the decode-capture scope restores the eager/native path.
     assert method.apply(module, activation, bias=None) is native_output
     assert native_gemm.call_count == 2
+
+
+def test_mxfp8_auto_quant_keeps_eager_native_and_captures_cutedsl(monkeypatch):
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.delenv("TRTLLM_MXFP8_FLASHINFER_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setattr(MXFP8LinearMethod, "_flashinfer_quant_eligible", lambda self, input: True)
+
+    flashinfer_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    flashinfer_quantized = torch.empty((2, 4), dtype=torch.float8_e4m3fn)
+    flashinfer_scale = torch.empty(512, dtype=torch.uint8)
+    mm_mxfp8 = Mock(return_value=flashinfer_output)
+    mxfp8_quantize = Mock(return_value=(flashinfer_quantized, flashinfer_scale))
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.cute_dsl", SimpleNamespace(is_cute_dsl_available=lambda: True)
+    )
+    monkeypatch.setitem(
+        sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8, mxfp8_quantize=mxfp8_quantize)
+    )
+    _, _, native_quantize, _, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
+
+    module = SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    activation = torch.randn((2, 4), dtype=torch.bfloat16)
+    method = MXFP8LinearMethod()
+    assert method.enable_flashinfer_auto()
+
+    assert method.apply(module, activation, bias=None) is native_output
+    native_quantize.assert_called_once_with(activation, True)
+    mxfp8_quantize.assert_not_called()
+
+    method.mark_flashinfer_autotuned()
+    with flashinfer_mxfp8_decode_graph_capture():
+        assert method.apply(module, activation, bias=None) is flashinfer_output
+    mxfp8_quantize.assert_called_once_with(
+        activation,
+        is_sf_swizzled_layout=True,
+        alignment=32,
+        enable_pdl=None,
+        backend="cute-dsl",
+    )
+    assert mm_mxfp8.call_args.args[0] is flashinfer_quantized
+    assert mm_mxfp8.call_args.args[2] is flashinfer_scale
+
+
+@pytest.mark.parametrize(
+    "m,k,dtype,capability,expected",
+    [
+        (1, 6144, torch.bfloat16, (10, 3), True),
+        (24, 3072, torch.bfloat16, (10, 3), True),
+        (64, 2048, torch.bfloat16, (10, 3), True),
+        (256, 768, torch.bfloat16, (10, 3), True),
+        (2, 384, torch.bfloat16, (10, 3), True),
+        (32, 384, torch.bfloat16, (10, 3), True),
+        (184, 384, torch.bfloat16, (10, 3), True),
+        (16, 768, torch.bfloat16, (10, 3), True),
+        (104, 768, torch.bfloat16, (10, 3), True),
+        (8, 1536, torch.bfloat16, (10, 3), True),
+        (88, 1536, torch.bfloat16, (10, 3), True),
+        (128, 8192, torch.bfloat16, (10, 3), True),
+        (256, 12288, torch.bfloat16, (10, 3), True),
+        (1, 384, torch.bfloat16, (10, 3), False),
+        (40, 384, torch.bfloat16, (10, 3), False),
+        (24, 768, torch.bfloat16, (10, 3), False),
+        (16, 1536, torch.bfloat16, (10, 3), False),
+        (3, 6144, torch.bfloat16, (10, 3), False),
+        (257, 6144, torch.bfloat16, (10, 3), False),
+        (32, 4096, torch.bfloat16, (10, 3), False),
+        (32, 6144, torch.float16, (10, 3), False),
+        (32, 6144, torch.bfloat16, (10, 0), False),
+    ],
+)
+def test_mxfp8_flashinfer_quant_qualification(monkeypatch, m, k, dtype, capability, expected):
+    input = SimpleNamespace(
+        is_cuda=True,
+        dtype=dtype,
+        shape=(m, k),
+        dim=lambda: 2,
+        device=torch.device("cuda"),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+
+    assert MXFP8LinearMethod._flashinfer_quant_eligible(input) is expected
+
+
+def test_mxfp8_flashinfer_quant_qualification_rejects_cpu():
+    input = torch.empty((32, 6144), dtype=torch.bfloat16)
+    assert not MXFP8LinearMethod._flashinfer_quant_eligible(input)
+
+
+def test_mxfp8_flashinfer_quant_non_matrix_falls_back(monkeypatch):
+    method = object.__new__(MXFP8LinearMethod)
+    method.flashinfer_quant_backend = "cute-dsl"
+    method._flashinfer_mxfp8_quantize = Mock()
+    method.backend = "flashinfer"
+    input = torch.empty(32, dtype=torch.bfloat16)
+
+    with flashinfer_mxfp8_decode_graph_capture():
+        assert method._flashinfer_quant_backend_for_call(input) is None
 
 
 @pytest.mark.parametrize(
@@ -344,6 +451,22 @@ def test_mxfp8_rejects_unknown_backend(monkeypatch):
 def test_mxfp8_rejects_unknown_flashinfer_backend(monkeypatch):
     monkeypatch.setenv("TRTLLM_MXFP8_FLASHINFER_BACKEND", "unknown")
     with pytest.raises(ValueError, match="TRTLLM_MXFP8_FLASHINFER_BACKEND"):
+        MXFP8LinearMethod()
+
+
+def test_mxfp8_rejects_unknown_flashinfer_quant_backend(monkeypatch):
+    monkeypatch.setenv("TRTLLM_MXFP8_FLASHINFER_QUANT_BACKEND", "unknown")
+    with pytest.raises(ValueError, match="TRTLLM_MXFP8_FLASHINFER_QUANT_BACKEND"):
+        MXFP8LinearMethod()
+
+
+def test_mxfp8_explicit_flashinfer_quant_requires_package_support(monkeypatch):
+    monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "flashinfer")
+    monkeypatch.setenv("TRTLLM_MXFP8_FLASHINFER_QUANT_BACKEND", "cute-dsl")
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=Mock()))
+
+    with pytest.raises(RuntimeError, match="MXFP8 quantization support"):
         MXFP8LinearMethod()
 
 
