@@ -1181,12 +1181,16 @@ class PyTorchModelEngine(ModelEngine):
         # a larger workspace, so the first pass grows the workspace to its
         # maximum size. The second pass runs the final per-shape warmup and
         # captures without resizing the workspace.
+        num_profiles = len(AutoTuner.get().profiling_cache)
         with self.cuda_graph_runner.allow_capture():
             self.cuda_graph_runner.is_warmup_only = True
             try:
                 self._run_cuda_graph_warmup(resource_manager)
             finally:
                 self.cuda_graph_runner.is_warmup_only = False
+            if len(AutoTuner.get().profiling_cache) > num_profiles:
+                gc.collect()
+                torch.cuda.empty_cache()
             self.cuda_graph_runner.padding_dummy_requests = {}
             self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
@@ -1846,7 +1850,8 @@ class PyTorchModelEngine(ModelEngine):
 
         # The automatic MiniMax-M3 MXFP8 selection is decode-graph-only.
         # Keep piecewise context/prefill graph capture on the native backend.
-        with flashinfer_mxfp8_decode_graph_capture():
+        with flashinfer_mxfp8_decode_graph_capture(
+                tune=self.cuda_graph_runner.is_warmup_only):
             self._capture_generation_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.

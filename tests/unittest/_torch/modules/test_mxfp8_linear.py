@@ -22,7 +22,9 @@ import torch
 import tensorrt_llm._torch.modules.linear as linear_module
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    FlashInferMXFP8GemmRunner,
     MXFP8GemmRunner,
+    MXFP8QuantizeRunner,
     _get_mxfp8_large_m_tuning_buckets,
     _map_to_mxfp8_large_m_bucket,
 )
@@ -151,13 +153,17 @@ def test_mxfp8_explicit_flashinfer_survives_torch_compile(monkeypatch):
     native_gemm.assert_not_called()
 
 
-def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
+def test_mxfp8_auto_keeps_eager_native_and_captures_factorized_ops(monkeypatch):
     monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
 
-    flashinfer_output = torch.empty((2, 3), dtype=torch.bfloat16)
-    flashinfer_gemm = _mock_flashinfer_mxfp8_op(monkeypatch, flashinfer_output)
-    _, _, _, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
+    graph_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    flashinfer_gemm = _mock_flashinfer_mxfp8_op(monkeypatch, graph_output)
+    quantized, activation_scale, _, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
+    graph_quantize = Mock(return_value=(quantized, activation_scale))
+    graph_gemm = Mock(return_value=graph_output)
+    monkeypatch.setattr(linear_module, "mxfp8_quantize_autotuned", graph_quantize)
+    monkeypatch.setattr(linear_module, "flashinfer_mxfp8_gemm_autotuned", graph_gemm)
 
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
@@ -173,13 +179,42 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     flashinfer_gemm.assert_not_called()
 
     method.mark_flashinfer_autotuned()
-    with flashinfer_mxfp8_decode_graph_capture():
-        assert method.apply(module, activation, bias=None) is flashinfer_output
-    flashinfer_gemm.assert_called_once()
+    with flashinfer_mxfp8_decode_graph_capture(tune=True):
+        assert method.apply(module, activation, bias=None) is graph_output
+    graph_quantize.assert_called_once_with(activation, tune=True)
+    graph_gemm.assert_called_once_with(
+        quantized,
+        activation_scale,
+        module.weight,
+        module.weight_scale,
+        module.dtype,
+        tune=True,
+    )
+    flashinfer_gemm.assert_not_called()
 
     # Leaving the decode-capture scope restores the eager/native path.
     assert method.apply(module, activation, bias=None) is native_output
     assert native_gemm.call_count == 2
+
+
+def test_mxfp8_factorized_runners_expose_only_available_candidates():
+    quant_runner = object.__new__(MXFP8QuantizeRunner)
+    quant_runner.cute_dsl_quantize = None
+    assert quant_runner.get_valid_tactics([], Mock()) == [quant_runner.TRTLLM]
+    quant_runner.cute_dsl_quantize = Mock()
+    assert quant_runner.get_valid_tactics([], Mock()) == [
+        quant_runner.TRTLLM,
+        quant_runner.CUTE_DSL,
+    ]
+
+    gemm_runner = object.__new__(FlashInferMXFP8GemmRunner)
+    gemm_runner.cute_dsl_gemm = None
+    assert gemm_runner.get_valid_tactics([], Mock()) == [gemm_runner.CUTLASS]
+    gemm_runner.cute_dsl_gemm = Mock()
+    assert gemm_runner.get_valid_tactics([], Mock()) == [
+        gemm_runner.CUTLASS,
+        gemm_runner.CUTE_DSL,
+    ]
 
 
 def test_mxfp8_auto_stays_native_under_torch_compile(monkeypatch):

@@ -15,7 +15,8 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    BufferKind, flashinfer_mxfp8_gemm_autotuned, mxfp8_quantize_autotuned)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -3064,13 +3065,15 @@ def flashinfer_mxfp8_autotune():
 
 
 @contextmanager
-def flashinfer_mxfp8_decode_graph_capture():
-    """Enable auto-dispatched FlashInfer calls only for decode graph capture."""
-    token = _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.set(True)
+def flashinfer_mxfp8_decode_graph_capture(*, tune: bool = False):
+    """Enable MXFP8 backend selection for generation CUDA graphs."""
+    capture_token = _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.set(True)
+    tuning_token = _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.set(tune)
     try:
         yield
     finally:
-        _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(token)
+        _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.reset(tuning_token)
+        _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(capture_token)
 
 
 class MXFP8LinearMethod(LinearMethodBase):
@@ -3082,12 +3085,10 @@ class MXFP8LinearMethod(LinearMethodBase):
         as a portable fallback.
       - CUTLASS (Blackwell sm100/103 + mxfp8_mxfp8_gemm op present): dynamic
         MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
-      - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
-        via trtllm::flashinfer_mm_mxfp8, which wraps mm_mxfp8 so a compiled
-        graph gets one opaque node. MiniMax-M3 enables this path automatically
-        only while tuning or capturing decode CUDA graphs, and that automatic
-        selection is skipped under torch.compile. A pinned flashinfer backend
-        applies everywhere.
+      - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales.
+        MiniMax-M3 independently tunes quantization and GEMM backends while
+        warming its decode CUDA graphs. Automatic selection is skipped under
+        torch.compile; a pinned FlashInfer backend applies everywhere.
 
     ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
     ``flashinfer``, or ``auto``; ``auto`` settles on ``trtllm`` when the model
@@ -3220,8 +3221,16 @@ class MXFP8LinearMethod(LinearMethodBase):
         if self.use_cutlass:
             # Dynamic MXFP8 activation quantization (swizzled SF layout), then
             # the CUTLASS block-scaled e4m3xe4m3 GEMM.
-            act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
-                input.contiguous(), True)
+            input = input.contiguous()
+            use_graph_autotuners = (
+                self.backend == "auto" and self._flashinfer_autotuned
+                and not is_torch_compiling()
+                and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())
+            if use_graph_autotuners:
+                tune = _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get()
+                act_e4m3, act_sf = mxfp8_quantize_autotuned(input, tune=tune)
+            else:
+                act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
             # The automatic path switches per call on context state, which
             # Dynamo cannot trace and a compiled graph could not honor. A
             # pinned backend resolves before tracing, so only the automatic
@@ -3231,7 +3240,16 @@ class MXFP8LinearMethod(LinearMethodBase):
                 (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
                  (self._flashinfer_autotuned
                   and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
-            if use_flashinfer:
+            if use_graph_autotuners:
+                output = flashinfer_mxfp8_gemm_autotuned(
+                    act_e4m3,
+                    act_sf,
+                    module.weight,
+                    module.weight_scale,
+                    module.dtype,
+                    tune=tune,
+                )
+            elif use_flashinfer:
                 flashinfer_mxfp8 = self._flashinfer_mxfp8
                 assert flashinfer_mxfp8 is not None
                 output = flashinfer_mxfp8(
