@@ -236,7 +236,7 @@ class TestWarmupCleanup(unittest.TestCase):
         )
 
     def test_flashinfer_mxfp8_auto_is_enabled_before_graph_warmup(self):
-        """Graph warmup owns joint tuning, independent of global TRT tuning."""
+        """Graph warmup owns MXFP8 tuning, independent of global TRT tuning."""
         with (
             patch(
                 "tensorrt_llm._torch.modules.linear._mxfp8_cutlass_op_available",
@@ -416,7 +416,7 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
+                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
             )
 
             with (

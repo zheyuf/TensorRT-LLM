@@ -23,8 +23,11 @@ import torch
 import tensorrt_llm._torch.modules.linear as linear_module
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    FlashInferMXFP8GemmRunner,
+    FlashInferMXFP8GemmTactic,
     MXFP8GemmRunner,
-    MXFP8LinearRunner,
+    MXFP8QuantizeRunner,
+    MXFP8QuantizeTactic,
     _get_mxfp8_large_m_tuning_buckets,
     _map_to_mxfp8_large_m_bucket,
 )
@@ -80,13 +83,15 @@ def _mock_mxfp8_ops(monkeypatch):
     native_gemm = Mock(return_value=native_output)
     autotuned_output = torch.empty((2, 3), dtype=torch.bfloat16)
     autotuned_gemm = Mock(return_value=autotuned_output)
-    joint_output = torch.empty((2, 3), dtype=torch.bfloat16)
-    joint_linear = Mock(return_value=joint_output)
+    graph_quantize = Mock(return_value=(quantized, activation_scale))
+    graph_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    graph_gemm = Mock(return_value=graph_output)
     fake_trtllm_ops = SimpleNamespace(
         mxfp8_quantize=quantize,
         mxfp8_mxfp8_gemm=native_gemm,
         mxfp8_mxfp8_gemm_autotuned=autotuned_gemm,
-        mxfp8_linear_autotuned=joint_linear,
+        mxfp8_quantize_autotuned=graph_quantize,
+        flashinfer_mxfp8_gemm_autotuned=graph_gemm,
     )
     monkeypatch.setattr(linear_module.torch, "ops", SimpleNamespace(trtllm=fake_trtllm_ops))
     return SimpleNamespace(
@@ -97,8 +102,9 @@ def _mock_mxfp8_ops(monkeypatch):
         native_output=native_output,
         autotuned_gemm=autotuned_gemm,
         autotuned_output=autotuned_output,
-        joint_linear=joint_linear,
-        joint_output=joint_output,
+        graph_quantize=graph_quantize,
+        graph_gemm=graph_gemm,
+        graph_output=graph_output,
     )
 
 
@@ -162,7 +168,7 @@ def test_mxfp8_explicit_flashinfer_survives_torch_compile(monkeypatch):
     ops.native_gemm.assert_not_called()
 
 
-def test_mxfp8_auto_keeps_eager_native_and_captures_joint_op(monkeypatch):
+def test_mxfp8_auto_keeps_eager_native_and_captures_factorized_ops(monkeypatch):
     monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
 
@@ -182,24 +188,30 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_joint_op(monkeypatch):
 
     assert method.apply(module, activation, bias=None) is ops.native_output
     ops.native_gemm.assert_called_once()
-    ops.joint_linear.assert_not_called()
+    ops.graph_quantize.assert_not_called()
+    ops.graph_gemm.assert_not_called()
     flashinfer_gemm.assert_not_called()
 
     with flashinfer_mxfp8_decode_graph_capture(tune=True):
-        assert method.apply(module, activation, bias=None) is ops.joint_output
-    ops.joint_linear.assert_called_once_with(
-        activation,
+        assert method.apply(module, activation, bias=None) is ops.graph_output
+    ops.graph_quantize.assert_called_once_with(activation, tune=True)
+    ops.graph_gemm.assert_called_once_with(
+        ops.quantized,
+        ops.activation_scale,
         module.weight,
         module.weight_scale,
         module.dtype,
         tune=True,
     )
-    ops.joint_linear.reset_mock()
+    ops.graph_quantize.reset_mock()
+    ops.graph_gemm.reset_mock()
 
     with flashinfer_mxfp8_decode_graph_capture():
-        assert method.apply(module, activation, bias=None) is ops.joint_output
-    ops.joint_linear.assert_called_once_with(
-        activation,
+        assert method.apply(module, activation, bias=None) is ops.graph_output
+    ops.graph_quantize.assert_called_once_with(activation, tune=False)
+    ops.graph_gemm.assert_called_once_with(
+        ops.quantized,
+        ops.activation_scale,
         module.weight,
         module.weight_scale,
         module.dtype,
@@ -212,73 +224,53 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_joint_op(monkeypatch):
     assert ops.native_gemm.call_count == 2
 
 
-def test_mxfp8_joint_runner_exposes_backend_cross_product():
-    runner = object.__new__(MXFP8LinearRunner)
-    runner.mm_mxfp8 = None
+def test_mxfp8_factorized_runners_expose_two_choices_each():
+    runner = object.__new__(MXFP8QuantizeRunner)
     runner.mxfp8_quantize = None
     runner.cute_dsl_available = False
-    assert runner.get_valid_tactics([], Mock()) == [-1]
-
-    runner.mm_mxfp8 = Mock()
-    assert runner.get_valid_tactics([], Mock()) == [-1, ("trtllm", "cutlass")]
-
-    runner.cute_dsl_available = True
-    assert runner.get_valid_tactics([], Mock()) == [
-        -1,
-        ("trtllm", "cutlass"),
-        ("trtllm", "cute-dsl"),
-    ]
+    assert runner.get_valid_tactics([], Mock()) == [MXFP8QuantizeTactic.TRTLLM]
 
     runner.mxfp8_quantize = Mock()
+    runner.cute_dsl_available = True
     assert runner.get_valid_tactics([], Mock()) == [
-        -1,
-        ("trtllm", "cutlass"),
-        ("trtllm", "cute-dsl"),
-        ("cute-dsl", "cutlass"),
-        ("cute-dsl", "cute-dsl"),
+        MXFP8QuantizeTactic.TRTLLM,
+        MXFP8QuantizeTactic.FLASHINFER_CUTE_DSL,
+    ]
+
+    runner = object.__new__(FlashInferMXFP8GemmRunner)
+    runner.cute_dsl_available = False
+    assert runner.get_valid_tactics([], Mock()) == [FlashInferMXFP8GemmTactic.CUTLASS]
+    runner.cute_dsl_available = True
+    runner.flashinfer_autotune = Mock()
+    assert runner.get_valid_tactics([], Mock()) == [
+        FlashInferMXFP8GemmTactic.CUTLASS,
+        FlashInferMXFP8GemmTactic.CUTE_DSL,
     ]
 
 
-def test_mxfp8_joint_runner_fallback_is_native(monkeypatch):
+def test_mxfp8_quantize_runner_fallback_is_native(monkeypatch):
     ops = _mock_mxfp8_ops(monkeypatch)
-    runner = object.__new__(MXFP8LinearRunner)
-    runner.output_dtype = torch.bfloat16
-
+    runner = object.__new__(MXFP8QuantizeRunner)
     activation = torch.randn((2, 4), dtype=torch.bfloat16)
-    weight = torch.empty((3, 4), dtype=torch.float8_e4m3fn)
-    weight_scale = torch.empty(512, dtype=torch.uint8)
-    output = runner.forward([activation, weight, weight_scale], tactic=-1)
 
-    assert output is ops.native_output
+    output = runner.forward([activation], tactic=MXFP8QuantizeTactic.TRTLLM)
+
+    assert output[0] is ops.quantized
+    assert output[1] is ops.activation_scale
     ops.quantize.assert_called_once_with(activation, True)
-    args = ops.native_gemm.call_args.args
-    assert args[0] is ops.quantized
-    assert args[1] is ops.activation_scale
-    assert args[2] is weight
-    assert args[3] is weight_scale
-    assert args[5] == torch.bfloat16
 
 
-def test_mxfp8_joint_runner_cutedsl_pipeline_contract(monkeypatch):
-    _mock_mxfp8_ops(monkeypatch)
-    runner = object.__new__(MXFP8LinearRunner)
-    runner.output_dtype = torch.bfloat16
+def test_mxfp8_quantize_runner_cutedsl_contract():
+    runner = object.__new__(MXFP8QuantizeRunner)
     quantized = torch.empty((2, 4), dtype=torch.float8_e4m3fn)
     activation_scale = torch.empty(512, dtype=torch.uint8)
     runner.mxfp8_quantize = Mock(return_value=(quantized, activation_scale))
-    expected = torch.empty((2, 3), dtype=torch.bfloat16)
-    runner.mm_mxfp8 = Mock(return_value=expected)
-    runner.flashinfer_autotune = Mock(return_value=nullcontext())
-
     activation = torch.randn((2, 4), dtype=torch.bfloat16)
-    weight = torch.empty((3, 4), dtype=torch.float8_e4m3fn)
-    weight_scale = torch.empty(512, dtype=torch.uint8)
-    output = runner.forward(
-        [activation, weight, weight_scale],
-        tactic=("cute-dsl", "cute-dsl"),
-    )
 
-    assert output is expected
+    output = runner.forward([activation], tactic=MXFP8QuantizeTactic.FLASHINFER_CUTE_DSL)
+
+    assert output[0] is quantized
+    assert output[1] is activation_scale
     runner.mxfp8_quantize.assert_called_once_with(
         activation,
         is_sf_swizzled_layout=True,
@@ -286,6 +278,29 @@ def test_mxfp8_joint_runner_cutedsl_pipeline_contract(monkeypatch):
         enable_pdl=None,
         backend="cute-dsl",
     )
+
+
+@pytest.mark.parametrize(
+    "tactic,backend",
+    [
+        (FlashInferMXFP8GemmTactic.CUTLASS, "cutlass"),
+        (FlashInferMXFP8GemmTactic.CUTE_DSL, "cute-dsl"),
+    ],
+)
+def test_flashinfer_mxfp8_gemm_runner_contract(tactic, backend):
+    runner = object.__new__(FlashInferMXFP8GemmRunner)
+    runner.output_dtype = torch.bfloat16
+    expected = torch.empty((2, 3), dtype=torch.bfloat16)
+    runner.mm_mxfp8 = Mock(return_value=expected)
+    runner.flashinfer_autotune = Mock(return_value=nullcontext())
+
+    quantized = torch.empty((2, 4), dtype=torch.float8_e4m3fn)
+    activation_scale = torch.empty(512, dtype=torch.uint8)
+    weight = torch.empty((3, 4), dtype=torch.float8_e4m3fn)
+    weight_scale = torch.empty(512, dtype=torch.uint8)
+    output = runner.forward([quantized, activation_scale, weight, weight_scale], tactic=tactic)
+
+    assert output is expected
     args = runner.mm_mxfp8.call_args.args
     assert args[0] is quantized
     assert args[1].shape == (4, 3)
@@ -295,26 +310,38 @@ def test_mxfp8_joint_runner_cutedsl_pipeline_contract(monkeypatch):
     assert runner.mm_mxfp8.call_args.kwargs == {
         "out_dtype": torch.bfloat16,
         "use_8x4_sf_layout": False,
-        "backend": "cute-dsl",
+        "backend": backend,
     }
-    runner.flashinfer_autotune.assert_called_once_with(tune_mode=False, skip_ops="mxfp8_gemm")
+    if backend == "cute-dsl":
+        runner.flashinfer_autotune.assert_called_once_with(tune_mode=False, skip_ops="mxfp8_gemm")
+    else:
+        runner.flashinfer_autotune.assert_not_called()
 
 
 @pytest.mark.parametrize("num_tokens,expected", [(24, 32), (40, 64), (64, 64)])
-def test_mxfp8_joint_runner_uses_conservative_power_of_two_buckets(num_tokens, expected):
+def test_mxfp8_factorized_runners_use_power_of_two_buckets(num_tokens, expected):
     AutoTuner._find_nearest_profile.cache_clear()
-    input_shapes = (
-        torch.Size((num_tokens, 6144)),
-        torch.Size((9216, 6144)),
-        torch.Size((1769472,)),
+    activation_shape = torch.Size((num_tokens, 6144))
+    quant_profile = AutoTuner._find_nearest_profile(
+        (activation_shape,),
+        MXFP8QuantizeRunner.tuning_config.dynamic_tensor_specs,
+        MXFP8QuantizeRunner.tuning_config.constraint_specs,
     )
-    profile = AutoTuner._find_nearest_profile(
-        input_shapes,
-        MXFP8LinearRunner.tuning_config.dynamic_tensor_specs,
-        MXFP8LinearRunner.tuning_config.constraint_specs,
+    assert quant_profile == ((expected, 6144),)
+
+    gemm_profile = AutoTuner._find_nearest_profile(
+        (
+            activation_shape,
+            torch.Size((24576,)),
+            torch.Size((9216, 6144)),
+            torch.Size((1769472,)),
+        ),
+        FlashInferMXFP8GemmRunner.tuning_config.dynamic_tensor_specs,
+        FlashInferMXFP8GemmRunner.tuning_config.constraint_specs,
     )
-    assert profile == (
+    assert gemm_profile == (
         (expected, 6144),
+        (-1,),
         (9216, 6144),
         (1769472,),
     )
@@ -343,7 +370,8 @@ def test_mxfp8_auto_stays_native_under_torch_compile(monkeypatch):
     with flashinfer_mxfp8_decode_graph_capture():
         assert method.apply(module, activation, bias=None) is ops.native_output
     ops.native_gemm.assert_called_once()
-    ops.joint_linear.assert_not_called()
+    ops.graph_quantize.assert_not_called()
+    ops.graph_gemm.assert_not_called()
     flashinfer_gemm.assert_not_called()
 
 

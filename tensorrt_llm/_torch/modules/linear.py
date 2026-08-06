@@ -3067,7 +3067,7 @@ _FLASHINFER_MXFP8_DECODE_GRAPH_TUNING_ACTIVE = ContextVar(
 
 @contextmanager
 def flashinfer_mxfp8_decode_graph_capture(*, tune: bool = False):
-    """Enable joint MXFP8 dispatch while warming up or capturing decode graphs."""
+    """Enable MXFP8 backend tuning while warming or capturing decode graphs."""
     capture_token = _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.set(True)
     tuning_token = _FLASHINFER_MXFP8_DECODE_GRAPH_TUNING_ACTIVE.set(tune)
     try:
@@ -3087,14 +3087,11 @@ class MXFP8LinearMethod(LinearMethodBase):
       - CUTLASS (Blackwell sm100/103 + mxfp8_mxfp8_gemm op present): dynamic
         MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
       - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
-        with ``mm_mxfp8``. MiniMax-M3 enables joint pipeline selection only
-        while warming up or capturing decode CUDA graphs; eager execution
-        remains on the native TensorRT-LLM op. The first graph-warmup pass
-        profiles the complete activation-quantization and GEMM pipeline,
-        including native, FlashInfer CUTLASS, and FlashInfer CuTeDSL candidates.
-        Automatic selection is skipped under torch.compile. An explicitly
-        pinned FlashInfer backend instead uses an opaque TensorRT-LLM custom op
-        and applies everywhere.
+        with ``mm_mxfp8``. Decode-graph warmup independently profiles native
+        vs FlashInfer CuTeDSL quantization and FlashInfer CUTLASS vs CuTeDSL
+        GEMM. Eager execution remains native, and automatic selection is
+        skipped under torch.compile. An explicitly pinned FlashInfer backend
+        instead uses an opaque TensorRT-LLM custom op and applies everywhere.
 
     ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
     ``flashinfer``, or ``auto``; ``auto`` settles on ``trtllm`` when the model
@@ -3152,7 +3149,7 @@ class MXFP8LinearMethod(LinearMethodBase):
         self._flashinfer_mxfp8 = op
         return True
 
-    def _use_joint_autotuner_for_call(self) -> bool:
+    def _use_graph_autotuners_for_call(self) -> bool:
         return (self.backend == "auto" and not is_torch_compiling()
                 and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())
 
@@ -3220,13 +3217,19 @@ class MXFP8LinearMethod(LinearMethodBase):
             # Dynamic MXFP8 activation quantization (swizzled SF layout), then
             # the CUTLASS block-scaled e4m3xe4m3 GEMM.
             input = input.contiguous()
-            if self._use_joint_autotuner_for_call():
-                output = torch.ops.trtllm.mxfp8_linear_autotuned(
+            if self._use_graph_autotuners_for_call():
+                tune = _FLASHINFER_MXFP8_DECODE_GRAPH_TUNING_ACTIVE.get()
+                act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize_autotuned(
                     input,
+                    tune=tune,
+                )
+                output = torch.ops.trtllm.flashinfer_mxfp8_gemm_autotuned(
+                    act_e4m3,
+                    act_sf,
                     module.weight,
                     module.weight_scale,
                     module.dtype,
-                    tune=_FLASHINFER_MXFP8_DECODE_GRAPH_TUNING_ACTIVE.get(),
+                    tune=tune,
                 )
             else:
                 act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
