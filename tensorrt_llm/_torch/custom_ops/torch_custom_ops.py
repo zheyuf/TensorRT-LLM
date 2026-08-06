@@ -710,11 +710,8 @@ class MXFP8QuantizeRunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
-        del inputs, profile, kwargs
-        tactics = [self.TRTLLM]
-        if self.cute_dsl_quantize is not None:
-            tactics.append(self.CUTE_DSL)
-        return tactics
+        return ([self.TRTLLM, self.CUTE_DSL]
+                if self.cute_dsl_quantize is not None else [self.TRTLLM])
 
     def forward(
         self,
@@ -758,11 +755,8 @@ class FlashInferMXFP8GemmRunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
-        del inputs, profile, kwargs
-        tactics = [self.CUTLASS]
-        if self.cute_dsl_gemm is not None:
-            tactics.append(self.CUTE_DSL)
-        return tactics
+        return ([self.CUTLASS, self.CUTE_DSL]
+                if self.cute_dsl_gemm is not None else [self.CUTLASS])
 
     def forward(
         self,
