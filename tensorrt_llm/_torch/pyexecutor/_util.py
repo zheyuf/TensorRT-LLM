@@ -75,6 +75,9 @@ from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
 
+# Non-production A/B switch for the MiniMax-M3 shared draft-KV experiment.
+_M3_AGG_SHARED_DRAFT_KV_ENV = "TRTLLM_M3_ENABLE_AGG_SHARED_DRAFT_KV"
+
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -1152,7 +1155,20 @@ class KvCacheCreator:
             logger.info("Attention DP: draft layers share the target KV "
                         "cache manager.")
             return False
-        return should_use_separate_draft_kv_cache(self._speculative_config)
+        use_separate = should_use_separate_draft_kv_cache(
+            self._speculative_config)
+        enable_experimental_agg_shared = (
+            use_separate and not self._is_disagg
+            and os.environ.get(_M3_AGG_SHARED_DRAFT_KV_ENV, "0") == "1"
+            and getattr(self._kv_cache_manager_cls,
+                        'supports_experimental_agg_shared_draft_layers', False))
+        if enable_experimental_agg_shared:
+            logger.warning(
+                "[experimental] Aggregated MiniMax-M3 draft layers share "
+                "the target KV cache manager because %s=1.",
+                _M3_AGG_SHARED_DRAFT_KV_ENV)
+            return False
+        return use_separate
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """

@@ -22,6 +22,7 @@ sub-pages ``s*scale*subdiv + j`` and V sub-pages offset by ``subdiv`` (V is
 laid out immediately after K within the slot).
 """
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.cache_manager import (
@@ -131,6 +132,58 @@ def test_subdiv_one_degenerates_to_identity():
     view.copy_batch_block_offsets(dst, request_ids=[1], beam_width=1, num_contexts=1, num_seqs=1)
     assert dst[0, 0, 0, :2].tolist() == [5 * SCALE, 7 * SCALE]
     assert dst[0, 0, 1, :2].tolist() == [5 * SCALE + 1, 7 * SCALE + 1]
+
+
+def test_p64_view_halves_the_block_table_expansion() -> None:
+    # Control-plane coverage for the optional P64 kernel experiment. This
+    # verifies shared-manager addressing only; kernel qualification remains
+    # an end-to-end GPU test.
+    view = MiniMaxM3DraftSubpageView(_FakeManager(), [DRAFT_LAYER], 64)
+    assert view._subdiv == 2
+    assert view.tokens_per_block == 64
+    assert view.max_blocks_per_seq == 32
+    dst = torch.zeros((1, 1, 2, view.max_blocks_per_seq), dtype=torch.int32)
+    view.copy_batch_block_offsets(
+        dst,
+        request_ids=[1],
+        beam_width=1,
+        num_contexts=1,
+        num_seqs=1,
+    )
+    unit = SCALE * 2
+    assert dst[0, 0, 0, :4].tolist() == [
+        5 * unit,
+        5 * unit + 1,
+        7 * unit,
+        7 * unit + 1,
+    ]
+    assert dst[0, 0, 1, :4].tolist() == [
+        5 * unit + 2,
+        5 * unit + 3,
+        7 * unit + 2,
+        7 * unit + 3,
+    ]
+
+
+def test_manager_accessor_honors_p64_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeSharedManager(_FakeManager):
+        is_draft = False
+        draft_manager_tokens_per_block = 32
+
+        def __init__(self):
+            super().__init__()
+            self._shared_draft_layer_ids = [DRAFT_LAYER]
+            self._draft_subpage_view_obj = None
+
+    monkeypatch.setenv("TRTLLM_M3_DRAFT_KV_TOKENS_PER_BLOCK", "64")
+    manager = _FakeSharedManager()
+    view = MiniMaxM3KVCacheManagerV2.get_draft_subpage_view(manager)
+
+    assert view is not None
+    assert view.tokens_per_block == 64
+    assert view._subdiv == 2
 
 
 def test_manager_accessor_builds_and_caches_view():

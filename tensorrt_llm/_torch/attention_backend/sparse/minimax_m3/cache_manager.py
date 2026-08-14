@@ -200,6 +200,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     # attention addresses that pool through ``get_draft_subpage_view``.
     supports_shared_draft_layers = True
 
+    # Non-production performance experiment: the existing shared-draft
+    # sub-page view can also serve aggregated deployments with attention DP
+    # disabled. KvCacheCreator requires both this model-specific capability
+    # and an explicit environment opt-in before selecting that path.
+    supports_experimental_agg_shared_draft_layers = True
+
     # WAR: the Eagle draft kernels break at tokens_per_block=128 (the MSA
     # target's page size) — the SM103 context cubin is missing (its unfused
     # fallback demands a multi-TiB workspace) and the generation kernel hits
