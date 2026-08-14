@@ -44,7 +44,8 @@ class _FakeManager:
     # base pointer. The draft view must not delegate this value.
     blocks_in_primary_pool = 1024 * SCALE
 
-    def __init__(self):
+    def __init__(self, num_slots=1024):
+        self.num_slots = num_slots
         self.layer_offsets = {DRAFT_LAYER: DRAFT_LAYER}
         self.kv_cache_pool_mapping = torch.zeros((DRAFT_LAYER + 1, 2), dtype=torch.int32)
         self.kv_cache_pool_mapping[DRAFT_LAYER] = torch.tensor([0, 7], dtype=torch.int32)
@@ -53,7 +54,7 @@ class _FakeManager:
     def _kv_slot_geometry(self, layer_idx, kv_layout):
         assert layer_idx == DRAFT_LAYER
         page_shape = [self.tokens_per_block, 16, 128]
-        return ADDR, torch.int8, 1024, SCALE, page_shape
+        return ADDR, torch.int8, self.num_slots, SCALE, page_shape
 
     def _get_batch_cache_indices_by_pool_id(self, request_ids, *, pool_id):
         assert pool_id == 0
@@ -151,6 +152,7 @@ def test_p64_view_halves_the_block_table_expansion() -> None:
     assert view._subdiv == 2
     assert view.tokens_per_block == 64
     assert view.max_blocks_per_seq == 32
+    assert view.blocks_in_primary_pool == (1024 - 1) * SCALE * 2 + 4
     dst = torch.zeros((1, 1, 2, view.max_blocks_per_seq), dtype=torch.int32)
     view.copy_batch_block_offsets(
         dst,
@@ -172,6 +174,15 @@ def test_p64_view_halves_the_block_table_expansion() -> None:
         7 * unit + 2,
         7 * unit + 3,
     ]
+
+
+def test_p64_single_slot_flat_pool_bound() -> None:
+    view = MiniMaxM3DraftSubpageView(_FakeManager(num_slots=1), [DRAFT_LAYER], 64)
+
+    assert view._subdiv == 2
+    # With no inter-slot stride, the draft-K-rooted pool contains exactly
+    # two P64 K sub-pages followed by two P64 V sub-pages.
+    assert view.blocks_in_primary_pool == 4
 
 
 def test_manager_accessor_honors_p64_environment_override(
