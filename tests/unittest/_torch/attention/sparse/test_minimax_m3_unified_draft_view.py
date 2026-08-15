@@ -142,6 +142,61 @@ def test_subdiv_one_degenerates_to_identity():
     assert dst[0, 0, 1, :2].tolist() == [5 * SCALE + 1, 7 * SCALE + 1]
 
 
+def test_p64_view_geometry_and_pool_bound():
+    # P64 remains an opt-in kernel experiment. Its control-plane geometry
+    # must nevertheless retain the final slot's K and V sub-pages.
+    assert MiniMaxM3KVCacheManagerV2.draft_manager_tokens_per_block == 32
+    view = MiniMaxM3DraftSubpageView(_FakeManager(), [DRAFT_LAYER], 64)
+    assert view._subdiv == 2
+    assert view.tokens_per_block == 64
+    assert view.max_blocks_per_seq == 16 * 2
+    assert view.blocks_in_primary_pool == (1024 - 1) * SCALE * 2 + 4
+
+    dst = torch.zeros((1, 1, 2, view.max_blocks_per_seq), dtype=torch.int32)
+    view.copy_batch_block_offsets(
+        dst,
+        request_ids=[1],
+        beam_width=1,
+        num_contexts=1,
+        num_seqs=1,
+    )
+    unit = SCALE * 2
+    assert dst[0, 0, 0, :4].tolist() == [
+        5 * unit,
+        5 * unit + 1,
+        7 * unit,
+        7 * unit + 1,
+    ]
+    assert dst[0, 0, 1, :4].tolist() == [
+        5 * unit + 2,
+        5 * unit + 3,
+        7 * unit + 2,
+        7 * unit + 3,
+    ]
+
+
+def test_tp2_h2_subpage_offsets_are_not_p128_hnd_offsets():
+    # MSA overrides the manager's class-default NHD layout to HND at runtime.
+    # The draft view is nevertheless a flat sequence of [H, P32, D] blocks,
+    # so one P128 allocation is physically addressed as [subpage, H, P32, D].
+    # The relocation kernel instead constructs a P128 KVBlockArray whose
+    # getKVLocalIdx() addresses [H, P128, D]. The two interpretations happen
+    # to agree for H=1, but not for MiniMax-M3 TP2's H=2.
+    heads = 2
+    target_page = 128
+    draft_page = 32
+
+    def draft_view_offset(subpage: int, head: int, token: int) -> int:
+        return (subpage * heads + head) * draft_page + token
+
+    def relocation_offset(subpage: int, head: int, token: int) -> int:
+        return head * target_page + subpage * draft_page + token
+
+    assert draft_view_offset(0, 0, 0) == relocation_offset(0, 0, 0)
+    assert draft_view_offset(1, 0, 0) != relocation_offset(1, 0, 0)
+    assert draft_view_offset(0, 1, 0) != relocation_offset(0, 1, 0)
+
+
 def test_manager_accessor_builds_and_caches_view():
     # Exercise the accessor itself (construction + the log statement), not
     # just direct view construction: a stale field reference in the log
