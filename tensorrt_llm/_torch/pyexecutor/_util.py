@@ -1134,25 +1134,62 @@ class KvCacheCreator:
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """
         Check if we need a separate draft KV cache manager for one-model mode.
-        Returns True if the speculative config has use_separate_draft_kv_cache=True.
+        Returns True if the draft layout must remain independent.
 
         Note: For MTP, _draft_config may be None since MTP layers are embedded
         in the target model and don't produce a separate ModelConfig. We fall
         back to the target model's config via _get_effective_draft_config().
         """
-        if self._mapping.enable_attention_dp and getattr(
-                self._kv_cache_manager_cls, 'supports_shared_draft_layers',
-                True):
+        use_separate = should_use_separate_draft_kv_cache(
+            self._speculative_config)
+        if (self._speculative_config is None
+                or not self._speculative_config.spec_dec_mode.use_one_engine()):
+            return use_separate
+
+        supports_shared_layers = getattr(self._kv_cache_manager_cls,
+                                         'supports_shared_draft_layers', True)
+        if self._mapping.enable_attention_dp and supports_shared_layers:
             # Under attention DP, draft layers share the target manager (the
             # layout existing deployments were validated with). A manager can
-            # opt out: MiniMax-M3's coalesces an index-K pool into its KV
-            # pages and exposes only synthetic AttentionOp tensors, which the
-            # dense Eagle3 drafter cannot attend against, so it requires the
-            # separate draft manager even under attention DP.
+            # opt out entirely. Preserve this existing route exactly; the
+            # aggregated-only policy below does not claim to validate legacy
+            # attention-DP or disaggregated tree relocation.
             logger.info("Attention DP: draft layers share the target KV "
                         "cache manager.")
             return False
-        return should_use_separate_draft_kv_cache(self._speculative_config)
+
+        supports_aggregated_shared = getattr(
+            self._kv_cache_manager_cls,
+            'supports_aggregated_shared_draft_layers', False)
+        if (use_separate and not self._is_disagg
+                and supports_aggregated_shared):
+            config_policy = getattr(self._kv_cache_manager_cls,
+                                    'supports_aggregated_shared_draft_config',
+                                    None)
+            config_supported = (config_policy(self._speculative_config)
+                                if config_policy is not None else True)
+            if not config_supported:
+                # This is the pre-existing aggregated route. Keeping its
+                # separate manager avoids expanding the new shared path to
+                # unvalidated non-contiguous relocation configurations.
+                logger.warning(
+                    "Aggregated shared draft KV is not supported for this "
+                    "speculative configuration; preserving the separate "
+                    "draft manager.")
+                return True
+            disable_env = getattr(self._kv_cache_manager_cls,
+                                  'aggregated_shared_draft_disable_env', None)
+            if disable_env is not None and os.environ.get(disable_env,
+                                                          "0") == "1":
+                logger.warning(
+                    "Aggregated shared draft KV is disabled by %s=1; using "
+                    "a separate draft manager.", disable_env)
+                return True
+            logger.info(
+                "Aggregated draft layers share the target KV cache manager "
+                "under the model-specific compatibility policy.")
+            return False
+        return use_separate
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """

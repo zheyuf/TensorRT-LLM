@@ -26,7 +26,7 @@ Provides:
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -46,6 +46,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 
 from ....pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
 class MiniMaxM3SparseIndexCache:
@@ -200,6 +203,14 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     # attention addresses that pool through ``get_draft_subpage_view``.
     supports_shared_draft_layers = True
 
+    # Aggregated, attention-TP deployments may use the same shared layout,
+    # provided the speculative configuration passes
+    # ``supports_aggregated_shared_draft_config`` below. Keep the disable
+    # variable as a rollback switch for the new aggregated routing; neither
+    # hook alters the previously supported disaggregated/attention-DP route.
+    supports_aggregated_shared_draft_layers = True
+    aggregated_shared_draft_disable_env = "TRTLLM_M3_DISABLE_AGG_SHARED_DRAFT_KV"
+
     # WAR: the Eagle draft kernels break at tokens_per_block=128 (the MSA
     # target's page size) — the SM103 context cubin is missing (its unfused
     # fallback demands a multi-TiB workspace) and the generation kernel hits
@@ -214,6 +225,36 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     #      directly (validated at acceptance parity, PR #17457).
     draft_manager_tokens_per_block = 32
     _main_kv_layout = "NHD"
+
+    @staticmethod
+    def supports_aggregated_shared_draft_config(
+        speculative_config: Optional["DecodingBaseConfig"],
+    ) -> bool:
+        """Whether the new aggregated route can use the shared M3 pool.
+
+        Static and dynamic trees can accept a non-contiguous path and invoke
+        KV relocation. The MSA backend overrides ``_main_kv_layout`` to HND at
+        runtime, but relocation is still incompatible for two independent
+        reasons. First, the draft attention view writes each P128 allocation
+        through flat ``[subpage, H, P32, D]`` blocks, whereas relocation's
+        :class:`KVBlockArray` reinterprets it as ``[H, P128, D]``; these byte
+        offsets differ when a rank has more than one KV head (for example M3
+        TP2 has H=2). Second, relocation constructs uniform per-layer pools
+        and ignores M3's pool mapping and coalesced mega-slot stride. The
+        AgentX configuration is a three-token linear chain, which only accepts
+        a contiguous prefix and therefore never requests relocation.
+        """
+        if speculative_config is None:
+            return False
+        mode = speculative_config.spec_dec_mode
+        return (
+            mode.is_eagle3_one_model()
+            and speculative_config.max_draft_len == 3
+            and speculative_config.max_total_draft_tokens == 3
+            and getattr(speculative_config, "eagle_choices", None) is None
+            and not bool(getattr(speculative_config, "use_dynamic_tree", False))
+            and getattr(speculative_config, "sa_config", None) is None
+        )
 
     def __init__(
         self,
