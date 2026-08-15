@@ -21,6 +21,7 @@ import pytest
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.cache_manager import (
     MiniMaxM3KVCacheManagerV2,
 )
+from tensorrt_llm._torch.pyexecutor import _util as kv_util
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 
 _DISABLE_ENV = MiniMaxM3KVCacheManagerV2.aggregated_shared_draft_disable_env
@@ -91,9 +92,15 @@ def test_linear_agentx_config_shares_in_aggregated_attention_tp(
 
 def test_emergency_disable_uses_separate_manager(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(_DISABLE_ENV, "1")
+    warning = Mock()
+    monkeypatch.setattr(kv_util.logger, "warning", warning)
     creator = _make_creator(MiniMaxM3KVCacheManagerV2)
 
     assert creator._should_create_separate_draft_kv_cache()
+    warning.assert_called_once_with(
+        "Aggregated shared draft KV is disabled by "
+        "TRTLLM_M3_DISABLE_AGG_SHARED_DRAFT_KV=1; using a separate draft manager."
+    )
 
 
 def test_aggregated_route_is_model_scoped(monkeypatch: pytest.MonkeyPatch) -> None:

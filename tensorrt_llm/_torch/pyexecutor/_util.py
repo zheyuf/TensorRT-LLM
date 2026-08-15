@@ -1182,8 +1182,8 @@ class KvCacheCreator:
             if disable_env is not None and os.environ.get(disable_env,
                                                           "0") == "1":
                 logger.warning(
-                    "Aggregated shared draft KV is disabled by %s=1; using "
-                    "a separate draft manager.", disable_env)
+                    f"Aggregated shared draft KV is disabled by {disable_env}=1; "
+                    "using a separate draft manager.")
                 return True
             logger.info(
                 "Aggregated draft layers share the target KV cache manager "
