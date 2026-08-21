@@ -769,9 +769,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         description=
         "Sparse GQA backend for pure-decode batches under the MSA implementation. "
         "'default' retains the Triton decode route, 'msa' always uses the "
-        "preplanned fmha_sm100 route, and 'adaptive' uses Triton for rank-local "
-        "decode batch sizes 1-7 and MSA for batch sizes >= 8. Mixed batches keep "
-        "their existing Triton generation suffix.",
+        "preplanned fmha_sm100 route, and 'adaptive' profiles both routes once "
+        "per exact CUDA-graph shape and caches the faster tactic. Mixed batches "
+        "keep their existing Triton generation suffix.",
         status="prototype",
     )
 

@@ -38,7 +38,7 @@ from .common import (
     MiniMaxM3SparseConfig,
     MiniMaxM3SparseMetadataParams,
     build_paged_kv_slot_mapping,
-    use_msa_sparse_decode,
+    needs_msa_sparse_decode_plan,
     write_kv_slots,
 )
 from .msa_indexer import MsaIndexer, cutedsl_score_runner
@@ -989,7 +989,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             span is not None
             and not span.is_mixed
             and self._msa_params is not None
-            and use_msa_sparse_decode(self._msa_params.decode_backend, span.batch)
+            and needs_msa_sparse_decode_plan(self._msa_params.decode_backend)
         )
 
     def _msa_fmha_plan_rows(self) -> Optional[Tuple[int, int]]:

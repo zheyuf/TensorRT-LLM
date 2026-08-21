@@ -17,8 +17,7 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import (
-    MSA_SPARSE_DECODE_MIN_MBS,
-    use_msa_sparse_decode,
+    needs_msa_sparse_decode_plan,
     write_kv_slots,
 )
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_scatter import (
@@ -51,23 +50,21 @@ def test_resolver_selects_msa_backend_when_available(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("decode_backend", "rank_local_batch_size", "expected"),
+    ("decode_backend", "expected"),
     [
-        ("default", 1, False),
-        ("default", 64, False),
-        ("msa", 1, True),
-        ("adaptive", MSA_SPARSE_DECODE_MIN_MBS - 1, False),
-        ("adaptive", MSA_SPARSE_DECODE_MIN_MBS, True),
+        ("default", False),
+        ("msa", True),
+        ("adaptive", True),
     ],
 )
 def test_sparse_decode_backend_policy_is_explicit_and_lowered(
-    decode_backend, rank_local_batch_size, expected
+    decode_backend, expected
 ):
     cfg = MiniMaxM3SparseAttentionConfig(implementation="msa", decode_backend=decode_backend)
 
     assert cfg.to_sparse_params().decode_backend == decode_backend
     assert cfg.to_sparse_metadata_params().decode_backend == decode_backend
-    assert use_msa_sparse_decode(decode_backend, rank_local_batch_size) is expected
+    assert needs_msa_sparse_decode_plan(decode_backend) is expected
 
 
 @pytest.mark.parametrize("decode_backend", ["msa", "adaptive"])
@@ -76,21 +73,81 @@ def test_nondefault_decode_backend_requires_msa_implementation(decode_backend):
         MiniMaxM3SparseAttentionConfig(implementation="triton", decode_backend=decode_backend)
 
 
+@pytest.mark.parametrize("tactic", [-1, "triton", "msa"])
+def test_sparse_decode_tunable_runner_dispatches_and_falls_back_to_triton(
+    monkeypatch, tactic
+):
+    from tensorrt_llm._torch.attention_backend.fmha import msa_sparse_gqa
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
+        sparse_decode_autotuner,
+        triton_sparse_decode,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        triton_sparse_decode,
+        "minimax_m3_sparse_attn_decode",
+        lambda q_arg, *args, **kwargs: calls.append(("triton", tuple(q_arg.shape))),
+    )
+    monkeypatch.setattr(
+        msa_sparse_gqa,
+        "run_msa_sparse_gqa",
+        lambda q_arg, *args, **kwargs: calls.append(("msa", tuple(q_arg.shape))),
+    )
+
+    batch_size = 2
+    decode_query_len = 4
+    total_q = batch_size * decode_query_len
+    num_q_heads = 2
+    num_kv_heads = 1
+    head_dim = page_size = 128
+    topk = 16
+    q = torch.zeros(total_q, num_q_heads, head_dim, dtype=torch.bfloat16)
+    k_paged = torch.zeros(2, num_kv_heads, page_size, head_dim, dtype=torch.bfloat16)
+    v_paged = torch.zeros_like(k_paged)
+    block_indexes = torch.zeros(total_q, num_kv_heads, topk, dtype=torch.int32)
+    block_table = torch.zeros(batch_size, 2, dtype=torch.int32)
+    seq_lens = torch.ones(batch_size, dtype=torch.int32)
+    output = torch.empty_like(q)
+    runner = sparse_decode_autotuner.MiniMaxM3SparseDecodeRunner(
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        topk=topk,
+        decode_query_len=decode_query_len,
+        q_dtype=q.dtype,
+        kv_dtype=k_paged.dtype,
+        output_dtype=output.dtype,
+        sm_scale=head_dim**-0.5,
+    )
+
+    runner(
+        [q, k_paged, v_paged, block_indexes, block_table, seq_lens, output],
+        tactic=tactic,
+        plan=object(),
+    )
+
+    expected = "triton" if tactic == -1 else tactic
+    assert calls == [(expected, (total_q, num_q_heads, head_dim))]
+
+
 @pytest.mark.parametrize(
     ("decode_backend", "rank_local_batch_size", "expected_backend"),
     [
         ("default", 16, "triton"),
         ("msa", 1, "msa"),
-        ("adaptive", MSA_SPARSE_DECODE_MIN_MBS - 1, "triton"),
-        ("adaptive", MSA_SPARSE_DECODE_MIN_MBS, "msa"),
+        ("adaptive", 1, "adaptive"),
+        ("adaptive", 16, "adaptive"),
     ],
 )
-def test_pure_decode_dispatches_by_rank_local_batch_size(
+def test_pure_decode_dispatches_by_configured_policy(
     monkeypatch, decode_backend, rank_local_batch_size, expected_backend
 ):
     from tensorrt_llm._torch.attention_backend.fmha import msa_sparse_gqa
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
         msa_utils,
+        sparse_decode_autotuner,
         triton_sparse_decode,
     )
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
@@ -112,6 +169,11 @@ def test_pure_decode_dispatches_by_rank_local_batch_size(
         msa_sparse_gqa,
         "run_msa_sparse_gqa",
         lambda q_arg, *args, **kwargs: calls.append(("msa", int(q_arg.shape[0]))),
+    )
+    monkeypatch.setattr(
+        sparse_decode_autotuner,
+        "run_adaptive_sparse_decode",
+        lambda q_arg, *args, **kwargs: calls.append(("adaptive", int(q_arg.shape[0]))),
     )
 
     attention = SimpleNamespace(
@@ -143,7 +205,7 @@ def test_pure_decode_dispatches_by_rank_local_batch_size(
         msa_qo_offset_cpu=torch.zeros(rank_local_batch_size, dtype=torch.int32),
     )
     topk = torch.zeros(rank_local_batch_size, num_kv_heads, 16, dtype=torch.int32)
-    plan = object() if expected_backend == "msa" else None
+    plan = object() if expected_backend in ("msa", "adaptive") else None
 
     msa_sparse_gqa.run_msa_paged_gqa(
         attention,
@@ -940,8 +1002,8 @@ def test_resolve_decode_kernels_commits_on_uniform_decode(monkeypatch):
     ("decode_backend", "batch_size", "uses_msa"),
     [
         ("default", 16, False),
-        ("adaptive", MSA_SPARSE_DECODE_MIN_MBS - 1, False),
-        ("adaptive", MSA_SPARSE_DECODE_MIN_MBS, True),
+        ("adaptive", 1, True),
+        ("adaptive", 16, True),
         ("msa", 1, True),
     ],
 )
