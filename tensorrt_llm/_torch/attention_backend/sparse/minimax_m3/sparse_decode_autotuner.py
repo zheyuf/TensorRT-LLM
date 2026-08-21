@@ -88,7 +88,7 @@ class MiniMaxM3SparseDecodeRunner(TunableRunner):
         **kwargs,
     ) -> List[Any]:
         del inputs, profile, kwargs
-        return ["triton", "msa"]
+        return ["msa"]
 
     def forward(
         self,
