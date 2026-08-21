@@ -88,7 +88,10 @@ class MiniMaxM3SparseDecodeRunner(TunableRunner):
         **kwargs,
     ) -> List[Any]:
         del inputs, profile, kwargs
-        return ["triton", "msa"]
+        # Diagnostic control: retain adaptive metadata preparation, plan
+        # construction, cache seeding, and CUDA-graph capture, but never embed
+        # an MSA execution node. This isolates MSA execution from its plumbing.
+        return ["triton"]
 
     def forward(
         self,
