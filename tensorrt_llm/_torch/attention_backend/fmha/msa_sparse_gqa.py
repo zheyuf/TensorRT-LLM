@@ -205,6 +205,7 @@ def run_msa_paged_gqa(
             sm_scale=sm_scale,
             decode_query_len=decode_query_len,
             plan=plan,
+            is_cuda_graph_metadata=metadata.is_cuda_graph,
         )
         return
 

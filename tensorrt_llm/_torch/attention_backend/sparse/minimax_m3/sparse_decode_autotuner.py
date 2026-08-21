@@ -119,9 +119,7 @@ class MiniMaxM3SparseDecodeRunner(TunableRunner):
             )
             return output
         if tactic == "msa":
-            from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import (
-                run_msa_sparse_gqa,
-            )
+            from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_sparse_gqa
 
             use_fp8 = k_paged.dtype == torch.float8_e4m3fn
             msa_q = q
@@ -160,19 +158,19 @@ def run_adaptive_sparse_decode(
     sm_scale: float,
     decode_query_len: int,
     plan: tuple,
+    is_cuda_graph_metadata: bool,
 ) -> None:
     """Profile once per exact shape, cache the winner, and run it.
 
-    The first non-capturing CUDA call for a shape is the tuning point.  CUDA
-    graph warmup provides exactly such a call before capture.  During capture,
-    a cache miss deliberately takes AutoTuner's Triton fallback instead of
-    attempting nested profiling; the captured graph therefore never changes
-    tactic across replays.
+    Only a non-capturing call made with CUDA-graph metadata may seed the cache.
+    Eager startup warmups can have the same tensor shapes but nonrepresentative
+    sequence lengths, so allowing them to profile could poison the tactic later
+    embedded in the graph.  During capture, a cache miss deliberately takes
+    AutoTuner's Triton fallback instead of attempting nested profiling; the
+    captured graph therefore never changes tactic across replays.
     """
     if plan is None:
-        raise RuntimeError(
-            "MiniMax-M3 adaptive sparse decode requires a preplanned MSA GQA plan."
-        )
+        raise RuntimeError("MiniMax-M3 adaptive sparse decode requires a preplanned MSA GQA plan.")
 
     runner = MiniMaxM3SparseDecodeRunner(
         num_q_heads=int(q.shape[1]),
@@ -200,7 +198,8 @@ def run_adaptive_sparse_decode(
     # does not run that coordinator, so PP configurations conservatively keep
     # the Triton fallback until graph-tuning orchestration supports them.
     can_profile = (
-        q.is_cuda
+        is_cuda_graph_metadata
+        and q.is_cuda
         and not torch.cuda.is_current_stream_capturing()
         and not tuner.mapping.has_pp()
     )
@@ -223,10 +222,12 @@ def run_adaptive_sparse_decode(
             plan=plan,
         )
     selected_tactic = "triton" if tactic == -1 else tactic
-    logger.info_once(
-        "MiniMax-M3 adaptive sparse decode selected "
-        f"{selected_tactic} for B={int(block_table.shape[0])}, "
-        f"DQL={decode_query_len}, local HQ/HKV={int(q.shape[1])}/{int(k_paged.shape[1])}.",
-        key=(_CUSTOM_OP, tuning_key),
-    )
+    if cache_hit or should_profile:
+        logger.info_once(
+            "MiniMax-M3 adaptive sparse decode selected "
+            f"{selected_tactic} for B={int(block_table.shape[0])}, "
+            f"DQL={decode_query_len}, total_q={int(q.shape[0])}, "
+            f"local HQ/HKV={int(q.shape[1])}/{int(k_paged.shape[1])}.",
+            key=(_CUSTOM_OP, tuning_key, selected_tactic),
+        )
     runner(inputs, tactic=tactic, plan=plan)
