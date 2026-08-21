@@ -33,16 +33,21 @@ def test_only_graph_warmup_can_seed_adaptive_tuning(
         ),
         mapping=SimpleNamespace(has_pp=lambda: False),
         is_tuning_mode=False,
-        choose_one=lambda *args, **kwargs: (args[1][0], -1),
     )
     fallback_tactics = []
     tuning_calls = []
+    choose_calls = []
 
     def record_autotune():
         tuning_calls.append(True)
         return contextlib.nullcontext()
 
+    def choose_one(*args, **kwargs):
+        choose_calls.append(True)
+        return args[1][0], -1
+
     monkeypatch.setattr(sparse_decode_autotuner.AutoTuner, "get", lambda: tuner)
+    tuner.choose_one = choose_one
     monkeypatch.setattr(
         sparse_decode_autotuner.torch.cuda,
         "is_current_stream_capturing",
@@ -80,6 +85,7 @@ def test_only_graph_warmup_can_seed_adaptive_tuning(
 
     assert fallback_tactics == [-1]
     assert len(tuning_calls) == expected_tuning_calls
+    assert len(choose_calls) == expected_tuning_calls
     assert len(sparse_decode_autotuner._ATTEMPTED_TUNING_KEYS) == expected_tuning_calls
 
 

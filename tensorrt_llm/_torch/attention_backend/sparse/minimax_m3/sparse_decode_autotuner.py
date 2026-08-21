@@ -193,6 +193,13 @@ def run_adaptive_sparse_decode(
         input_shapes,
         runner.tuning_config,
     )
+    if not cache_hit and not is_cuda_graph_metadata:
+        # An eager startup warmup is intentionally ineligible to seed a tactic.
+        # Bypass choose_one() on its miss so AutoTuner does not report the
+        # expected Triton fallback as a graph-setup cache failure.
+        runner(inputs, tactic=-1, plan=plan)
+        return
+
     tuning_key = _tuning_key(runner, inputs)
     # AutoTuner's tune context performs pipeline cache handoff.  Graph warmup
     # does not run that coordinator, so PP configurations conservatively keep
