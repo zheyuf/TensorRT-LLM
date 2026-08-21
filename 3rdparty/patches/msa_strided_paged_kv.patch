@@ -897,6 +897,21 @@ index 0fdcbfa..c577f34 100644
                : -1;
            page_for_lookup = (sparse_idx >= 0) ? sparse_idx : 0;
          } else {
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+@@ -216,4 +216,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
+   CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
+-// #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+-//     asm volatile("griddepcontrol.wait;");
+-// #endif
++#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++    // FMHA::run launches this kernel with programmatic stream serialization.
++    // The immediately preceding sparse block selector produces
++    // kv_block_indexes, so no global input is safe to consume until the PDL
++    // dependency has completed and its writes are visible.
++    cudaGridDependencySynchronize();
++#endif
 diff --git a/tests/regression/test_noncontiguous_sparse_block_indexes.py b/tests/regression/test_noncontiguous_sparse_block_indexes.py
 new file mode 100644
 index 0000000..6a162b0
