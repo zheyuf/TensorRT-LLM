@@ -224,6 +224,13 @@ class _MsaGraphSafePlan:
     def __init__(self, metadata, name: str, *, max_batch: int, num_ctas: int, capture_graph: bool):
         buffers = metadata.cuda_graph_buffers
         self._buf = {}
+        # CUDA-graph metadata instances share one global Buffers pool. Most
+        # metadata tensors can safely share a named backing block because they
+        # are refreshed before every replay. A cached plan deliberately skips
+        # that refresh, so each owner needs private backing storage; otherwise
+        # capturing another batch bucket overwrites this owner's worklist while
+        # its local signature still reports a cache hit.
+        buffer_namespace = f"{name}_{id(self):x}"
         # Set by refresh(), read through the plan property.
         self._plan: Optional[tuple] = None
         # A graph metadata instance belongs to one batch/DQL capture key. The
@@ -249,7 +256,7 @@ class _MsaGraphSafePlan:
             self._buf[key] = metadata.get_empty(
                 buffers,
                 shape,
-                cache_name=f"{name}_{key}",
+                cache_name=f"{buffer_namespace}_{key}",
                 dtype=dtype,
                 capture_graph=capture_graph,
             )
@@ -424,6 +431,38 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        # create_cuda_graph_metadata() shallow-copies the eager metadata before
+        # calling this hook. Per-instance cached plans and live step state must
+        # never survive that copy: a graph key owns its plan cache and captured
+        # resolution independently.
+        self.msa_out_cache_loc = None
+        self.msa_kv_indices = None
+        self.msa_max_score = None
+        self.msa_n_valid_blocks = None
+        self.msa_block_table = None
+        self.msa_seq_lens_cuda = None
+        self.msa_subpage_block_table = None
+        self.msa_kv_lens_staged = None
+        self.msa_req_to_token = None
+        self.msa_q_batch_row = None
+        self.msa_q_intra = None
+        self.msa_qo_lens_dev = None
+        self._msa_subpages_per_slot = 0
+        self._msa_prewritten_layer = None
+        self._msa_buffers_ready = False
+        self._msa_fields_ready = False
+        self._msa_proxy_plan = None
+        self._msa_gqa_plan = None
+        self._msa_dense_plan = None
+        self._msa_eager_proxy_plan = None
+        self._msa_eager_gqa_plan = None
+        self._msa_eager_dense_plan = None
+        self._msa_eager_n_valid_buf = None
+        self._msa_eager_n_valid_blocks = None
+        self._msa_decode_span = None
+        self._msa_max_kv_len = 0
+        self._msa_worst_case_max_k_tiles = 0
+        self._msa_captured_resolution = None
         params = self.sparse_metadata_params
         self._msa_params = params if isinstance(params, MiniMaxM3SparseMetadataParams) else None
         # See on_update_kv_lens.
@@ -1353,31 +1392,17 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             ),
         )
 
-        # Allocate the graph-safe plan owners once per metadata; later steps
-        # only refresh their contents below. The plan worklists are sized per
+        # Pure decode keeps the proxy and dense sites on ported kernels, so only
+        # sparse GQA needs a graph-safe plan owner. The worklist is sized per
         # expanded row (the planner splits qo_len > 1 requests into per-token
         # rows under speculative multi-token verify), so use the worst-case
         # decode-step token count rather than the batch size.
-        if self._msa_proxy_plan is None:
+        if self._msa_gqa_plan is None:
             max_plan_rows = max(max_batch, self._msa_max_decode_tokens())
             num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
-            self._msa_proxy_plan = _MsaGraphSafePlan(
-                self,
-                "msa_proxy_plan",
-                max_batch=max_plan_rows,
-                num_ctas=num_ctas,
-                capture_graph=capture_graph,
-            )
             self._msa_gqa_plan = _MsaGraphSafePlan(
                 self,
                 "msa_gqa_plan",
-                max_batch=max_plan_rows,
-                num_ctas=num_ctas,
-                capture_graph=capture_graph,
-            )
-            self._msa_dense_plan = _MsaGraphSafePlan(
-                self,
-                "msa_dense_plan",
                 max_batch=max_plan_rows,
                 num_ctas=num_ctas,
                 capture_graph=capture_graph,

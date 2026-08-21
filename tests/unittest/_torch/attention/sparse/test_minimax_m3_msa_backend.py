@@ -9,6 +9,7 @@ Numerical parity against the Triton reference is covered by the SM100
 integration accuracy test.
 """
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -39,6 +40,66 @@ def test_sparse_decode_fixed_stride_page_indptr_matches_expanded_rows():
         torch.tensor([2, 1], dtype=torch.int32), page_table_stride=8
     )
     assert indptr.tolist() == [0, 0, 8, 16]
+
+
+def test_graph_safe_plan_owners_do_not_alias_shared_buffer_names():
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
+        _MsaGraphSafePlan,
+    )
+
+    class ReusingMetadata:
+
+        def __init__(self):
+            self.cuda_graph_buffers = {}
+            self.buffers = {}
+
+        def get_empty(self, buffers, shape, *, cache_name, dtype, capture_graph):
+            del buffers, capture_graph
+            if cache_name not in self.buffers:
+                self.buffers[cache_name] = torch.empty(shape, dtype=dtype)
+            return self.buffers[cache_name]
+
+    metadata = ReusingMetadata()
+    first = _MsaGraphSafePlan(
+        metadata, "msa_gqa_plan", max_batch=4, num_ctas=8, capture_graph=True
+    )
+    second = _MsaGraphSafePlan(
+        metadata, "msa_gqa_plan", max_batch=4, num_ctas=8, capture_graph=True
+    )
+
+    first_ptrs = {tensor.data_ptr() for tensor in first._buf.values()}
+    second_ptrs = {tensor.data_ptr() for tensor in second._buf.values()}
+    assert first_ptrs.isdisjoint(second_ptrs)
+
+
+def test_post_init_drops_shallow_copied_plan_and_step_state(monkeypatch):
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
+        MiniMaxM3MsaSparseAttentionMetadata,
+    )
+    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+
+    monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", lambda self: None)
+    monkeypatch.setattr(
+        MiniMaxM3MsaSparseAttentionMetadata, "_create_msa_buffers", lambda self: None
+    )
+    source = MiniMaxM3MsaSparseAttentionMetadata.__new__(
+        MiniMaxM3MsaSparseAttentionMetadata
+    )
+    sentinel = object()
+    source.sparse_metadata_params = None
+    source._msa_gqa_plan = sentinel
+    source._msa_eager_gqa_plan = sentinel
+    source._msa_decode_span = sentinel
+    source._msa_captured_resolution = sentinel
+
+    graph_metadata = copy.copy(source)
+    graph_metadata.__post_init__()
+
+    assert source._msa_gqa_plan is sentinel
+    assert graph_metadata._msa_gqa_plan is None
+    assert graph_metadata._msa_eager_gqa_plan is None
+    assert graph_metadata._msa_decode_span is None
+    assert graph_metadata._msa_captured_resolution is None
 
 
 def test_resolver_selects_msa_backend_when_available(monkeypatch):
