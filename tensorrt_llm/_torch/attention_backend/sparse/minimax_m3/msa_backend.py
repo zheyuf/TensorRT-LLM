@@ -97,9 +97,10 @@ def _worst_case_proxy_max_k_tiles(
 
 
 # Per-step fmha_sm100 plan tensors that must live in CUDA-graph-stable buffers.
-# At num_kv_splits=1 the plan carries no split-KV workspaces, and
-# cute_workspace_buffer is the vendor's cached scratch (kept by reference, not
-# copied).
+# At num_kv_splits=1 the plan carries no split-KV workspaces. The vendor's
+# cute_workspace_buffer is handled separately: upstream caches one mutable
+# scratch allocation per device, so every graph owner must replace it with
+# private storage before capture/replay.
 _MSA_PLAN_STABLE_KEYS = (
     "packed_work_range",
     "packed_work_info",
@@ -217,8 +218,8 @@ class _MsaGraphSafePlan:
     change across replays. Mirrors FlashInfer's fixed indptr/indices buffers.
 
     Only valid at num_kv_splits=1: the plan then has no split-KV workspaces
-    (refresh() asserts this), and cute_workspace_buffer and the scalar fields
-    pass through unchanged.
+    (refresh() asserts this). Scalar fields pass through unchanged, while the
+    vendor-global CUTLASS workspace is replaced by graph-owner-private storage.
     """
 
     def __init__(self, metadata, name: str, *, max_batch: int, num_ctas: int, capture_graph: bool):
@@ -230,7 +231,10 @@ class _MsaGraphSafePlan:
         # that refresh, so each owner needs private backing storage; otherwise
         # capturing another batch bucket overwrites this owner's worklist while
         # its local signature still reports a cache hit.
-        buffer_namespace = f"{name}_{id(self):x}"
+        self._metadata = metadata
+        self._buffers = buffers
+        self._capture_graph = capture_graph
+        self._buffer_namespace = f"{name}_{id(self):x}"
         # Set by refresh(), read through the plan property.
         self._plan: Optional[tuple] = None
         # A graph metadata instance belongs to one batch/DQL capture key. The
@@ -239,9 +243,12 @@ class _MsaGraphSafePlan:
         # signature still matches.
         self._cached_plan: Optional[tuple] = None
         self._cached_signature: Optional[tuple] = None
-        # cute_workspace_buffer must keep a fixed address across steps for the
-        # captured graph to replay correctly. Pin it on first use and fail if
-        # it moves.
+        # MSA's Python API returns one global 32 MiB workspace per CUDA device.
+        # CUTLASS mutates that workspace in initialize()/run(), so sharing it
+        # across concurrently replayed graph buckets is an asynchronous data
+        # race. Lazily allocate a private mirror once the vendor reports its
+        # exact shape/dtype, then keep that address fixed for this owner.
+        self._workspace: Optional[torch.Tensor] = None
         self._ws_ptr: Optional[int] = None
         for key in _MSA_PLAN_STABLE_KEYS:
             if key == "packed_work_range":
@@ -256,7 +263,7 @@ class _MsaGraphSafePlan:
             self._buf[key] = metadata.get_empty(
                 buffers,
                 shape,
-                cache_name=f"{buffer_namespace}_{key}",
+                cache_name=f"{self._buffer_namespace}_{key}",
                 dtype=dtype,
                 capture_graph=capture_graph,
             )
@@ -289,16 +296,34 @@ class _MsaGraphSafePlan:
                     f"MSA decode plan used split-KV workspace {key!r}; num_kv_splits=1 "
                     "is required for graph-safe decode."
                 )
+        rebuilt = dict(decode)
         ws = decode.get("cute_workspace_buffer")
         if ws is not None:
-            if self._ws_ptr is None:
-                self._ws_ptr = ws.data_ptr()
-            elif ws.data_ptr() != self._ws_ptr:
-                raise RuntimeError(
-                    "cute_workspace_buffer moved across steps; the fmha_sm100 plan "
-                    "is not CUDA-graph safe."
+            if self._workspace is None:
+                self._workspace = self._metadata.get_empty(
+                    self._buffers,
+                    tuple(ws.shape),
+                    cache_name=f"{self._buffer_namespace}_cute_workspace_buffer",
+                    dtype=ws.dtype,
+                    capture_graph=self._capture_graph,
                 )
-        rebuilt = dict(decode)
+                self._ws_ptr = self._workspace.data_ptr()
+            if (
+                self._workspace.shape != ws.shape
+                or self._workspace.dtype != ws.dtype
+                or self._workspace.device != ws.device
+            ):
+                raise RuntimeError(
+                    "cute_workspace_buffer geometry changed after graph-owner-private "
+                    f"allocation: private={tuple(self._workspace.shape)}/"
+                    f"{self._workspace.dtype}/{self._workspace.device}, vendor="
+                    f"{tuple(ws.shape)}/{ws.dtype}/{ws.device}."
+                )
+            if self._workspace.data_ptr() != self._ws_ptr:
+                raise RuntimeError(
+                    "Graph-owner-private cute_workspace_buffer moved across steps."
+                )
+            rebuilt["cute_workspace_buffer"] = self._workspace
         stable_overrides = stable_overrides or {}
         for key in _MSA_PLAN_STABLE_KEYS:
             src = stable_overrides.get(key, decode.get(key))

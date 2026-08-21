@@ -71,6 +71,30 @@ def test_graph_safe_plan_owners_do_not_alias_shared_buffer_names():
     second_ptrs = {tensor.data_ptr() for tensor in second._buf.values()}
     assert first_ptrs.isdisjoint(second_ptrs)
 
+    # Upstream fmha_sm100 returns one mutable CUTLASS workspace per device.
+    # Refreshing two graph owners from that same source must replace it with
+    # two private, graph-stable allocations.
+    shared_workspace = torch.empty(1024, dtype=torch.uint8)
+
+    def plan(owner):
+        decode = {
+            key: torch.zeros_like(value)
+            for key, value in owner._buf.items()
+        }
+        decode["cute_workspace_buffer"] = shared_workspace
+        return (False, 0, 4, decode, None)
+
+    first_plan = first.refresh(plan(first), cache_signature=(4,))
+    second_plan = second.refresh(plan(second), cache_signature=(4,))
+    first_workspace = first_plan[3]["cute_workspace_buffer"]
+    second_workspace = second_plan[3]["cute_workspace_buffer"]
+    assert first_workspace.data_ptr() != shared_workspace.data_ptr()
+    assert second_workspace.data_ptr() != shared_workspace.data_ptr()
+    assert first_workspace.data_ptr() != second_workspace.data_ptr()
+    assert first.reuse_sparse_decode((4,))[3]["cute_workspace_buffer"].data_ptr() == (
+        first_workspace.data_ptr()
+    )
+
 
 def test_post_init_drops_shallow_copied_plan_and_step_state(monkeypatch):
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
