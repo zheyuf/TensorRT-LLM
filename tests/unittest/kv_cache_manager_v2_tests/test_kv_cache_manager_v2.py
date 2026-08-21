@@ -529,6 +529,146 @@ class TestNoBatching(TestKVCacheManagerV2):
         # This also tests eviction to disk.
         self.assertRaises(OutOfPagesError, lambda: self.run_naive(seq_len + 1, 1, False))
 
+    def test_gpu_prefetch_allows_resident_cache_to_bypass_resume_threshold(self) -> None:
+        self.cfg = create_config(32, 32 << 20, 32 << 20, 1 << 30, 36, 128, 1, 32768)
+        self.cfg.max_util_for_resume = 0.3
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+        seq_len = 32 * 8
+
+        target = self.new_request(0, None, 32, seq_len - 32)
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            self.assertTrue(target.kv_cache.resume(stream))
+            self.run_request(target, 32, False)
+        stream_holder.take_finish_event()
+        target.kv_cache.suspend()
+
+        # Keep another suspended cache as an eviction victim.  The active
+        # filler then raises non-evictable utilization above the resume gate
+        # and pushes at least part of the older target into a lower tier.
+        victim = self.new_request(1, None, 32, seq_len - 32)
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            self.assertTrue(victim.kv_cache.resume(stream))
+            self.run_request(victim, 32, False)
+        stream_holder.take_finish_event()
+        victim.kv_cache.suspend()
+
+        filler = self.new_request(2, None, 32, seq_len - 32)
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            self.assertTrue(filler.kv_cache.resume(stream))
+            self.run_request(filler, 32, False)
+        stream_holder.take_finish_event()
+
+        target_counts, _ = _introspection.active_page_stats(target.kv_cache)
+        self.assertGreater(sum(target_counts[1:]), 0)
+        self.assertTrue(target.kv_cache.needs_gpu_prefetch)
+        self.assertGreater(
+            max(_introspection.storage_utilization(self.manager, GPU_LEVEL)),
+            self.cfg.max_util_for_resume,
+        )
+
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            # The regular path is still rejected at this utilization.
+            self.assertFalse(target.kv_cache.resume(stream))
+            self.assertTrue(target.kv_cache.resume_blocked_by_utilization)
+            self.assertTrue(target.kv_cache.prefetch(GPU_LEVEL))
+            self.assertFalse(target.kv_cache.resume_blocked_by_utilization)
+            self.assertFalse(target.kv_cache.needs_gpu_prefetch)
+        stream_holder.take_finish_event()
+
+        # Force an intervening eviction of the prefetched target.  Its stale
+        # hint must not bypass the utilization guard.
+        self.assertTrue(victim.kv_cache.prefetch(GPU_LEVEL))
+        stale_counts, _ = _introspection.active_page_stats(target.kv_cache)
+        self.assertGreater(sum(stale_counts[1:]), 0)
+        self.assertTrue(target.kv_cache.needs_gpu_prefetch)
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            self.assertFalse(target.kv_cache.resume(stream))
+            self.assertTrue(target.kv_cache.resume_blocked_by_utilization)
+
+            # A fresh prefetch restores residency and enables the single-use
+            # bypass. resume() still waits on its ready event.
+            self.assertTrue(target.kv_cache.prefetch(GPU_LEVEL))
+            prefetched_counts, _ = _introspection.active_page_stats(target.kv_cache)
+            self.assertGreater(prefetched_counts[GPU_LEVEL], 0)
+            self.assertEqual(sum(prefetched_counts[1:]), 0)
+            self.assertFalse(target.kv_cache.needs_gpu_prefetch)
+            self.assertTrue(target.kv_cache.resume(stream))
+            self.assertFalse(target.kv_cache.needs_gpu_prefetch)
+        stream_holder.take_finish_event().synchronize()
+
+        target.kv_cache.close()
+        victim.kv_cache.close()
+        filler.kv_cache.close()
+
+    def test_gpu_partial_prefetch_makes_progress_when_full_request_does_not_fit(self) -> None:
+        self.cfg = create_config(
+            32, 32 << 20, 64 << 20, 1 << 30, 36, 128, 1, 32768
+        )
+        self.cfg.max_util_for_resume = 0.3
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+
+        def populate(request_id: int, num_blocks: int) -> "TestNoBatching.Request":
+            request = self.new_request(request_id, None, 32, 32 * (num_blocks - 1))
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                self.assertTrue(request.kv_cache.resume(stream))
+                self.run_request(request, 32, False)
+            stream_holder.take_finish_event()
+            return request
+
+        # The old target is evicted first. The much smaller suspended victim
+        # leaves a bounded amount of evictable GPU space while the filler stays
+        # active, so only a strict subset of the target can be recalled.
+        target = populate(0, 14)
+        target.kv_cache.suspend()
+        victim = populate(1, 2)
+        victim.kv_cache.suspend()
+        filler = populate(2, 14)
+
+        before_counts, _ = _introspection.active_page_stats(target.kv_cache)
+        self.assertGreater(sum(before_counts[1:]), 0)
+        result = target.kv_cache.prefetch_partial(GPU_LEVEL)
+        complete, pages, num_bytes, repeated, remaining = result
+        self.assertFalse(complete)
+        self.assertGreater(pages, 0)
+        self.assertGreater(num_bytes, 0)
+        self.assertEqual(repeated, 0)
+        self.assertGreater(remaining, 0)
+
+        partial_counts, _ = _introspection.active_page_stats(target.kv_cache)
+        self.assertGreater(partial_counts[GPU_LEVEL], before_counts[GPU_LEVEL])
+        total_pages, total_bytes, total_repeated, stale, lead_time_ns = (
+            target.kv_cache.partial_prefetch_stats
+        )
+        self.assertEqual(total_pages, pages)
+        self.assertEqual(total_bytes, num_bytes)
+        self.assertEqual(total_repeated, 0)
+        self.assertEqual(stale, 0)
+        self.assertGreaterEqual(lead_time_ns, 0)
+
+        # Releasing the active filler creates enough capacity for the second
+        # partial call to finish the request and arm the safe resume bypass.
+        filler.kv_cache.close()
+        complete, second_pages, _, _, remaining = target.kv_cache.prefetch_partial(GPU_LEVEL)
+        self.assertTrue(complete)
+        self.assertGreater(second_pages, 0)
+        self.assertEqual(remaining, 0)
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            self.assertTrue(target.kv_cache.resume(stream))
+            self.assertEqual(target.kv_cache.partial_prefetch_stats, (0, 0, 0, 0, 0))
+        stream_holder.take_finish_event().synchronize()
+
+        target.kv_cache.close()
+        victim.kv_cache.close()
+
     def test_resume_rejects_if_any_pool_group_exceeds_threshold(self) -> None:
         cfg = KVCacheManagerConfig(
             tokens_per_block=32,

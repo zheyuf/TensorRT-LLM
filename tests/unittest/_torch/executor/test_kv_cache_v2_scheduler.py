@@ -18,10 +18,12 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+import os
 from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import _PartialPrefetchResult
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
@@ -169,7 +171,13 @@ def make_kv_cache_manager(
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     mgr.suspend_request.return_value = None
+    mgr.prefetch_request_to_gpu_partial.return_value = _PartialPrefetchResult(
+        True, 4, 1024, 0, 0
+    )
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
+    mgr.request_needs_gpu_prefetch.side_effect = (
+        lambda req: not mgr.kv_cache_map[req.py_request_id].is_active
+    )
     return mgr
 
 
@@ -189,6 +197,7 @@ def make_scheduler(
     scheduler_capacity: int | None = None,
     no_schedule_until_state: LlmRequestState | None = None,
     no_schedule_after_state: LlmRequestState | None = None,
+    draft_kv_cache_manager: Mock | None = None,
     cross_kv_cache_manager: Mock | None = None,
     enable_prefix_aware_scheduling: bool = True,
 ) -> object:
@@ -206,6 +215,8 @@ def make_scheduler(
             kwargs["no_schedule_after_state"] = no_schedule_after_state
         if cross_kv_cache_manager is not None:
             kwargs["cross_kv_cache_manager"] = cross_kv_cache_manager
+        if draft_kv_cache_manager is not None:
+            kwargs["draft_kv_cache_manager"] = draft_kv_cache_manager
         return KVCacheV2Scheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -464,6 +475,125 @@ class TestKVCacheFailuresGen:
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 1
         assert out.generation_requests[0].request_id == 0
+
+    def test_suspended_generation_prefetch_is_default_off(self):
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: req.py_request_id == 0)
+        suspended = make_gen_request(1)
+        mgr.kv_cache_map[suspended.py_request_id].is_active = False
+        with patch.dict(os.environ, {"TLLM_V2_PREFETCH_SUSPENDED_GEN": "0"}):
+            sched = make_scheduler(mgr, max_num_tokens=100)
+
+        out = sched.schedule_request([make_gen_request(0), suspended], set())
+
+        assert ids(out.generation_requests) == [0]
+        mgr.prefetch_request_to_gpu_partial.assert_not_called()
+
+    def test_prefetches_first_lower_tier_suspended_generation(self):
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: req.py_request_id == 0)
+        suspended = make_gen_request(1)
+        mgr.kv_cache_map[suspended.py_request_id].is_active = False
+        with patch.dict(os.environ, {"TLLM_V2_PREFETCH_SUSPENDED_GEN": "1"}):
+            sched = make_scheduler(mgr, max_num_tokens=100)
+
+        out = sched.schedule_request([make_gen_request(0), suspended], set())
+
+        assert ids(out.generation_requests) == [0]
+        mgr.prefetch_request_to_gpu_partial.assert_called_once_with(suspended)
+
+    def test_prefetches_lower_tier_request_before_its_resume_is_attempted(self):
+        mgr = make_kv_cache_manager()
+        current = make_gen_request(0)
+        next_request = make_gen_request(1)
+        mgr.kv_cache_map[next_request.py_request_id].is_active = False
+        with patch.dict(os.environ, {"TLLM_V2_PREFETCH_SUSPENDED_GEN": "1"}):
+            sched = make_scheduler(mgr, max_num_tokens=1)
+
+        out = sched.schedule_request([current, next_request], set())
+
+        assert ids(out.generation_requests) == [current.py_request_id]
+        mgr.try_allocate_generation.assert_called_once_with(current)
+        mgr.prefetch_request_to_gpu_partial.assert_called_once_with(next_request)
+
+    def test_does_not_prefetch_suspended_generation_without_lower_tier_pages(self):
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: req.py_request_id == 0)
+        mgr.request_needs_gpu_prefetch.side_effect = None
+        mgr.request_needs_gpu_prefetch.return_value = False
+        suspended = make_gen_request(1)
+        mgr.kv_cache_map[suspended.py_request_id].is_active = False
+        with patch.dict(os.environ, {"TLLM_V2_PREFETCH_SUSPENDED_GEN": "1"}):
+            sched = make_scheduler(mgr, max_num_tokens=100)
+
+        out = sched.schedule_request([make_gen_request(0), suspended], set())
+
+        assert ids(out.generation_requests) == [0]
+        mgr.prefetch_request_to_gpu_partial.assert_not_called()
+
+    def test_skips_resident_request_and_prefetches_earliest_lower_tier_request(self):
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: req.py_request_id == 0)
+        resident = make_gen_request(1)
+        lower_tier = make_gen_request(2)
+        mgr.kv_cache_map[resident.py_request_id].is_active = False
+        mgr.kv_cache_map[lower_tier.py_request_id].is_active = False
+        mgr.request_needs_gpu_prefetch.side_effect = (
+            lambda req: req.py_request_id == lower_tier.py_request_id
+        )
+        with patch.dict(os.environ, {"TLLM_V2_PREFETCH_SUSPENDED_GEN": "1"}):
+            sched = make_scheduler(mgr, max_num_tokens=100)
+
+        out = sched.schedule_request(
+            [make_gen_request(0), resident, lower_tier],
+            set(),
+        )
+
+        assert ids(out.generation_requests) == [0]
+        mgr.prefetch_request_to_gpu_partial.assert_called_once_with(lower_tier)
+        assert [entry.args[0] for entry in mgr.request_needs_gpu_prefetch.call_args_list] == [
+            resident,
+            lower_tier,
+        ]
+
+    def test_does_not_prefetch_request_evicted_in_same_iteration(self):
+        calls = 0
+
+        def allocate(req: Mock) -> bool:
+            nonlocal calls
+            calls += 1
+            return calls == 1
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=allocate)
+        first = make_gen_request(0)
+        victim = make_gen_request(1)
+        mgr.request_needs_gpu_prefetch.return_value = True
+        mgr.request_needs_gpu_prefetch.side_effect = None
+        with patch.dict(os.environ, {"TLLM_V2_PREFETCH_SUSPENDED_GEN": "1"}):
+            sched = make_scheduler(mgr, max_num_tokens=100)
+
+        out = sched.schedule_request([first, victim], set())
+
+        assert ids(out.generation_requests) == [first.py_request_id]
+        assert victim in out.paused_requests
+        mgr.prefetch_request_to_gpu_partial.assert_not_called()
+
+    def test_draft_prefetch_failure_does_not_arm_main_prefetch(self):
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: req.py_request_id == 0)
+        draft_mgr = make_kv_cache_manager()
+        draft_mgr.prefetch_request_to_gpu_partial.return_value = _PartialPrefetchResult(
+            False, 2, 512, 0, 2
+        )
+        suspended = make_gen_request(1)
+        mgr.kv_cache_map[suspended.py_request_id].is_active = False
+        with patch.dict(os.environ, {"TLLM_V2_PREFETCH_SUSPENDED_GEN": "1"}):
+            sched = make_scheduler(
+                mgr,
+                max_num_tokens=100,
+                draft_kv_cache_manager=draft_mgr,
+            )
+
+        out = sched.schedule_request([make_gen_request(0), suspended], set())
+
+        assert ids(out.generation_requests) == [0]
+        draft_mgr.prefetch_request_to_gpu_partial.assert_called_once_with(suspended)
+        mgr.prefetch_request_to_gpu_partial.assert_not_called()
 
     def test_gen_alloc_fails_evict_succeeds(self):
         """gen fails, started req at tail, retry succeeds after eviction."""

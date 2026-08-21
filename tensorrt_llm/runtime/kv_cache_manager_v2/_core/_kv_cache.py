@@ -16,6 +16,7 @@
 import array
 import enum
 import math
+import time
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -250,6 +251,13 @@ class _KVCache:
         "_never_resumed",
         "_enable_swa_scratch_reuse",
         "_scratch_slots",
+        "_prefetched_to_gpu",
+        "_resume_blocked_by_utilization",
+        "_partial_prefetch_page_ids",
+        "_partial_prefetch_total_pages",
+        "_partial_prefetch_total_bytes",
+        "_partial_prefetch_repeated_pages",
+        "_partial_prefetch_first_ns",
         "_pending_stats",
         "__rawref__",
     )
@@ -298,6 +306,16 @@ class _KVCache:
     # Managed via delta in resize(): existing slots are reused across resize calls,
     # only the additional needed slots are allocated. Freed on teardown/suspend.
     _scratch_slots: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
+    # True after a successful GPU prefetch while suspended.  resume() may
+    # bypass the utilization guard only while every active page is still on
+    # GPU, so an intervening eviction safely falls back to the normal path.
+    _prefetched_to_gpu: bool
+    _resume_blocked_by_utilization: bool
+    _partial_prefetch_page_ids: set[int] | None
+    _partial_prefetch_total_pages: int
+    _partial_prefetch_total_bytes: int
+    _partial_prefetch_repeated_pages: int
+    _partial_prefetch_first_ns: int | None
     _pending_stats: _PendingStats
 
     def __init__(
@@ -341,6 +359,13 @@ class _KVCache:
         self._scratch_slots = make_typed(
             lambda _: list[ScratchSlotLock](), manager._storage.num_life_cycles
         )
+        self._prefetched_to_gpu = False
+        self._resume_blocked_by_utilization = False
+        self._partial_prefetch_page_ids = None
+        self._partial_prefetch_total_pages = 0
+        self._partial_prefetch_total_bytes = 0
+        self._partial_prefetch_repeated_pages = 0
+        self._partial_prefetch_first_ns = None
         self._pending_stats = _PendingStats()
         self.__rawref__ = rawref.NULL
         if reuse_match is not None:
@@ -1153,6 +1178,9 @@ class _KVCache:
                 beam_block[lc_idx] = holder
             # Free scratch slots on suspend since the data is ephemeral
             self._free_scratch_slots()
+        self._prefetched_to_gpu = False
+        self._resume_blocked_by_utilization = False
+        self._reset_partial_prefetch_stats()
         self._status = self.Status.SUSPENDED
 
     # Resume, migrate buffers to GPU memory.
@@ -1160,8 +1188,18 @@ class _KVCache:
         assert self.status == self.Status.SUSPENDED
         if cuda_stream is not None:
             self.cuda_stream = cuda_stream
+        prefetched_and_resident = self._prefetched_to_gpu and self._active_pages_are_on_gpu()
+        # A prefetch hint is single-use.  If pages were evicted after the hint,
+        # this attempt observes the regular utilization guard and a future
+        # scheduler iteration may issue a fresh prefetch.
+        self._prefetched_to_gpu = False
+        self._resume_blocked_by_utilization = False
         utilization = max(self._storage.get_utilization(GPU_LEVEL))
-        if utilization > self.manager._init_config.max_util_for_resume:
+        if (
+            utilization > self.manager._init_config.max_util_for_resume
+            and not prefetched_and_resident
+        ):
+            self._resume_blocked_by_utilization = True
             return False
         assert self._cuda_stream is not None, "cuda_stream is never set"
         assert self._finish_event is None
@@ -1336,7 +1374,15 @@ class _KVCache:
                 self._blocks[last_ordinal].tree_block = None
         self._never_resumed = False
         self._status = self.Status.ACTIVE
+        self._reset_partial_prefetch_stats()
         return True
+
+    def _reset_partial_prefetch_stats(self) -> None:
+        self._partial_prefetch_page_ids = None
+        self._partial_prefetch_total_pages = 0
+        self._partial_prefetch_total_bytes = 0
+        self._partial_prefetch_repeated_pages = 0
+        self._partial_prefetch_first_ns = None
 
     def prefetch(self, target: CacheLevel) -> bool:
         """Best-effort prefetch active pages to the target cache level.
@@ -1352,6 +1398,8 @@ class _KVCache:
             True if the prefetch was dispatched, False if storage could not reserve enough pages.
         """
         assert self.status == self.Status.SUSPENDED
+        self._prefetched_to_gpu = False
+        self._resume_blocked_by_utilization = False
         manager = self.manager
         storage = manager._storage
         num_tiers = storage.num_cache_levels
@@ -1379,7 +1427,159 @@ class _KVCache:
             storage.prefetch(target, all_pages)
         except OutOfPagesError:
             return False
+        if target == GPU_LEVEL:
+            # storage.prefetch is all-or-nothing for the requested reservation;
+            # resume validates residency again before bypassing the guard.
+            self._prefetched_to_gpu = True
         return True
+
+    def prefetch_partial(self, target: CacheLevel) -> tuple[bool, int, int, int, int]:
+        """Prefetch as many active pages as currently fit at the target level.
+
+        Unlike :meth:`prefetch`, this method does not require every lower-tier
+        page to fit in one call. Pages already resident at the target are
+        included in the storage request so they cannot be selected as victims
+        while making room for the partial migration.
+
+        Returns:
+            A tuple containing whether all active pages are resident at the
+            target, dispatched page count, dispatched byte count, number of
+            pages dispatched previously in this suspension, and remaining
+            lower-tier page count.
+        """
+        assert self.status == self.Status.SUSPENDED
+        assert target == GPU_LEVEL
+        self._prefetched_to_gpu = False
+        self._resume_blocked_by_utilization = False
+
+        storage = self.manager._storage
+        num_tiers = storage.num_cache_levels
+        num_pool_groups = storage.num_pool_groups
+        lc2pg = storage.get_pool_group_index
+        statistics = storage.get_statistics(target)
+        all_pages = make_typed(
+            lambda _: make_typed(lambda _: list[Page](), num_tiers), num_pool_groups
+        )
+        lower_pages = make_typed(lambda _: list[Page](), num_pool_groups)
+        protected_evictable = filled_list(0, num_pool_groups)
+        seen_page_ids = set[int]()
+
+        for ordinal, beam_idx, lc_idx in self._active_pages():
+            holder = self._page(ordinal, beam_idx, lc_idx)
+            if holder is None:
+                continue
+            page = expect_type(_PageHolder, holder).page
+            page_id = id(page)
+            if page_id in seen_page_ids:
+                continue
+            seen_page_ids.add(page_id)
+            pg_idx = lc2pg(lc_idx)
+            if page.cache_level == target:
+                all_pages[pg_idx][target].append(page)
+                if page.scheduled_for_eviction:
+                    protected_evictable[pg_idx] += 1
+            elif page.cache_level > target:
+                lower_pages[pg_idx].append(page)
+
+        dispatched_pages = list[Page]()
+        dispatched_bytes = 0
+        remaining_pages = 0
+        for pg_idx in typed_range(num_pool_groups):
+            available = max(0, statistics[pg_idx].available - protected_evictable[pg_idx])
+            selected = lower_pages[pg_idx][:available]
+            for page in selected:
+                all_pages[pg_idx][page.cache_level].append(page)
+            dispatched_pages.extend(selected)
+            dispatched_bytes += len(selected) * sum(storage.slot_size(pg_idx))
+            remaining_pages += len(lower_pages[pg_idx]) - len(selected)
+
+        try:
+            storage.prefetch(target, all_pages)
+        except OutOfPagesError:
+            return False, 0, 0, 0, sum(len(pages) for pages in lower_pages)
+
+        prefetched_page_ids = self._partial_prefetch_page_ids
+        if prefetched_page_ids is None:
+            prefetched_page_ids = set()
+            self._partial_prefetch_page_ids = prefetched_page_ids
+        repeated_pages = sum(1 for page in dispatched_pages if id(page) in prefetched_page_ids)
+        prefetched_page_ids.update(id(page) for page in dispatched_pages)
+        self._partial_prefetch_total_pages += len(dispatched_pages)
+        self._partial_prefetch_total_bytes += dispatched_bytes
+        self._partial_prefetch_repeated_pages += repeated_pages
+        if dispatched_pages and self._partial_prefetch_first_ns is None:
+            self._partial_prefetch_first_ns = time.monotonic_ns()
+
+        complete = remaining_pages == 0 and self._active_pages_are_on_gpu()
+        self._prefetched_to_gpu = complete
+        return complete, len(dispatched_pages), dispatched_bytes, repeated_pages, remaining_pages
+
+    @property
+    def partial_prefetch_stats(self) -> tuple[int, int, int, int, int]:
+        """Return cumulative page/byte/repeat/stale/lead-time telemetry."""
+        prefetched_page_ids = self._partial_prefetch_page_ids
+        if prefetched_page_ids is None:
+            return 0, 0, 0, 0, 0
+        stale_pages = 0
+        seen_page_ids = set[int]()
+        for ordinal, beam_idx, lc_idx in self._active_pages():
+            holder = self._page(ordinal, beam_idx, lc_idx)
+            if holder is None:
+                continue
+            page = expect_type(_PageHolder, holder).page
+            page_id = id(page)
+            if page_id in seen_page_ids:
+                continue
+            seen_page_ids.add(page_id)
+            if page_id in prefetched_page_ids and page.cache_level != GPU_LEVEL:
+                stale_pages += 1
+        lead_time_ns = 0
+        if self._partial_prefetch_first_ns is not None:
+            lead_time_ns = time.monotonic_ns() - self._partial_prefetch_first_ns
+        return (
+            self._partial_prefetch_total_pages,
+            self._partial_prefetch_total_bytes,
+            self._partial_prefetch_repeated_pages,
+            stale_pages,
+            lead_time_ns,
+        )
+
+    @property
+    def resume_blocked_by_utilization(self) -> bool:
+        """Whether the most recent resume was rejected by its soft guard."""
+        return self._resume_blocked_by_utilization
+
+    @property
+    def needs_gpu_prefetch(self) -> bool:
+        """Whether a suspended cache can benefit from a GPU prefetch hint.
+
+        Lower-tier residency is the primary signal.  The utilization-guard
+        signal is retained because a suspended cache whose pages have not yet
+        been evicted may still need a one-shot hint to make forward progress.
+        """
+        if self.status != self.Status.SUSPENDED:
+            return False
+        if self._resume_blocked_by_utilization:
+            return True
+        for ordinal, beam_idx, lc_idx in self._active_pages():
+            holder = self._page(ordinal, beam_idx, lc_idx)
+            if holder is None:
+                continue
+            if expect_type(_PageHolder, holder).page.cache_level != GPU_LEVEL:
+                return True
+        return False
+
+    def _active_pages_are_on_gpu(self) -> bool:
+        """Return True when at least one active page is resident on GPU."""
+        found_page = False
+        for ordinal, beam_idx, lc_idx in self._active_pages():
+            holder = self._page(ordinal, beam_idx, lc_idx)
+            if holder is None:
+                continue
+            found_page = True
+            if expect_type(_PageHolder, holder).page.cache_level != GPU_LEVEL:
+                return False
+        return found_page
 
     def _active_pages(self) -> Iterator[tuple[BlockOrdinal, BeamIndex, LifeCycleId]]:
         """Yields (ordinal, beam_idx, lc_idx) for all active pages.

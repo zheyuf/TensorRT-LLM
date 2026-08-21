@@ -379,6 +379,16 @@ class _MmRunMetadata(NamedTuple):
     run_item_offsets: torch.Tensor
 
 
+class _PartialPrefetchResult(NamedTuple):
+    """Result of one best-effort suspended-request prefetch attempt."""
+
+    complete: bool
+    migrated_pages: int
+    migrated_bytes: int
+    repeated_pages: int
+    remaining_pages: int
+
+
 def _hash_to_digest(hash_ints: Sequence[int]) -> bytes:
     # Convert 8 x int32 hash chunks to the 32-byte digest used by C++ block
     # keys. The byte order matches getNthByte(), which extracts MSB first.
@@ -2160,9 +2170,8 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         if not kv_cache.is_active:
-            if not kv_cache.resume(self._stream.cuda_stream):
+            if not self._resume_and_restore(req.py_request_id, kv_cache):
                 return False
-            self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
         draft_len = self._effective_draft_len(req)
         self._allocated_draft_lens[req.py_request_id] = draft_len
@@ -2246,9 +2255,17 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if kv_cache.is_active:
             return True
+        prefetch_stats = kv_cache.partial_prefetch_stats
         if not kv_cache.resume(self._stream.cuda_stream):
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
+        pages, num_bytes, repeated, stale, lead_time_ns = prefetch_stats
+        if pages > 0:
+            logger.info(
+                f"[V2PartialPrefetch] resume request={req_id} rank={mpi_rank()} "
+                f"pages={pages} bytes={num_bytes} repeated={repeated} "
+                f"stale={stale} lead_ms={lead_time_ns / 1_000_000:.3f}"
+            )
         return True
 
     def prepare_context(self, req: LlmRequest) -> bool:
@@ -2425,6 +2442,21 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return False
         return self._resume_and_restore(req.py_request_id, kv_cache)
+
+    @nvtx_range("prefetch_request_to_gpu_partial_kv_cache_manager_v2")
+    def prefetch_request_to_gpu_partial(self, req: LlmRequest) -> _PartialPrefetchResult:
+        """Prefetch the subset of a suspended request that currently fits."""
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return _PartialPrefetchResult(False, 0, 0, 0, 0)
+        if kv_cache.is_active:
+            return _PartialPrefetchResult(True, 0, 0, 0, 0)
+        return _PartialPrefetchResult(*kv_cache.prefetch_partial(GPU_LEVEL))
+
+    def request_needs_gpu_prefetch(self, req: LlmRequest) -> bool:
+        """Return whether *req* is suspended with lower-tier or guard-blocked KV."""
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        return kv_cache is not None and kv_cache.needs_gpu_prefetch
 
     # ---- prepare_resources ----
 

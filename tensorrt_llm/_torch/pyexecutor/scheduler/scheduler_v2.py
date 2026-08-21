@@ -219,6 +219,18 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._prioritize_first_token_gen = (
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
+        # Opt-in experiment: prefetch one suspended generation request with
+        # lower-tier KV while the current scheduled batch executes. Default-off
+        # keeps the existing admission and migration behavior unchanged.
+        self._prefetch_suspended_generation = (
+            os.environ.get("TLLM_V2_PREFETCH_SUSPENDED_GEN", "0") == "1"
+        )
+        self._prefetch_log_emitted = False
+        self._prefetch_attempts = 0
+        self._prefetch_migrated_pages = 0
+        self._prefetch_migrated_bytes = 0
+        self._prefetch_repeated_pages = 0
+        self._prefetch_progress_logs = 0
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -443,6 +455,85 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"host cache tier for suspend/resume offload. "
                     f"Configure kv_cache_config.host_cache_size or increase "
                     f"kv_cache_config.max_tokens."
+                )
+
+        # Dispatch after all current-iteration KV allocations are settled, so
+        # the prefetch observes final memory pressure and can overlap the batch
+        # that is about to execute. Search in normal scheduler order for the
+        # earliest naturally-unscheduled generation request with lower-tier KV
+        # (or a resume-guard rejection). This moves data only; it does not alter
+        # admission order. Do not undo an eviction made in this iteration.
+        has_overlap_work = bool(scheduled_encoder or scheduled_ctx or scheduled_gen)
+        prefetch_candidate = None
+        main_needs_prefetch = False
+        draft_needs_prefetch = False
+        if self._prefetch_suspended_generation and has_overlap_work:
+            scheduled_ids = {req.py_request_id for req in scheduled_gen}
+            evicted_ids = {req.py_request_id for req in evicted}
+            for req in requests_list:
+                if (
+                    req.py_request_id in scheduled_ids
+                    or req.request_id in inflight_request_ids
+                    or not req.is_generation_in_progress_state
+                    or req.state_value == self._gen_to_complete_state_value
+                ):
+                    continue
+                if req.py_request_id in evicted_ids:
+                    continue
+                main_needs_prefetch = self.kv_cache_manager.request_needs_gpu_prefetch(req)
+                draft_needs_prefetch = (
+                    self.draft_kv_cache_manager is not None
+                    and self.draft_kv_cache_manager.request_needs_gpu_prefetch(req)
+                )
+                if main_needs_prefetch or draft_needs_prefetch:
+                    prefetch_candidate = req
+                    break
+
+        if prefetch_candidate is not None:
+            draft_result = None
+            if self.draft_kv_cache_manager is not None:
+                draft_result = self.draft_kv_cache_manager.prefetch_request_to_gpu_partial(
+                    prefetch_candidate
+                )
+            # Do not arm the main-cache bypass unless the draft cache is also
+            # ready. Otherwise main admission could succeed next iteration and
+            # fail later in draft prepare_resources.
+            draft_ready = draft_result is None or draft_result.complete
+            main_result = None
+            if draft_ready:
+                main_result = self.kv_cache_manager.prefetch_request_to_gpu_partial(
+                    prefetch_candidate
+                )
+                self._prefetch_migrated_pages += main_result.migrated_pages
+                self._prefetch_migrated_bytes += main_result.migrated_bytes
+                self._prefetch_repeated_pages += main_result.repeated_pages
+            self._prefetch_attempts += 1
+            made_progress = main_result is not None and main_result.migrated_pages > 0
+            should_log = False
+            if made_progress and self._prefetch_progress_logs < 4:
+                self._prefetch_progress_logs += 1
+                should_log = True
+            if not self._prefetch_log_emitted or self._prefetch_attempts % 100 == 0:
+                should_log = True
+                self._prefetch_log_emitted = True
+            if should_log:
+                main_complete = None if main_result is None else main_result.complete
+                main_pages = 0 if main_result is None else main_result.migrated_pages
+                main_bytes = 0 if main_result is None else main_result.migrated_bytes
+                main_repeated = 0 if main_result is None else main_result.repeated_pages
+                main_remaining = 0 if main_result is None else main_result.remaining_pages
+                draft_complete = None if draft_result is None else draft_result.complete
+                draft_pages = 0 if draft_result is None else draft_result.migrated_pages
+                logger.info(
+                    f"[V2PartialPrefetch] attempt request={prefetch_candidate.py_request_id} "
+                    f"main_needed={main_needs_prefetch} draft_needed={draft_needs_prefetch} "
+                    f"main_complete={main_complete} main_pages={main_pages} "
+                    f"main_bytes={main_bytes} main_repeated={main_repeated} "
+                    f"main_remaining={main_remaining} draft_complete={draft_complete} "
+                    f"draft_pages={draft_pages} total_attempts={self._prefetch_attempts} "
+                    f"total_pages={self._prefetch_migrated_pages} "
+                    f"total_bytes={self._prefetch_migrated_bytes} "
+                    f"total_repeated={self._prefetch_repeated_pages}"
                 )
 
         return (
