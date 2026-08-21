@@ -11,6 +11,7 @@ import torch
 
 from tensorrt_llm._torch.autotuner import (
     AutoTuner,
+    DistributedTuningStrategy,
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
@@ -30,7 +31,14 @@ class MiniMaxM3SparseDecodeRunner(TunableRunner):
     prebuilt plan; metadata preparation guarantees that for ``adaptive``.
     """
 
-    tuning_config = TuningConfig(use_cuda_graph=True)
+    # All TP ranks capture the same graph key and must embed the same tactic.
+    # Profiling independently makes near-tie shapes vulnerable to rank-local
+    # timer noise. Rank 0 is representative on homogeneous TP nodes, so tune
+    # once and broadcast the cached choice before capture.
+    tuning_config = TuningConfig(
+        use_cuda_graph=True,
+        distributed_tuning_strategy=DistributedTuningStrategy.BROADCAST,
+    )
 
     def __init__(
         self,

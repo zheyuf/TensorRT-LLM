@@ -193,6 +193,18 @@ def test_sparse_decode_tunable_runner_dispatches_and_falls_back_to_triton(
     assert calls == [(expected, (total_q, num_q_heads, head_dim))]
 
 
+def test_sparse_decode_autotuner_broadcasts_one_tp_tactic():
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.sparse_decode_autotuner import (
+        MiniMaxM3SparseDecodeRunner,
+    )
+    from tensorrt_llm._torch.autotuner import DistributedTuningStrategy
+
+    assert (
+        MiniMaxM3SparseDecodeRunner.tuning_config.distributed_tuning_strategy
+        == DistributedTuningStrategy.BROADCAST
+    )
+
+
 @pytest.mark.parametrize(
     ("decode_backend", "rank_local_batch_size", "expected_backend"),
     [
