@@ -27,6 +27,23 @@ if TYPE_CHECKING:
 _INIT_SCORE = 1e30
 _LOCAL_SCORE = 1e29
 
+MiniMaxM3DecodeBackend = Literal["default", "msa", "adaptive"]
+
+
+def needs_msa_sparse_decode_plan(decode_backend: MiniMaxM3DecodeBackend) -> bool:
+    """Whether pure sparse decode may need a preplanned MSA kernel.
+
+    ``default`` retains the production Triton decode path, ``msa`` forces MSA,
+    and ``adaptive`` profiles both tactics for each exact CUDA-graph shape.
+    Metadata must prepare the plan for both latter policies before forward so
+    graph capture can safely fix either tactic.
+    """
+    if decode_backend == "default":
+        return False
+    if decode_backend in ("msa", "adaptive"):
+        return True
+    raise ValueError(f"Unsupported MiniMax-M3 decode backend: {decode_backend!r}.")
+
 
 @dataclass(frozen=True)
 class MiniMaxM3SparseParams(SparseParams):
@@ -42,6 +59,7 @@ class MiniMaxM3SparseParams(SparseParams):
     score_type: str = "max"
     disable_index_value: bool = True
     implementation: Literal["triton", "msa"] = "triton"
+    decode_backend: MiniMaxM3DecodeBackend = "default"
     indexer_kv_dtype: Literal["bf16", "fp8"] = "bf16"
     fuse_qkv_index_projection: bool = False
 
@@ -64,6 +82,7 @@ class MiniMaxM3SparseMetadataParams(SparseMetadataParams):
     num_index_heads: int = 4
     topk: int = 16
     fuse_qkv_index_projection: bool = False
+    decode_backend: MiniMaxM3DecodeBackend = "default"
 
     def sharded_head_counts(self, mapping: Optional["Mapping"] = None) -> Tuple[int, int]:
         """Return per-rank (num_q_heads, num_kv_heads) for mapping.
