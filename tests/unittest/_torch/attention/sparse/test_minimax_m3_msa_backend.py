@@ -48,7 +48,6 @@ def test_graph_safe_plan_owners_do_not_alias_shared_buffer_names():
     )
 
     class ReusingMetadata:
-
         def __init__(self):
             self.cuda_graph_buffers = {}
             self.buffers = {}
@@ -60,9 +59,7 @@ def test_graph_safe_plan_owners_do_not_alias_shared_buffer_names():
             return self.buffers[cache_name]
 
     metadata = ReusingMetadata()
-    first = _MsaGraphSafePlan(
-        metadata, "msa_gqa_plan", max_batch=4, num_ctas=8, capture_graph=True
-    )
+    first = _MsaGraphSafePlan(metadata, "msa_gqa_plan", max_batch=4, num_ctas=8, capture_graph=True)
     second = _MsaGraphSafePlan(
         metadata, "msa_gqa_plan", max_batch=4, num_ctas=8, capture_graph=True
     )
@@ -82,9 +79,7 @@ def test_post_init_drops_shallow_copied_plan_and_step_state(monkeypatch):
     monkeypatch.setattr(
         MiniMaxM3MsaSparseAttentionMetadata, "_create_msa_buffers", lambda self: None
     )
-    source = MiniMaxM3MsaSparseAttentionMetadata.__new__(
-        MiniMaxM3MsaSparseAttentionMetadata
-    )
+    source = MiniMaxM3MsaSparseAttentionMetadata.__new__(MiniMaxM3MsaSparseAttentionMetadata)
     sentinel = object()
     source.sparse_metadata_params = None
     source._msa_gqa_plan = sentinel
@@ -118,9 +113,7 @@ def test_resolver_selects_msa_backend_when_available(monkeypatch):
         ("adaptive", True),
     ],
 )
-def test_sparse_decode_backend_policy_is_explicit_and_lowered(
-    decode_backend, expected
-):
+def test_sparse_decode_backend_policy_is_explicit_and_lowered(decode_backend, expected):
     cfg = MiniMaxM3SparseAttentionConfig(implementation="msa", decode_backend=decode_backend)
 
     assert cfg.to_sparse_params().decode_backend == decode_backend
@@ -135,9 +128,7 @@ def test_nondefault_decode_backend_requires_msa_implementation(decode_backend):
 
 
 @pytest.mark.parametrize("tactic", [-1, "triton", "msa"])
-def test_sparse_decode_tunable_runner_dispatches_and_falls_back_to_triton(
-    monkeypatch, tactic
-):
+def test_sparse_decode_tunable_runner_dispatches_and_falls_back_to_triton(monkeypatch, tactic):
     from tensorrt_llm._torch.attention_backend.fmha import msa_sparse_gqa
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
         sparse_decode_autotuner,
