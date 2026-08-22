@@ -251,6 +251,7 @@ def test_pure_decode_dispatches_by_configured_policy(
     )
     block_table = torch.zeros(rank_local_batch_size, 1, dtype=torch.int32)
     metadata = SimpleNamespace(
+        is_cuda_graph=True,
         kv_cache_manager=object(),
         _msa_prewritten_layer=None,
         msa_decode_query_len=1,
