@@ -1134,62 +1134,19 @@ class KvCacheCreator:
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """
         Check if we need a separate draft KV cache manager for one-model mode.
-        Returns True if the draft layout must remain independent.
+        Returns True if the speculative config has use_separate_draft_kv_cache=True.
 
         Note: For MTP, _draft_config may be None since MTP layers are embedded
         in the target model and don't produce a separate ModelConfig. We fall
         back to the target model's config via _get_effective_draft_config().
         """
-        use_separate = should_use_separate_draft_kv_cache(
-            self._speculative_config)
-        if (self._speculative_config is None
-                or not self._speculative_config.spec_dec_mode.use_one_engine()):
-            return use_separate
-
-        supports_shared_layers = getattr(self._kv_cache_manager_cls,
-                                         'supports_shared_draft_layers', True)
-        if self._mapping.enable_attention_dp and supports_shared_layers:
-            # Under attention DP, draft layers share the target manager (the
-            # layout existing deployments were validated with). A manager can
-            # opt out entirely. Preserve this existing route exactly; the
-            # aggregated-only policy below does not claim to validate legacy
-            # attention-DP or disaggregated tree relocation.
-            logger.info("Attention DP: draft layers share the target KV "
-                        "cache manager.")
-            return False
-
-        supports_aggregated_shared = getattr(
-            self._kv_cache_manager_cls,
-            'supports_aggregated_shared_draft_layers', False)
-        if (use_separate and not self._is_disagg
-                and supports_aggregated_shared):
-            config_policy = getattr(self._kv_cache_manager_cls,
-                                    'supports_aggregated_shared_draft_config',
-                                    None)
-            config_supported = (config_policy(self._speculative_config)
-                                if config_policy is not None else True)
-            if not config_supported:
-                # This is the pre-existing aggregated route. Keeping its
-                # separate manager avoids expanding the new shared path to
-                # unvalidated non-contiguous relocation configurations.
-                logger.warning(
-                    "Aggregated shared draft KV is not supported for this "
-                    "speculative configuration; preserving the separate "
-                    "draft manager.")
-                return True
-            disable_env = getattr(self._kv_cache_manager_cls,
-                                  'aggregated_shared_draft_disable_env', None)
-            if disable_env is not None and os.environ.get(disable_env,
-                                                          "0") == "1":
-                logger.warning(
-                    f"Aggregated shared draft KV is disabled by {disable_env}=1; "
-                    "using a separate draft manager.")
-                return True
+        if self._mapping.enable_attention_dp:
             logger.info(
-                "Aggregated draft layers share the target KV cache manager "
-                "under the model-specific compatibility policy.")
+                "Attention DP is enabled, separate draft KV cache is not supported."
+            )
             return False
-        return use_separate
+
+        return should_use_separate_draft_kv_cache(self._speculative_config)
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """
@@ -1292,23 +1249,12 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
-        # A target manager class may request a different page size for the
-        # separate draft manager (e.g. MiniMax-M3, see
-        # draft_manager_tokens_per_block there for the rationale).
-        draft_tpb = getattr(self._kv_cache_manager_cls,
-                            'draft_manager_tokens_per_block',
-                            self._tokens_per_block)
-        if draft_tpb != self._tokens_per_block:
-            logger.info(
-                f"Draft KV cache manager uses tokens_per_block={draft_tpb} "
-                f"(target uses {self._tokens_per_block}).")
-            draft_kv_config.tokens_per_block = draft_tpb
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=self._mapping,
             kv_cache_config=draft_kv_config,
-            tokens_per_block=draft_tpb,
+            tokens_per_block=self._tokens_per_block,
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
@@ -2053,7 +1999,7 @@ def _create_kv_cache_manager(
         # One-model spec with shared draft layers appends the drafter's
         # layers to this manager; tell the manager how many. Anchor on the
         # pretrained TARGET layer count — local num_hidden_layers may already
-        # include the draft tail. Consumed by managers with a draft sub-page
+        # include the draft tail. Consumed by managers with a draft KV-cache
         # view (MiniMax-M3); others ignore it. Masked/cross flows yield a
         # non-positive delta and correctly report 0.
         target_num_layers = getattr(config, "num_hidden_layers", None)
