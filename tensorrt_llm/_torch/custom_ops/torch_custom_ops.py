@@ -2728,30 +2728,6 @@ def record_event(event_idx: int) -> None:
     event.record()
 
 
-@torch.library.custom_op("trtllm::capture_eagle_hidden_states",
-                         mutates_args=("hidden_states_buffer", ))
-def capture_eagle_hidden_states(hidden_states_buffer: torch.Tensor,
-                                hidden_states: torch.Tensor,
-                                residual: Optional[torch.Tensor],
-                                dim1_start: int, dim1_end: int) -> None:
-    """Write one Eagle capture slice with at most one GPU kernel."""
-    if residual is None:
-        torch.ops.trtllm.inplace_slice_copy(hidden_states_buffer, hidden_states,
-                                            dim1_start, dim1_end)
-    else:
-        destination = hidden_states_buffer[:hidden_states.shape[0],
-                                           dim1_start:dim1_end]
-        torch.add(hidden_states, residual, out=destination)
-
-
-@torch.library.register_fake("trtllm::capture_eagle_hidden_states")
-def _capture_eagle_hidden_states_fake(hidden_states_buffer: torch.Tensor,
-                                      hidden_states: torch.Tensor,
-                                      residual: Optional[torch.Tensor],
-                                      dim1_start: int, dim1_end: int) -> None:
-    pass
-
-
 @torch.library.custom_op("trtllm::wait_event", mutates_args=())
 def wait_event(event_idx: int) -> None:
     if not do_multi_stream():

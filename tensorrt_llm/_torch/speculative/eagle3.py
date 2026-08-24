@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
@@ -577,16 +578,14 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                         "EAGLE3 hidden-state capture token count exceeds "
                         f"available hidden states: num_tokens={num_tokens}, "
                         f"hidden_states={hidden_states.shape[0]}")
-                # Keep the strided destination write inside the custom op:
-                # Dynamo rejects Python-level add(out=<non-contiguous view>),
-                # while the dispatcher kernel supports it. The op remains an
-                # explicit in-place DAG node for output ordering.
-                hidden_states = hidden_states[:num_tokens]
-                residual = (residual[:num_tokens]
-                            if residual is not None else None)
-                torch.ops.trtllm.capture_eagle_hidden_states(
-                    self.hidden_states, hidden_states, residual,
-                    i * self.hidden_size, (i + 1) * self.hidden_size)
+                to_save = hidden_states[:num_tokens]
+                if residual is not None:
+                    # Both values come from the same decoder layer, so the
+                    # hidden-state bound above also covers residual.
+                    to_save = to_save + residual[:num_tokens]
+                inplace_slice_copy(self.hidden_states, to_save,
+                                   i * self.hidden_size,
+                                   (i + 1) * self.hidden_size)
                 break
 
 
