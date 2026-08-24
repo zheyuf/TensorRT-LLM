@@ -47,8 +47,7 @@ def estimate_time(node: Node) -> int:
     no_cost_ops = {
         getitem, torch.ops.aten.view.default, torch.ops.aten.view.dtype,
         torch.ops.aten.alias.default, torch.ops.aten.empty.memory_format,
-        torch.ops.aten.permute.default,
-        torch.ops.trtllm.publish_eagle_hidden_states.default
+        torch.ops.aten.permute.default
     }
 
     moe_ops = {
@@ -143,6 +142,12 @@ class MultiStreamNode:
         # trigger event
         self.event = None
 
+        # A compile-time Eagle publication marker is folded into its exact
+        # producer. Keeping this metadata off the scheduling DAG preserves
+        # the native add -> inplace_slice_copy stream assignment.
+        self.eagle_hidden_states_buffer = None
+        self.eagle_capture_idx = None
+
 
 class MultiStreamDAG:
 
@@ -203,6 +208,27 @@ class MultiStreamDAG:
             args = flatten_args([a for a in node.args] +
                                 [a for a in node.kwargs.values()])
 
+            if (node.op == "call_function" and node.target
+                    == torch.ops.trtllm.publish_eagle_hidden_states.default):
+                # remove_copy_for_mutates_args normalizes mutable custom ops
+                # to kwargs; accept positional form as well for direct FX use.
+                hidden_states_buffer = (node.args[0] if node.args else
+                                        node.kwargs["hidden_states_buffer"])
+                capture_idx = (node.args[1] if len(node.args) > 1 else
+                               node.kwargs["capture_idx"])
+                producer = latest_inplace_stat.get(hidden_states_buffer)
+                assert producer is not None, (
+                    "Eagle hidden-state publication must immediately follow "
+                    "an in-place write to its buffer")
+                assert producer.eagle_capture_idx is None
+                producer.eagle_hidden_states_buffer = hidden_states_buffer
+                producer.eagle_capture_idx = capture_idx
+                self.required_before_output.add(producer)
+                # This is a compile-time annotation. Reinsert the event record
+                # immediately after the producer during graph emission so it
+                # is guaranteed to use the producer's exact stream.
+                continue
+
             in_edges = dict()
             for arg in args:
                 if arg in latest_inplace_stat:
@@ -215,9 +241,6 @@ class MultiStreamDAG:
                 in_edges[None] = self.entry_node
 
             vertex = MultiStreamNode(node, in_edges)
-            if (node.op == "call_function" and node.target
-                    == torch.ops.trtllm.publish_eagle_hidden_states.default):
-                self.required_before_output.add(vertex)
             if node.op == "output":
                 self.exit_node = vertex
                 vertex.distance = 0
@@ -387,9 +410,10 @@ class MultiStreamDAG:
                     # This stream is not ready to run now.
                     continue
                 if should_defer_output(node):
-                    # The Eagle publish node is a detached side effect. Emit
-                    # it before returning from the FX graph, without pulling
-                    # unrelated detached work into the consumer's dependency.
+                    # Eagle capture copies are detached side effects. Emit
+                    # those producers before returning from the FX graph,
+                    # without pulling unrelated detached work into the
+                    # consumer's dependency.
                     continue
 
                 # Any time the stream is changed, set the stream.
@@ -422,6 +446,16 @@ class MultiStreamDAG:
                                                   args=(wait[0].event, ))
                         remap[node.node] = new_graph.node_copy(
                             node.node, lambda n: remap[n])
+                        if node.eagle_capture_idx is not None:
+                            # Record completion directly after the native copy
+                            # while its assigned stream is still current. A
+                            # separate marker can be assigned to the primary
+                            # stream and publish too early.
+                            new_graph.create_node(
+                                "call_function",
+                                torch.ops.trtllm.publish_eagle_hidden_states,
+                                args=(remap[node.eagle_hidden_states_buffer],
+                                      node.eagle_capture_idx))
                         for wait in node.wait_on:
                             # wait[1] is the actual tensor that the op is waiting on.
                             # Need to record stream for that tensor.

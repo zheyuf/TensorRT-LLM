@@ -2739,10 +2739,16 @@ def record_event(event_idx: int) -> None:
     event.record()
 
 
-@torch.library.custom_op("trtllm::publish_eagle_hidden_states", mutates_args=())
+@torch.library.custom_op("trtllm::publish_eagle_hidden_states",
+                         mutates_args=("hidden_states_buffer", ))
 def publish_eagle_hidden_states(hidden_states_buffer: torch.Tensor,
                                 capture_idx: int) -> None:
-    """Publish completion of one Eagle hidden-state buffer slice."""
+    """Publish completion of one Eagle hidden-state buffer slice.
+
+    The mutation annotation keeps this compile-time publication marker alive
+    through FX dead-code elimination. The multi-stream emitter folds it into
+    the preceding physical buffer write before producing the executable graph.
+    """
     if do_multi_stream():
         get_eagle_hidden_states_event(capture_idx).record()
 
