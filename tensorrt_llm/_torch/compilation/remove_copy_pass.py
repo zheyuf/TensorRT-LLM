@@ -19,7 +19,8 @@ from torch._higher_order_ops.auto_functionalize import (auto_functionalized,
                                                         auto_functionalized_v2)
 from torch.fx import Graph, Node
 
-from .utils import inplace_info, is_call_function
+from .utils import (EAGLE_HIDDEN_STATES_CAPTURE_IDX_META, inplace_info,
+                    is_call_function)
 
 aten = torch.ops.aten
 
@@ -83,4 +84,49 @@ def remove_copy_for_mutates_args(graph: Graph):
         )
 
     for node in nodes_to_remove:
+        graph.erase_node(node)
+
+
+def extract_eagle_hidden_state_publications(graph: Graph) -> None:
+    """Fold Eagle publication markers into their physical buffer writes.
+
+    The marker is declared mutable so AOTAutograd keeps it through dead-code
+    elimination. Leaving that mutation in the graph until piecewise splitting
+    changes submodule boundaries and, consequently, multi-stream scheduling.
+    Convert it to producer metadata here, after DCE but before piecewise split,
+    so the executable graph seen by the scheduler is otherwise unchanged.
+    """
+    latest_inplace_stat: dict[Node, Node] = {}
+    nodes_to_remove: list[Node] = []
+    inplace_map = inplace_info()
+    publication_op = torch.ops.trtllm.publish_eagle_hidden_states.default
+    slice_copy_op = torch.ops.trtllm.inplace_slice_copy.default
+
+    for node in graph.nodes:
+        if is_call_function(node, publication_op):
+            hidden_states_buffer = node.kwargs["hidden_states_buffer"]
+            capture_idx = node.kwargs["capture_idx"]
+            producer = latest_inplace_stat.get(hidden_states_buffer)
+            assert producer is not None, (
+                "Eagle hidden-state publication must follow an in-place "
+                "buffer write")
+            assert is_call_function(
+                producer,
+                slice_copy_op), ("Eagle hidden-state publication must follow "
+                                 "inplace_slice_copy")
+            assert EAGLE_HIDDEN_STATES_CAPTURE_IDX_META not in producer.meta
+            producer.meta[EAGLE_HIDDEN_STATES_CAPTURE_IDX_META] = capture_idx
+            nodes_to_remove.append(node)
+            continue
+
+        if node.op != "call_function" or node.target not in inplace_map:
+            continue
+        for inplace_arg in inplace_map[node.target].values():
+            assert inplace_arg in node.kwargs
+            mutated_arg = node.kwargs[inplace_arg]
+            if isinstance(mutated_arg, Node):
+                latest_inplace_stat[mutated_arg] = node
+
+    for node in nodes_to_remove:
+        assert not node.users
         graph.erase_node(node)

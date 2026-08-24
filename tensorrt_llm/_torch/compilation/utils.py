@@ -7,6 +7,9 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 
+EAGLE_HIDDEN_STATES_CAPTURE_IDX_META = (
+    "trtllm_eagle_hidden_states_capture_idx")
+
 
 def get_symint_val(i: Union[torch.SymInt | int]):
     if isinstance(i, int):

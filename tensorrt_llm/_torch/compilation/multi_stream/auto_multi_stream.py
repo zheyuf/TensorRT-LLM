@@ -23,7 +23,7 @@ from torch.fx import Graph, GraphModule, Node
 
 from tensorrt_llm.logger import logger
 
-from ..utils import inplace_info
+from ..utils import EAGLE_HIDDEN_STATES_CAPTURE_IDX_META, inplace_info
 
 
 def is_symint_node(node: Node) -> bool:
@@ -208,27 +208,6 @@ class MultiStreamDAG:
             args = flatten_args([a for a in node.args] +
                                 [a for a in node.kwargs.values()])
 
-            if (node.op == "call_function" and node.target
-                    == torch.ops.trtllm.publish_eagle_hidden_states.default):
-                # remove_copy_for_mutates_args normalizes mutable custom ops
-                # to kwargs; accept positional form as well for direct FX use.
-                hidden_states_buffer = (node.args[0] if node.args else
-                                        node.kwargs["hidden_states_buffer"])
-                capture_idx = (node.args[1] if len(node.args) > 1 else
-                               node.kwargs["capture_idx"])
-                producer = latest_inplace_stat.get(hidden_states_buffer)
-                assert producer is not None, (
-                    "Eagle hidden-state publication must immediately follow "
-                    "an in-place write to its buffer")
-                assert producer.eagle_capture_idx is None
-                producer.eagle_hidden_states_buffer = hidden_states_buffer
-                producer.eagle_capture_idx = capture_idx
-                self.required_before_output.add(producer)
-                # This is a compile-time annotation. Reinsert the event record
-                # immediately after the producer during graph emission so it
-                # is guaranteed to use the producer's exact stream.
-                continue
-
             in_edges = dict()
             for arg in args:
                 if arg in latest_inplace_stat:
@@ -241,6 +220,14 @@ class MultiStreamDAG:
                 in_edges[None] = self.entry_node
 
             vertex = MultiStreamNode(node, in_edges)
+            if EAGLE_HIDDEN_STATES_CAPTURE_IDX_META in node.meta:
+                assert (node.op == "call_function" and node.target
+                        == torch.ops.trtllm.inplace_slice_copy.default)
+                assert "dest" in node.kwargs
+                vertex.eagle_hidden_states_buffer = node.kwargs["dest"]
+                vertex.eagle_capture_idx = node.meta[
+                    EAGLE_HIDDEN_STATES_CAPTURE_IDX_META]
+                self.required_before_output.add(vertex)
             if node.op == "output":
                 self.exit_node = vertex
                 vertex.distance = 0

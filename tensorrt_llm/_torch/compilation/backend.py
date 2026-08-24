@@ -37,7 +37,8 @@ from .patterns.residual_add_norm import (register_add_norm,
                                          register_add_norm_quant)
 from .piecewise_optimizer import PiecewiseRunner, piecewise_optimizer
 from .recover_pass import recover_pass
-from .remove_copy_pass import remove_copy_for_mutates_args
+from .remove_copy_pass import (extract_eagle_hidden_state_publications,
+                               remove_copy_for_mutates_args)
 
 
 class Backend:
@@ -162,6 +163,7 @@ class Backend:
         graph.eliminate_dead_code()
         # After this pass, cannot run any dce!!!
         remove_copy_for_mutates_args(graph)
+        extract_eagle_hidden_state_publications(graph)
 
         # Do not apply multi-stream if enable piecewise cuda graph or inductor
         # For piecewise cuda graph, we will apply the multi-stream optimization in piecewise_optimizer
