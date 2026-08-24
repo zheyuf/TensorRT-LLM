@@ -591,9 +591,13 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                     # add tensor and a second copy kernel.
                     destination = self.hidden_states[:num_tokens,
                                                      dim1_start:dim1_end]
-                    torch.add(hidden_states,
-                              residual[:num_tokens],
-                              out=destination)
+                    # Call the dispatcher overload directly. Dynamo rejects
+                    # the Python-level torch.add wrapper when ``out`` is this
+                    # strided column view, even though aten.add.out supports
+                    # the layout and is what the captured custom op executes.
+                    torch.ops.aten.add.out(hidden_states,
+                                           residual[:num_tokens],
+                                           out=destination)
                 break
 
 
