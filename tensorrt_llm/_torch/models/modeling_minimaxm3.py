@@ -51,7 +51,6 @@ from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMax
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fp32_router_gemm import router_gemm, split_router_weight
 from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
@@ -501,15 +500,10 @@ class MiniMaxM3Gate(nn.Module):
             torch.empty((num_experts,), dtype=torch.float32),
             requires_grad=False,
         )
-        # The fp32 weight rewritten as stacked bf16 terms for the CuTe DSL gate
-        # GEMM, filled by load_weights and None where that kernel cannot run.
-        # Costs a second copy of a 3MB weight per layer.
-        self.register_buffer("weight_split", None, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # The router runs in fp32 to match SGLang. router_gemm picks the kernel
-        # that suits the token count.
-        return router_gemm(hidden_states, self.weight, self.weight_split)
+        # Router runs in fp32 to match SGLang.
+        return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
 
     def load_weights(self, weights: List[Dict]):
         """Load the router weight and the e_score_correction_bias.
@@ -527,8 +521,6 @@ class MiniMaxM3Gate(nn.Module):
         w = weights[0]
         if "weight" in w:
             self.weight.copy_(w["weight"][:].to(self.weight.dtype))
-            # The weight is frozen, so it is split here rather than per call.
-            self.weight_split = split_router_weight(self.weight)
         if "e_score_correction_bias" in w:
             self.e_score_correction_bias.copy_(
                 w["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)
@@ -2409,10 +2401,19 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         else:
             hidden_states, residual = self.forward_mlp(hidden_states, residual)
 
-        # hidden_states is fully TP-reduced at layer exit (no cross-layer
-        # allreduce+norm fusion).
+        # The layer-boundary norm materializes both the next layer's normalized
+        # input and the complete, unnormalized residual stream that Eagle was
+        # trained to consume. Capture that residual directly instead of adding
+        # the normalized value to it again. Standalone layers without wired
+        # norm aliases retain the generic hidden_states + residual path.
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
-            spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
+            if self.next_layer_layernorm is not None:
+                assert residual is not None
+                spec_metadata.maybe_capture_hidden_states(self.layer_idx, residual, None)
+            else:
+                spec_metadata.maybe_capture_hidden_states(
+                    self.layer_idx, hidden_states, residual
+                )
 
         return hidden_states, residual
 
