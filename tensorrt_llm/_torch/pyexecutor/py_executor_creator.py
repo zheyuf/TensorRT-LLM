@@ -503,12 +503,12 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-        # A disaggregated context worker can return from a piecewise
-        # multi-stream target graph before its graph-external one-model Eagle
-        # worker consumes the captured hidden-state buffer. The disaggregated
-        # generation worker uses decode CUDA graphs instead, while aggregate
-        # serving does not cross this executor boundary; keep both historical
-        # hot paths unchanged.
+        # The observed hazard requires a disaggregated context worker, a
+        # piecewise multi-stream target graph, and its eager one-model Eagle
+        # consumer: the graph can return before publishing the captured
+        # hidden-state buffer. Disaggregated generation uses decode CUDA graphs;
+        # aggregate serving is correct with its historical capture schedule.
+        # Keep both unaffected hot paths unchanged.
         compile_config = llm_args.torch_compile_config
         spec_config._requires_eagle_hidden_states_publication = (
             cache_transceiver_config is not None
