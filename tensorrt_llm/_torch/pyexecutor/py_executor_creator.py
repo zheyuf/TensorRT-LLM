@@ -503,13 +503,19 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-        # A disaggregated context worker can return from a piecewise target
-        # graph before its graph-external one-model Eagle worker consumes the
-        # captured hidden-state buffer. Aggregate serving keeps the historical
-        # capture path; it does not cross that executor boundary.
+        # A disaggregated context worker can return from a piecewise
+        # multi-stream target graph before its graph-external one-model Eagle
+        # worker consumes the captured hidden-state buffer. The disaggregated
+        # generation worker uses decode CUDA graphs instead, while aggregate
+        # serving does not cross this executor boundary; keep both historical
+        # hot paths unchanged.
+        compile_config = llm_args.torch_compile_config
         spec_config._requires_eagle_hidden_states_publication = (
             cache_transceiver_config is not None
-            and cache_transceiver_config.backend is not None)
+            and cache_transceiver_config.backend is not None
+            and compile_config is not None
+            and compile_config.enable_piecewise_cuda_graph
+            and compile_config.max_num_streams > 1)
 
         # Eagle3DecodingConfig._max_batch_size is internally managed: the
         # dynamic-tree worker pre-allocates batch-indexed CUDA buffers sized
