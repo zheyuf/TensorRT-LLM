@@ -2411,9 +2411,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 assert residual is not None
                 spec_metadata.maybe_capture_hidden_states(self.layer_idx, residual, None)
             else:
-                spec_metadata.maybe_capture_hidden_states(
-                    self.layer_idx, hidden_states, residual
-                )
+                spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
 
         return hidden_states, residual
 
