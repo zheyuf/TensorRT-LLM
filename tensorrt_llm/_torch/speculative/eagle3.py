@@ -11,7 +11,6 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
-from ..modules.multi_stream_utils import do_multi_stream
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
@@ -403,10 +402,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
-    # Each capture slice may live in a different piecewise graph/stream. Keep
-    # one external event per slice so the eager worker can join exactly those
-    # producers without relying on cross-graph stream assignment.
-    hidden_states_ready_events: Optional[List[torch.cuda.Event]] = None
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -431,12 +426,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
-        if (self.num_capture_layers > 0
-                and self.hidden_states_ready_events is None):
-            self.hidden_states_ready_events = [
-                torch.cuda.Event(external=True)
-                for _ in range(self.num_capture_layers)
-            ]
         if self.num_capture_layers == 0:
             # No layers to capture (MTP Eagle one-model). Skip buffer
             # allocation entirely; nothing reads self.hidden_states on this
@@ -605,16 +594,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 torch.ops.trtllm.publish_eagle_hidden_states(
                     self.hidden_states, i)
                 break
-
-    def wait_for_captured_hidden_states(self) -> None:
-        # During an enclosing decode CUDA-graph capture the piecewise work is
-        # already captured as part of the same graph. The explicit join is for
-        # the eager graph-external consumer.
-        if (not do_multi_stream() or torch.cuda.is_current_stream_capturing()):
-            return
-        assert self.hidden_states_ready_events is not None
-        for event in self.hidden_states_ready_events:
-            event.wait()
 
 
 class Eagle3OneModelSampler(MTPSampler):
@@ -1263,7 +1242,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         if not self.is_mtp_eagle:
             # Eagle3: project the multi-layer concatenated hidden states.
-            spec_metadata.wait_for_captured_hidden_states()
             hidden_size_up = spec_metadata.hidden_size * len(
                 spec_metadata.layers_to_capture)
             hidden_states = spec_metadata.hidden_states[:num_tokens, :

@@ -142,12 +142,6 @@ class MultiStreamNode:
         # trigger event
         self.event = None
 
-        # A compile-time Eagle publication marker is folded into its exact
-        # producer. Keeping this metadata off the scheduling DAG preserves
-        # the native add -> inplace_slice_copy stream assignment.
-        self.eagle_hidden_states_buffer = None
-        self.eagle_capture_idx = None
-
 
 class MultiStreamDAG:
 
@@ -224,9 +218,6 @@ class MultiStreamDAG:
                 assert (node.op == "call_function" and node.target
                         == torch.ops.trtllm.inplace_slice_copy.default)
                 assert "dest" in node.kwargs
-                vertex.eagle_hidden_states_buffer = node.kwargs["dest"]
-                vertex.eagle_capture_idx = node.meta[
-                    EAGLE_HIDDEN_STATES_CAPTURE_IDX_META]
                 self.required_before_output.add(vertex)
             if node.op == "output":
                 self.exit_node = vertex
@@ -433,16 +424,6 @@ class MultiStreamDAG:
                                                   args=(wait[0].event, ))
                         remap[node.node] = new_graph.node_copy(
                             node.node, lambda n: remap[n])
-                        if node.eagle_capture_idx is not None:
-                            # Record completion directly after the native copy
-                            # while its assigned stream is still current. A
-                            # separate marker can be assigned to the primary
-                            # stream and publish too early.
-                            new_graph.create_node(
-                                "call_function",
-                                torch.ops.trtllm.publish_eagle_hidden_states,
-                                args=(remap[node.eagle_hidden_states_buffer],
-                                      node.eagle_capture_idx))
                         for wait in node.wait_on:
                             # wait[1] is the actual tensor that the op is waiting on.
                             # Need to record stream for that tensor.

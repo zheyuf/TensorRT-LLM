@@ -2702,17 +2702,6 @@ def get_event(event_idx: int):
     return extra_attrs["events"]()[event_idx]
 
 
-def get_eagle_hidden_states_event(capture_idx: int) -> torch.cuda.Event:
-    from ..utils import get_model_extra_attrs
-    extra_attrs = get_model_extra_attrs()
-    assert extra_attrs is not None, "Missing model extra attributes"
-    spec_metadata = extra_attrs.get("spec_metadata")
-    assert spec_metadata is not None, "Missing speculative metadata"
-    events = spec_metadata.hidden_states_ready_events
-    assert events is not None, "Missing Eagle hidden-state events"
-    return events[capture_idx]
-
-
 def get_stream(stream_id: int):
     from ..utils import get_model_extra_attrs
     extra_attrs = get_model_extra_attrs()
@@ -2743,14 +2732,13 @@ def record_event(event_idx: int) -> None:
                          mutates_args=("hidden_states_buffer", ))
 def publish_eagle_hidden_states(hidden_states_buffer: torch.Tensor,
                                 capture_idx: int) -> None:
-    """Publish completion of one Eagle hidden-state buffer slice.
+    """Keep an Eagle hidden-state buffer write alive through FX DCE.
 
     The mutation annotation keeps this compile-time publication marker alive
-    through FX dead-code elimination. The multi-stream emitter folds it into
-    the preceding physical buffer write before producing the executable graph.
+    until the backend tags the preceding physical write and removes this op.
+    The multi-stream emitter then schedules that write before graph output.
     """
-    if do_multi_stream():
-        get_eagle_hidden_states_event(capture_idx).record()
+    pass
 
 
 @torch.library.register_fake("trtllm::publish_eagle_hidden_states")
