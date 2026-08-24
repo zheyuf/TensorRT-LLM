@@ -2745,6 +2745,24 @@ def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
     tensor.record_stream(stream)
 
 
+@torch.library.custom_op("trtllm::eagle_hidden_states_copy",
+                         mutates_args=("dest", ))
+def eagle_hidden_states_copy(dest: torch.Tensor, src: torch.Tensor,
+                             dim1_start: int, dim1_end: int) -> None:
+    """Copy one Eagle hidden-state slice using a distinct FX target.
+
+    The target lets the multi-stream emitter preserve this required detached
+    side effect without forcing every detached in-place op to execute.
+    """
+    torch.ops.trtllm.inplace_slice_copy(dest, src, dim1_start, dim1_end)
+
+
+@torch.library.register_fake("trtllm::eagle_hidden_states_copy")
+def _eagle_hidden_states_copy_fake(dest: torch.Tensor, src: torch.Tensor,
+                                   dim1_start: int, dim1_end: int) -> None:
+    pass
+
+
 class Fp4GemmAllreduceRunner(TunableRunner):
     runner_dict = dict()
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(

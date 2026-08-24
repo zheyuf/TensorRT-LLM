@@ -5,7 +5,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
@@ -586,9 +585,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                     # check above already guarantees num_tokens <=
                     # residual.shape[0]; no separate check is needed.
                     to_save = to_save + residual[:num_tokens]
-                inplace_slice_copy(self.hidden_states, to_save,
-                                   i * self.hidden_size,
-                                   (i + 1) * self.hidden_size)
+                torch.ops.trtllm.eagle_hidden_states_copy(
+                    self.hidden_states, to_save, i * self.hidden_size,
+                    (i + 1) * self.hidden_size)
                 break
 
     def wait_for_captured_hidden_states(self) -> None:
