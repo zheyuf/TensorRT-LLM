@@ -2401,10 +2401,19 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         else:
             hidden_states, residual = self.forward_mlp(hidden_states, residual)
 
-        # hidden_states is fully TP-reduced at layer exit (no cross-layer
-        # allreduce+norm fusion).
+        # The layer-boundary norm materializes both the next layer's normalized
+        # input and the complete, unnormalized residual stream that Eagle was
+        # trained to consume. Capture that residual directly instead of adding
+        # the normalized value to it again. Standalone layers without wired
+        # norm aliases retain the generic hidden_states + residual path.
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
-            spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
+            if self.next_layer_layernorm is not None:
+                assert residual is not None
+                spec_metadata.maybe_capture_hidden_states(self.layer_idx, residual, None)
+            else:
+                spec_metadata.maybe_capture_hidden_states(
+                    self.layer_idx, hidden_states, residual
+                )
 
         return hidden_states, residual
 
