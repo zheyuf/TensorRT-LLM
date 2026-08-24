@@ -592,7 +592,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 break
 
     def wait_for_captured_hidden_states(self) -> None:
-        if not do_multi_stream():
+        # The join targets eager piecewise fallback. Avoid adding stream-event
+        # nodes while an enclosing decode CUDA graph is being captured.
+        if (not do_multi_stream() or torch.cuda.is_current_stream_capturing()):
             return
         # Hidden-state slices are side effects of the target multi-stream DAG,
         # not returned FX outputs. Join its auxiliary streams only at the
