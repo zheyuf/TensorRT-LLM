@@ -156,6 +156,7 @@ class MultiStreamDAG:
         self.work_list = []
         self.entry_node = None
         self.exit_node = None
+        self.eagle_capture_sink = None
 
         self.create_dag_from_gm(gm)
         assert self.entry_node is not None
@@ -190,6 +191,8 @@ class MultiStreamDAG:
                     args_new.append(arg)
             return args_new
 
+        eagle_capture_nodes = []
+
         # Pop all the placeholders from gm
         # We know that the node is already in topological order
         for node in gm.graph.nodes:
@@ -213,6 +216,9 @@ class MultiStreamDAG:
                 in_edges[None] = self.entry_node
 
             vertex = MultiStreamNode(node, in_edges)
+            if (node.op == "call_function" and node.target
+                    == torch.ops.trtllm.eagle_hidden_states_copy.default):
+                eagle_capture_nodes.append(vertex)
             if node.op == "output":
                 self.exit_node = vertex
                 vertex.distance = 0
@@ -230,7 +236,21 @@ class MultiStreamDAG:
 
             for edge in in_edges.values():
                 edge.out_edges.append(vertex)
+
+        # The final hidden-state write feeds a graph-external Eagle consumer.
+        # Give that write the output path's list-scheduling priority, then
+        # remove the synthetic edge before assigning streams so it cannot
+        # become a device-side graph-exit barrier.
+        if eagle_capture_nodes:
+            self.eagle_capture_sink = eagle_capture_nodes[-1]
+            edge_key = ("eagle_capture_priority",
+                        self.node_to_id[self.eagle_capture_sink.node])
+            self.eagle_capture_sink.out_edges.append(self.exit_node)
+            self.exit_node.in_edges[edge_key] = self.eagle_capture_sink
         self.compute_distance()
+        if self.eagle_capture_sink is not None:
+            self.eagle_capture_sink.out_edges.remove(self.exit_node)
+            del self.exit_node.in_edges[edge_key]
 
     def compute_distance(self) -> None:
         """
@@ -271,6 +291,12 @@ class MultiStreamDAG:
         streams = [Stream(i) for i in range(max_num_streams)]
 
         def pick_stream(start_time, node) -> Stream:
+            if node is self.eagle_capture_sink:
+                # The eager Eagle consumer runs on the primary stream. The
+                # final buffer write belongs there as well, so normal stream
+                # order publishes it without an external event or a join of
+                # unrelated auxiliary work.
+                return streams[0]
             if node.weight == 0:
                 # This is a symint node or a getitem node.
                 # It always assigns to the stream that produce the node.

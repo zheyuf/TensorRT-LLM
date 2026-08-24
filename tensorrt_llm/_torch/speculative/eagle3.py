@@ -402,6 +402,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
+    # Disaggregated context execution crosses from a piecewise target graph to
+    # a graph-external Eagle consumer. Its final capture needs explicit
+    # publication; aggregate execution retains the native capture schedule.
+    requires_hidden_states_publication: bool = False
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -580,14 +584,18 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                         f"hidden_states={hidden_states.shape[0]}")
                 to_save = hidden_states[:num_tokens]
                 if residual is not None:
-                    # residual shares its leading (token) dim with hidden_states
-                    # (both come from the same decoder layer), so the bound
-                    # check above already guarantees num_tokens <=
-                    # residual.shape[0]; no separate check is needed.
+                    # Both values come from the same decoder layer, so the
+                    # hidden-state bound above also covers residual.
                     to_save = to_save + residual[:num_tokens]
-                inplace_slice_copy(self.hidden_states, to_save,
-                                   i * self.hidden_size,
-                                   (i + 1) * self.hidden_size)
+                if (self.requires_hidden_states_publication
+                        and i == self.num_capture_layers - 1):
+                    torch.ops.trtllm.eagle_hidden_states_copy(
+                        self.hidden_states, to_save, i * self.hidden_size,
+                        (i + 1) * self.hidden_size)
+                else:
+                    inplace_slice_copy(self.hidden_states, to_save,
+                                       i * self.hidden_size,
+                                       (i + 1) * self.hidden_size)
                 break
 
 
