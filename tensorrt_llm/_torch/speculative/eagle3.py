@@ -602,11 +602,14 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         # DAG while guaranteeing that every slice is visible to the FC.
         from ..utils import get_model_extra_attrs
         extra_attrs = get_model_extra_attrs()
-        assert extra_attrs is not None, "Missing model extra attributes"
+        # CUDA-graph warmup can execute before ModelEngine has registered its
+        # compile backend streams. No auxiliary work exists in that phase.
+        if extra_attrs is None:
+            return
         global_stream = extra_attrs.get("global_stream")
         aux_streams_ref = extra_attrs.get("aux_streams")
-        assert global_stream is not None, "Missing primary CUDA stream"
-        assert aux_streams_ref is not None, "Missing auxiliary CUDA streams"
+        if global_stream is None or aux_streams_ref is None:
+            return
         for aux_stream in aux_streams_ref():
             global_stream.wait_stream(aux_stream)
         torch.cuda.set_stream(global_stream)
