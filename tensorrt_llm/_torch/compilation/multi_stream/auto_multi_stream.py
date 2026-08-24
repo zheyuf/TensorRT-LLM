@@ -275,17 +275,30 @@ class MultiStreamDAG:
         """
         worklist = PriorityQueue()
         num_nodes = len(self.node_to_id)
+        eagle_capture_distance = max(node.distance
+                                     for node in self.nodes.values()) + 1
 
         # When accessing node, the distance to the exit node is main priority.
         # The node with largest distance means currently this is the bottleneck of the whole graph.
-        def calc_priority(node_id: int, distance: int) -> int:
+        def calc_priority(node: MultiStreamNode) -> int:
             # We keep the node order by default.
             # It also gives deterministic order for priority queue.
+            node_id = self.node_to_id[node.node]
+            distance = node.distance
+            if node in self.required_before_output:
+                distance = eagle_capture_distance
             return (-distance) * num_nodes + node_id
 
         streams = [Stream(i) for i in range(max_num_streams)]
 
         def pick_stream(start_time, node) -> Stream:
+            if node in self.required_before_output and len(streams) > 1:
+                # Hidden-state copies are small and become ready while later
+                # target layers can still run. Queue them immediately on the
+                # existing auxiliary stream so their transfer overlaps that
+                # remaining model work instead of extending the eager
+                # consumer's critical path.
+                return streams[1]
             if node.weight == 0:
                 # This is a symint node or a getitem node.
                 # It always assigns to the stream that produce the node.
@@ -311,8 +324,7 @@ class MultiStreamDAG:
         self.entry_node.stream = streams[0]
         streams[0].nodes.append(self.entry_node)
         for out_edge in self.entry_node.out_edges:
-            worklist.put((calc_priority(self.node_to_id[out_edge.node],
-                                        out_edge.distance), out_edge))
+            worklist.put((calc_priority(out_edge), out_edge))
 
         sync_event_id = 0
 
@@ -329,6 +341,14 @@ class MultiStreamDAG:
                                 node.stream.current_time) + node.weight
             node.stream.current_time = node.end_time
             node.stream.nodes.append(node)
+            if node in self.required_before_output:
+                logger.info(
+                    "Eagle capture producer schedule: "
+                    f"node_id={self.node_to_id[node.node]}, "
+                    f"native_distance={node.distance}, "
+                    f"priority_distance={eagle_capture_distance}, "
+                    f"stream={node.stream.id}, start_time={start_time}, "
+                    f"end_time={node.end_time}")
 
             for in_edge_tensor, in_edge in node.in_edges.items():
                 if in_edge.stream != node.stream and not is_symint_node(
@@ -342,8 +362,7 @@ class MultiStreamDAG:
             for out_edge in node.out_edges:
                 self.in_degrees[out_edge] -= 1
                 if self.in_degrees[out_edge] == 0:
-                    worklist.put((calc_priority(self.node_to_id[out_edge.node],
-                                                out_edge.distance), out_edge))
+                    worklist.put((calc_priority(out_edge), out_edge))
         self.streams = streams
         return sync_event_id
 
