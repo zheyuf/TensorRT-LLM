@@ -2702,15 +2702,15 @@ def get_event(event_idx: int):
     return extra_attrs["events"]()[event_idx]
 
 
-def get_eagle_hidden_states_event(capture_idx: int) -> torch.cuda.Event:
+def get_eagle_hidden_states_event() -> torch.cuda.Event:
     from ..utils import get_model_extra_attrs
     extra_attrs = get_model_extra_attrs()
     assert extra_attrs is not None, "Missing model extra attributes"
     spec_metadata = extra_attrs.get("spec_metadata")
     assert spec_metadata is not None, "Missing speculative metadata"
-    events = spec_metadata.hidden_states_ready_events
-    assert events is not None, "Missing Eagle hidden-state events"
-    return events[capture_idx]
+    event = spec_metadata.hidden_states_ready_event
+    assert event is not None, "Missing Eagle hidden-state event"
+    return event
 
 
 def get_stream(stream_id: int):
@@ -2750,7 +2750,16 @@ def publish_eagle_hidden_states(hidden_states_buffer: torch.Tensor,
     the preceding physical buffer write before producing the executable graph.
     """
     if do_multi_stream():
-        get_eagle_hidden_states_event(capture_idx).record()
+        from ..utils import get_model_extra_attrs
+        extra_attrs = get_model_extra_attrs()
+        assert extra_attrs is not None, "Missing model extra attributes"
+        spec_metadata = extra_attrs.get("spec_metadata")
+        assert spec_metadata is not None, "Missing speculative metadata"
+        # The scheduler puts every capture copy on the same physical stream.
+        # Publishing the final slice therefore transitively publishes all
+        # earlier slices without adding two redundant record/wait pairs.
+        if capture_idx == spec_metadata.num_capture_layers - 1:
+            get_eagle_hidden_states_event().record()
 
 
 @torch.library.register_fake("trtllm::publish_eagle_hidden_states")

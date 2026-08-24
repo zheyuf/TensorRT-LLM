@@ -403,10 +403,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
-    # Each capture slice may live in a different piecewise graph/stream. Keep
-    # one external event per slice so the eager worker can join exactly those
-    # producers without relying on cross-graph stream assignment.
-    hidden_states_ready_events: Optional[List[torch.cuda.Event]] = None
+    # The multi-stream scheduler places every capture slice on the same
+    # physical auxiliary stream. Its final external event publishes all three
+    # writes to the eager drafter consumer.
+    hidden_states_ready_event: Optional[torch.cuda.Event] = None
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -432,11 +432,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
         if (self.num_capture_layers > 0
-                and self.hidden_states_ready_events is None):
-            self.hidden_states_ready_events = [
-                torch.cuda.Event(external=True)
-                for _ in range(self.num_capture_layers)
-            ]
+                and self.hidden_states_ready_event is None):
+            self.hidden_states_ready_event = torch.cuda.Event(external=True)
         if self.num_capture_layers == 0:
             # No layers to capture (MTP Eagle one-model). Skip buffer
             # allocation entirely; nothing reads self.hidden_states on this
@@ -612,9 +609,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         # the eager graph-external consumer.
         if (not do_multi_stream() or torch.cuda.is_current_stream_capturing()):
             return
-        assert self.hidden_states_ready_events is not None
-        for event in self.hidden_states_ready_events:
-            event.wait()
+        assert self.hidden_states_ready_event is not None
+        self.hidden_states_ready_event.wait()
 
 
 class Eagle3OneModelSampler(MTPSampler):
