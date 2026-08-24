@@ -403,8 +403,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
-    # CUDA-graph metadata copies share this event with the eager worker.
-    hidden_states_ready_event: Optional[torch.cuda.Event] = None
+    # Each capture slice may live in a different piecewise graph/stream. Keep
+    # one external event per slice so the eager worker can join exactly those
+    # producers without relying on cross-graph stream assignment.
+    hidden_states_ready_events: Optional[List[torch.cuda.Event]] = None
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -430,8 +432,11 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
         if (self.num_capture_layers > 0
-                and self.hidden_states_ready_event is None):
-            self.hidden_states_ready_event = torch.cuda.Event(external=True)
+                and self.hidden_states_ready_events is None):
+            self.hidden_states_ready_events = [
+                torch.cuda.Event(external=True)
+                for _ in range(self.num_capture_layers)
+            ]
         if self.num_capture_layers == 0:
             # No layers to capture (MTP Eagle one-model). Skip buffer
             # allocation entirely; nothing reads self.hidden_states on this
@@ -592,16 +597,24 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 inplace_slice_copy(self.hidden_states, to_save,
                                    i * self.hidden_size,
                                    (i + 1) * self.hidden_size)
-                if i == self.num_capture_layers - 1:
-                    torch.ops.trtllm.publish_eagle_hidden_states(
-                        self.hidden_states)
+                # This zero-cost marker makes the detached copy executable
+                # before its piecewise FX graph returns and records completion
+                # on the copy's exact stream. Capture layers can be split over
+                # different piecewise graphs, so publish every slice rather
+                # than assuming the final one orders the earlier writes.
+                torch.ops.trtllm.publish_eagle_hidden_states(
+                    self.hidden_states, i)
                 break
 
     def wait_for_captured_hidden_states(self) -> None:
-        if not do_multi_stream():
+        # During an enclosing decode CUDA-graph capture the piecewise work is
+        # already captured as part of the same graph. The explicit join is for
+        # the eager graph-external consumer.
+        if (not do_multi_stream() or torch.cuda.is_current_stream_capturing()):
             return
-        assert self.hidden_states_ready_event is not None
-        self.hidden_states_ready_event.wait()
+        assert self.hidden_states_ready_events is not None
+        for event in self.hidden_states_ready_events:
+            event.wait()
 
 
 class Eagle3OneModelSampler(MTPSampler):

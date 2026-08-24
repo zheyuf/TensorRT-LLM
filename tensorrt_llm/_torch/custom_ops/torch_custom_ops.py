@@ -2702,15 +2702,15 @@ def get_event(event_idx: int):
     return extra_attrs["events"]()[event_idx]
 
 
-def get_eagle_hidden_states_event() -> torch.cuda.Event:
+def get_eagle_hidden_states_event(capture_idx: int) -> torch.cuda.Event:
     from ..utils import get_model_extra_attrs
     extra_attrs = get_model_extra_attrs()
     assert extra_attrs is not None, "Missing model extra attributes"
     spec_metadata = extra_attrs.get("spec_metadata")
     assert spec_metadata is not None, "Missing speculative metadata"
-    event = spec_metadata.hidden_states_ready_event
-    assert event is not None, "Missing Eagle hidden-state event"
-    return event
+    events = spec_metadata.hidden_states_ready_events
+    assert events is not None, "Missing Eagle hidden-state events"
+    return events[capture_idx]
 
 
 def get_stream(stream_id: int):
@@ -2740,15 +2740,16 @@ def record_event(event_idx: int) -> None:
 
 
 @torch.library.custom_op("trtllm::publish_eagle_hidden_states", mutates_args=())
-def publish_eagle_hidden_states(hidden_states_buffer: torch.Tensor) -> None:
-    """Publish completion after the final Eagle hidden-state buffer write."""
+def publish_eagle_hidden_states(hidden_states_buffer: torch.Tensor,
+                                capture_idx: int) -> None:
+    """Publish completion of one Eagle hidden-state buffer slice."""
     if do_multi_stream():
-        get_eagle_hidden_states_event().record()
+        get_eagle_hidden_states_event(capture_idx).record()
 
 
 @torch.library.register_fake("trtllm::publish_eagle_hidden_states")
-def _publish_eagle_hidden_states_fake(
-        hidden_states_buffer: torch.Tensor) -> None:
+def _publish_eagle_hidden_states_fake(hidden_states_buffer: torch.Tensor,
+                                      capture_idx: int) -> None:
     pass
 
 
