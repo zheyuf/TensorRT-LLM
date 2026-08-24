@@ -578,14 +578,22 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                         "EAGLE3 hidden-state capture token count exceeds "
                         f"available hidden states: num_tokens={num_tokens}, "
                         f"hidden_states={hidden_states.shape[0]}")
-                to_save = hidden_states[:num_tokens]
-                if residual is not None:
-                    # residual shares its leading (token) dim with
-                    # hidden_states, so the bound check above covers both.
-                    to_save = to_save + residual[:num_tokens]
-                inplace_slice_copy(self.hidden_states, to_save,
-                                   i * self.hidden_size,
-                                   (i + 1) * self.hidden_size)
+                hidden_states = hidden_states[:num_tokens]
+                dim1_start = i * self.hidden_size
+                dim1_end = (i + 1) * self.hidden_size
+                if residual is None:
+                    inplace_slice_copy(self.hidden_states, hidden_states,
+                                       dim1_start, dim1_end)
+                else:
+                    # Write the residual sum directly into the capture buffer.
+                    # Keeping aten.add.out visible to FX preserves the native
+                    # multi-stream dependencies while avoiding an intermediate
+                    # add tensor and a second copy kernel.
+                    destination = self.hidden_states[:num_tokens,
+                                                     dim1_start:dim1_end]
+                    torch.add(hidden_states,
+                              residual[:num_tokens],
+                              out=destination)
                 break
 
 

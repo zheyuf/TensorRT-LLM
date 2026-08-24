@@ -171,6 +171,9 @@ def inplace_info():
         torch.ops.trtllm.inplace_slice_copy.default: {
             1: "dest"
         },
+        torch.ops.aten.add.out: {
+            1: "out"
+        },
         torch.ops.trtllm.verify_dynamic_tree_rejection_out_op.default: {
             5: "acceptIndex",
             6: "acceptTokenNum",
