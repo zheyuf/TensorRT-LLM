@@ -93,7 +93,10 @@ def estimate_time(node: Node) -> int:
     # residual is present, while emitting only the fused add-to-slice kernel.
     if (node.op == "call_function" and node.target
             == torch.ops.trtllm.capture_eagle_hidden_states.default):
-        return 2 if node.kwargs.get("residual") is not None else 1
+        residual = node.kwargs.get("residual")
+        if residual is None and len(node.args) > 2:
+            residual = node.args[2]
+        return 2 if residual is not None else 1
 
     # Adjust MOE weight to make the router -> MOE key path
     if node.op == "call_function" and node.target in moe_ops:
