@@ -245,7 +245,29 @@ class MultiStreamDAG:
 
             for edge in in_edges.values():
                 edge.out_edges.append(vertex)
+
+        # The capture copies are detached side effects, so their native DAG
+        # distance is zero even though the eager Eagle worker consumes their
+        # buffer immediately after this graph returns. Give only those exact
+        # producers an output-distance during priority calculation so list
+        # scheduling starts them as soon as their inputs are ready. Remove the
+        # virtual edges before stream assignment: they affect scheduling
+        # priority only and add no executable synchronization or graph node.
+        priority_edges = []
+        for producer in self.required_before_output:
+            if self.exit_node in producer.out_edges:
+                continue
+            edge_key = ("eagle_hidden_states_priority",
+                        self.node_to_id[producer.node])
+            producer.out_edges.append(self.exit_node)
+            self.exit_node.in_edges[edge_key] = producer
+            priority_edges.append((edge_key, producer))
+
         self.compute_distance()
+
+        for edge_key, producer in priority_edges:
+            producer.out_edges.remove(self.exit_node)
+            del self.exit_node.in_edges[edge_key]
 
     def compute_distance(self) -> None:
         """
