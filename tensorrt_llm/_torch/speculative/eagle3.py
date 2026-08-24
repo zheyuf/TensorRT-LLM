@@ -5,7 +5,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
@@ -583,9 +582,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                     # Both values come from the same decoder layer, so the
                     # hidden-state bound above also covers residual.
                     to_save = to_save + residual[:num_tokens]
-                inplace_slice_copy(self.hidden_states, to_save,
-                                   i * self.hidden_size,
-                                   (i + 1) * self.hidden_size)
+                torch.ops.trtllm.eagle_hidden_states_copy(
+                    self.hidden_states, to_save, i * self.hidden_size,
+                    (i + 1) * self.hidden_size)
                 break
 
 
