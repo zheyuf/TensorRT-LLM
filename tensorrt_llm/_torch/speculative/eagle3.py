@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
@@ -583,15 +584,17 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                         "EAGLE3 hidden-state capture token count exceeds "
                         f"available hidden states: num_tokens={num_tokens}, "
                         f"hidden_states={hidden_states.shape[0]}")
-                # residual shares its leading (token) dim with hidden_states,
-                # so the bound check above covers both tensors.
-                hidden_states = hidden_states[:num_tokens]
-                residual = (residual[:num_tokens]
-                            if residual is not None else None)
-                torch.ops.trtllm.capture_eagle_hidden_states(
-                    self.hidden_states, hidden_states, residual,
-                    i * self.hidden_size, (i + 1) * self.hidden_size,
-                    i == self.num_capture_layers - 1)
+                to_save = hidden_states[:num_tokens]
+                if residual is not None:
+                    # residual shares its leading (token) dim with
+                    # hidden_states, so the bound check above covers both.
+                    to_save = to_save + residual[:num_tokens]
+                inplace_slice_copy(self.hidden_states, to_save,
+                                   i * self.hidden_size,
+                                   (i + 1) * self.hidden_size)
+                if i == self.num_capture_layers - 1:
+                    torch.ops.trtllm.publish_eagle_hidden_states(
+                        self.hidden_states)
                 break
 
     def wait_for_captured_hidden_states(self) -> None:

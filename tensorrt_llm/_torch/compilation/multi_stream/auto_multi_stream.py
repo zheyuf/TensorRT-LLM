@@ -47,7 +47,8 @@ def estimate_time(node: Node) -> int:
     no_cost_ops = {
         getitem, torch.ops.aten.view.default, torch.ops.aten.view.dtype,
         torch.ops.aten.alias.default, torch.ops.aten.empty.memory_format,
-        torch.ops.aten.permute.default
+        torch.ops.aten.permute.default,
+        torch.ops.trtllm.publish_eagle_hidden_states.default
     }
 
     moe_ops = {
@@ -156,6 +157,7 @@ class MultiStreamDAG:
         self.work_list = []
         self.entry_node = None
         self.exit_node = None
+        self.required_before_output = set()
 
         self.create_dag_from_gm(gm)
         assert self.entry_node is not None
@@ -213,6 +215,9 @@ class MultiStreamDAG:
                 in_edges[None] = self.entry_node
 
             vertex = MultiStreamNode(node, in_edges)
+            if (node.op == "call_function" and node.target
+                    == torch.ops.trtllm.publish_eagle_hidden_states.default):
+                self.required_before_output.add(vertex)
             if node.op == "output":
                 self.exit_node = vertex
                 vertex.distance = 0
@@ -358,7 +363,7 @@ class MultiStreamDAG:
         self.in_degrees[self.entry_node] = 0
 
         stream_pos = [0] * len(self.streams)
-        remaining_nodes = sum(len(st.nodes) for st in self.streams)
+        remaining_required = len(self.required_before_output)
 
         def has_more_nodes() -> bool:
             for st in self.streams:
@@ -367,7 +372,7 @@ class MultiStreamDAG:
             return False
 
         def should_defer_output(node: MultiStreamNode) -> bool:
-            return (remaining_nodes > 1 and node.node is not None
+            return (remaining_required > 0 and node.node is not None
                     and node.node.op == "output")
 
         last_stream = 0
@@ -382,9 +387,9 @@ class MultiStreamDAG:
                     # This stream is not ready to run now.
                     continue
                 if should_defer_output(node):
-                    # Output must be the final host-side instruction. Other
-                    # streams may still have independent work to launch, but
-                    # this adds no GPU completion dependency.
+                    # The Eagle publish node is a detached side effect. Emit
+                    # it before returning from the FX graph, without pulling
+                    # unrelated detached work into the consumer's dependency.
                     continue
 
                 # Any time the stream is changed, set the stream.
@@ -404,7 +409,10 @@ class MultiStreamDAG:
                     for out_edge in node.out_edges:
                         self.in_degrees[out_edge] -= 1
                     stream_pos[st.id] += 1
-                    remaining_nodes -= 1
+                    emitted_last_required = (node in self.required_before_output
+                                             and remaining_required == 1)
+                    if node in self.required_before_output:
+                        remaining_required -= 1
                     # It could be the fake entry node.
                     if node.node is not None:
                         # Wait on all the events that the node is waiting on.
@@ -427,6 +435,10 @@ class MultiStreamDAG:
                         new_graph.create_node("call_function",
                                               torch.ops.trtllm.record_event,
                                               args=(node.event, ))
+                    if emitted_last_required:
+                        # Reconsider the primary stream immediately so output
+                        # can return before unrelated detached work.
+                        break
 
                 # After each handling, start again to make sure primary stream is pushed first.
                 break
