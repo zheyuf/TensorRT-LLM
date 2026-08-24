@@ -291,12 +291,6 @@ class MultiStreamDAG:
         streams = [Stream(i) for i in range(max_num_streams)]
 
         def pick_stream(start_time, node) -> Stream:
-            if node is self.eagle_capture_sink:
-                # The eager Eagle consumer runs on the primary stream. The
-                # final buffer write belongs there as well, so normal stream
-                # order publishes it without an external event or a join of
-                # unrelated auxiliary work.
-                return streams[0]
             if node.weight == 0:
                 # This is a symint node or a getitem node.
                 # It always assigns to the stream that produce the node.

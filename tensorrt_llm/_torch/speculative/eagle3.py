@@ -11,6 +11,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
+from ..modules.multi_stream_utils import do_multi_stream
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
@@ -406,6 +407,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     # a graph-external Eagle consumer. Its final capture needs explicit
     # publication; aggregate execution retains the native capture schedule.
     requires_hidden_states_publication: bool = False
+    hidden_states_ready_event: Optional[torch.cuda.Event] = None
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -430,6 +432,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
+        if (self.requires_hidden_states_publication
+                and self.num_capture_layers > 0
+                and self.hidden_states_ready_event is None):
+            self.hidden_states_ready_event = torch.cuda.Event(external=True)
         if self.num_capture_layers == 0:
             # No layers to capture (MTP Eagle one-model). Skip buffer
             # allocation entirely; nothing reads self.hidden_states on this
@@ -597,6 +603,12 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                        i * self.hidden_size,
                                        (i + 1) * self.hidden_size)
                 break
+
+    def wait_for_captured_hidden_states(self) -> None:
+        if not self.requires_hidden_states_publication or not do_multi_stream():
+            return
+        assert self.hidden_states_ready_event is not None
+        self.hidden_states_ready_event.wait()
 
 
 class Eagle3OneModelSampler(MTPSampler):
@@ -1245,6 +1257,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         if not self.is_mtp_eagle:
             # Eagle3: project the multi-layer concatenated hidden states.
+            spec_metadata.wait_for_captured_hidden_states()
             hidden_size_up = spec_metadata.hidden_size * len(
                 spec_metadata.layers_to_capture)
             hidden_states = spec_metadata.hidden_states[:num_tokens, :
