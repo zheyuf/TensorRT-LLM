@@ -292,13 +292,6 @@ class MultiStreamDAG:
         streams = [Stream(i) for i in range(max_num_streams)]
 
         def pick_stream(start_time, node) -> Stream:
-            if node in self.required_before_output and len(streams) > 1:
-                # Hidden-state copies are small and become ready while later
-                # target layers can still run. Queue them immediately on the
-                # existing auxiliary stream so their transfer overlaps that
-                # remaining model work instead of extending the eager
-                # consumer's critical path.
-                return streams[1]
             if node.weight == 0:
                 # This is a symint node or a getitem node.
                 # It always assigns to the stream that produce the node.
@@ -336,6 +329,7 @@ class MultiStreamDAG:
             # Start time is the max of the end time of all the in edges.
             start_time = max(
                 [in_edge.end_time for in_edge in node.in_edges.values()])
+            stream_times_before = tuple(st.current_time for st in streams)
             node.stream = pick_stream(start_time, node)
             node.end_time = max(start_time,
                                 node.stream.current_time) + node.weight
@@ -348,7 +342,8 @@ class MultiStreamDAG:
                     f"native_distance={node.distance}, "
                     f"priority_distance={eagle_capture_distance}, "
                     f"stream={node.stream.id}, start_time={start_time}, "
-                    f"end_time={node.end_time}")
+                    f"end_time={node.end_time}, "
+                    f"stream_times_before={stream_times_before}")
 
             for in_edge_tensor, in_edge in node.in_edges.items():
                 if in_edge.stream != node.stream and not is_symint_node(
