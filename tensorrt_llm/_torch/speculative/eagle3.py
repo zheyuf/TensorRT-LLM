@@ -587,7 +587,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                     # Both values come from the same decoder layer, so the
                     # hidden-state bound above also covers residual.
                     to_save = to_save + residual[:num_tokens]
-                if self.requires_hidden_states_publication:
+                if (self.requires_hidden_states_publication
+                        and i == self.num_capture_layers - 1):
                     torch.ops.trtllm.eagle_hidden_states_copy(
                         self.hidden_states, to_save, i * self.hidden_size,
                         (i + 1) * self.hidden_size)
