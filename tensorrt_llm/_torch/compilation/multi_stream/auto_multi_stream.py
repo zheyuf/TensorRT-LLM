@@ -88,6 +88,13 @@ def estimate_time(node: Node) -> int:
     GEMM_OP_COST = 10
     DEFAULT_OP_COST = 1
 
+    # The fused Eagle capture replaces the historical add followed by an
+    # in-place slice copy. Preserve that two-node scheduling cost when a
+    # residual is present, while emitting only the fused add-to-slice kernel.
+    if (node.op == "call_function" and node.target
+            == torch.ops.trtllm.capture_eagle_hidden_states.default):
+        return 2 if node.kwargs.get("residual") is not None else 1
+
     # Adjust MOE weight to make the router -> MOE key path
     if node.op == "call_function" and node.target in moe_ops:
         return MOE_OP_COST
