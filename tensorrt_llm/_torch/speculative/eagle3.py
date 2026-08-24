@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
@@ -401,6 +402,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
+    # Disaggregated context execution crosses from a piecewise target graph to
+    # a graph-external Eagle consumer. Its final capture needs explicit
+    # publication; aggregate execution retains the native capture schedule.
+    requires_hidden_states_publication: bool = False
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -582,9 +587,14 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                     # Both values come from the same decoder layer, so the
                     # hidden-state bound above also covers residual.
                     to_save = to_save + residual[:num_tokens]
-                torch.ops.trtllm.eagle_hidden_states_copy(
-                    self.hidden_states, to_save, i * self.hidden_size,
-                    (i + 1) * self.hidden_size)
+                if self.requires_hidden_states_publication:
+                    torch.ops.trtllm.eagle_hidden_states_copy(
+                        self.hidden_states, to_save, i * self.hidden_size,
+                        (i + 1) * self.hidden_size)
+                else:
+                    inplace_slice_copy(self.hidden_states, to_save,
+                                       i * self.hidden_size,
+                                       (i + 1) * self.hidden_size)
                 break
 
 
