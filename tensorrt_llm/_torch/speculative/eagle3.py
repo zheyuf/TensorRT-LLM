@@ -402,6 +402,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
+    # Published by the last hidden-state copy and consumed by the eager drafter.
+    hidden_states_ready_event: Optional[torch.cuda.Event] = None
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -426,6 +428,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
+        if (self.num_capture_layers > 0
+                and self.hidden_states_ready_event is None):
+            self.hidden_states_ready_event = torch.cuda.Event(external=True)
         if self.num_capture_layers == 0:
             # No layers to capture (MTP Eagle one-model). Skip buffer
             # allocation entirely; nothing reads self.hidden_states on this
@@ -587,7 +592,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                     to_save = to_save + residual[:num_tokens]
                 torch.ops.trtllm.eagle_hidden_states_copy(
                     self.hidden_states, to_save, i * self.hidden_size,
-                    (i + 1) * self.hidden_size)
+                    (i + 1) * self.hidden_size,
+                    i == self.num_capture_layers - 1)
                 break
 
     def wait_for_captured_hidden_states(self) -> None:
@@ -595,23 +601,11 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         # nodes while an enclosing decode CUDA graph is being captured.
         if (not do_multi_stream() or torch.cuda.is_current_stream_capturing()):
             return
-        # Hidden-state slices are side effects of the target multi-stream DAG,
-        # not returned FX outputs. Join its auxiliary streams only at the
-        # graph-external Eagle consumer, preserving the historical scheduling
-        # DAG while guaranteeing that every slice is visible to the FC.
-        from ..utils import get_model_extra_attrs
-        extra_attrs = get_model_extra_attrs()
-        # CUDA-graph warmup can execute before ModelEngine has registered its
-        # compile backend streams. No auxiliary work exists in that phase.
-        if extra_attrs is None:
-            return
-        global_stream = extra_attrs.get("global_stream")
-        aux_streams_ref = extra_attrs.get("aux_streams")
-        if global_stream is None or aux_streams_ref is None:
-            return
-        for aux_stream in aux_streams_ref():
-            global_stream.wait_stream(aux_stream)
-        torch.cuda.set_stream(global_stream)
+        # The final copy is transitively ordered after the earlier slices, so
+        # this single event expresses exactly the dependency the eager drafter
+        # needs without waiting for unrelated auxiliary-stream work.
+        assert self.hidden_states_ready_event is not None
+        self.hidden_states_ready_event.wait()
 
 
 class Eagle3OneModelSampler(MTPSampler):
