@@ -632,6 +632,42 @@ def _extract_minimax_m3_attention_extra_attrs(layer_idx: str):
     return metadata, attn_layer
 
 
+def _dispatch_attention_over_live_tokens(
+    attn_layer: "MiniMaxM3Attention",
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    idx_q: Optional[torch.Tensor],
+    idx_k: Optional[torch.Tensor],
+    attn_metadata: AttentionMetadata,
+    output: torch.Tensor,
+) -> None:
+    """Run attention over live tokens, excluding CUDA-graph padding rows.
+
+    Piecewise CUDA graphs pad token-shaped inputs to a capture bucket without
+    adding requests for those rows.  MSA kernels derive request information
+    from token indices, so only the live prefix may enter the backend.  Clear
+    the unused output suffix as well so stale graph-buffer values cannot flow
+    into sampling as NaNs.
+
+    This is the model-layer portion of upstream correctness fix
+    c422e8900da38dd96edf70ea48becdb6d73cb5d3, adapted to the effacf70 API in
+    which main K and V are required tensors.
+    """
+    num_tokens = int(attn_metadata.num_tokens)
+    if num_tokens < int(output.shape[0]):
+        output[num_tokens:].zero_()
+    attn_layer._dispatch_attention_backend(
+        q[:num_tokens],
+        k[:num_tokens],
+        v[:num_tokens],
+        idx_q[:num_tokens] if idx_q is not None else None,
+        idx_k[:num_tokens] if idx_k is not None else None,
+        attn_metadata,
+        output[:num_tokens],
+    )
+
+
 @torch.library.custom_op("trtllm::minimax_m3_attn_custom_op_inplace", mutates_args=("output",))
 def minimax_m3_attn_custom_op_inplace(
     q: torch.Tensor,
@@ -644,15 +680,8 @@ def minimax_m3_attn_custom_op_inplace(
 ) -> None:
     """Run MiniMax-M3 cache and attention work behind a compile boundary."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
-    num_tokens = attn_metadata.num_tokens
-    attn_layer._dispatch_attention_backend(
-        q[:num_tokens],
-        k[:num_tokens],
-        v[:num_tokens],
-        idx_q[:num_tokens] if idx_q is not None else None,
-        idx_k[:num_tokens] if idx_k is not None else None,
-        attn_metadata,
-        output[:num_tokens],
+    _dispatch_attention_over_live_tokens(
+        attn_layer, q, k, v, idx_q, idx_k, attn_metadata, output
     )
 
 
@@ -1261,7 +1290,9 @@ class MiniMaxM3Attention(Attention):
                 output,
             )
         else:
-            self._dispatch_attention_backend(q, k, v, idx_q, idx_k, attn_metadata, output)
+            _dispatch_attention_over_live_tokens(
+                self, q, k, v, idx_q, idx_k, attn_metadata, output
+            )
         return output
 
     def _dispatch_attention_backend(
