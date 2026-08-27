@@ -139,6 +139,10 @@ class CUDAGraphRunner:
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
+        # graph_outputs holds only non-owning weak refs, so these strong refs are
+        # what stop the capture-time output storage from returning to the shared
+        # graph pool and being reused while the graph is still replayable.
+        self._graph_output_refs: Dict[KeyType, Any] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
         self.padding_dummy_requests: Dict[int, LlmRequest] = {}
@@ -468,6 +472,9 @@ class CUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            # Do not keep the eager result live from this runner across graph
+            # setup/capture; release its reference before entering.
+            output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
@@ -477,6 +484,7 @@ class CUDAGraphRunner:
                                                saved_kv_lens_cuda)
 
         self.graphs[key] = graph
+        self._graph_output_refs[key] = output
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
         self.memory_pool = graph.pool()
@@ -703,6 +711,9 @@ class CUDAGraphRunner:
 
     def clear(self):
         """Releases all captured graphs and the associated memory pool."""
+        # Drop the output buffers while the pool that backs them is still alive;
+        # freeing them after graph.reset() trips the allocator's use_count check.
+        self._graph_output_refs.clear()
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
@@ -758,6 +769,8 @@ class EncoderCUDAGraphRunner:
         self.graphs: Dict[EncoderKeyType, torch.cuda.CUDAGraph] = {}
         self.graph_outputs: Dict[EncoderKeyType, Callable[[],
                                                           Optional[Any]]] = {}
+        # See CUDAGraphRunner._graph_output_refs.
+        self._graph_output_refs: Dict[EncoderKeyType, Any] = {}
         self.graph_metadata: Dict[EncoderKeyType, Dict[str, Any]] = {}
         self.memory_pool = config.cuda_graph_mem_pool
 
@@ -1057,6 +1070,9 @@ class EncoderCUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            # Do not keep the eager result live from this runner across graph
+            # setup/capture; release its reference before entering.
+            output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 if self._capture_h2d_copy:
                     # H2D copies for captured inside the graph: at replay
@@ -1077,6 +1093,7 @@ class EncoderCUDAGraphRunner:
                 "Encoder CUDA graph does not support nested tensor outputs. "
                 "Disable encoder CUDA graphs for models with ragged outputs.")
         self.graphs[key] = graph
+        self._graph_output_refs[key] = output
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
         self.memory_pool = graph.pool()
@@ -1148,6 +1165,7 @@ class EncoderCUDAGraphRunner:
         return self.memory_pool
 
     def clear(self):
+        self._graph_output_refs.clear()
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
