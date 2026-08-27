@@ -468,6 +468,9 @@ class CUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            # Do not keep the eager result live from this runner across graph
+            # setup/capture; release its reference before entering.
+            output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
@@ -1057,6 +1060,9 @@ class EncoderCUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            # Do not keep the eager result live from this runner across graph
+            # setup/capture; release its reference before entering.
+            output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 if self._capture_h2d_copy:
                     # H2D copies for captured inside the graph: at replay
