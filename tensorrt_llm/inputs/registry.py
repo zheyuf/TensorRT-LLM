@@ -153,6 +153,116 @@ class InputProcessor(Protocol):
         ...
 
 
+# ---------------------------------------------------------------------------
+# Experimental: exact parallel tokenization of long text prompts.
+# Long agentic prompts (100k+ tokens, 0.5-2.5 MB of text) spend 300-900 ms in a
+# single-threaded HF ``encode``.  Added/special tokens (chat-role markers) are
+# matched before BPE and never merge with neighbouring text, so the prompt can
+# be split right *before* every added-token occurrence and the pieces encoded
+# with the Rust ``encode_batch`` (Rayon threads); concatenating the ids is
+# bit-identical to the serial encode.  Gate: env ``TLLM_PARALLEL_TOKENIZE``
+# ("1"/"true" -> on; a path -> on iff that file exists, so it can be toggled
+# at runtime for A/B tests).  Only used for ``add_special_tokens=False`` and
+# when no truncation is requested.
+# ---------------------------------------------------------------------------
+import os as _ptok_os
+import re as _ptok_re
+import threading as _ptok_threading
+
+_PTOK_ENV = "TLLM_PARALLEL_TOKENIZE"
+_PTOK_MIN_CHARS = int(_ptok_os.environ.get("TLLM_PARALLEL_TOKENIZE_MIN_CHARS", "32768"))
+_PTOK_MIN_PARTS = int(_ptok_os.environ.get("TLLM_PARALLEL_TOKENIZE_MIN_PARTS", "4"))
+_PTOK_VERIFY = _ptok_os.environ.get("TLLM_PARALLEL_TOKENIZE_VERIFY", "0") == "1"
+_ptok_cache: Dict[int, Any] = {}
+_ptok_lock = _ptok_threading.Lock()
+_ptok_stats = {"parallel": 0, "serial": 0, "mismatch": 0, "announced": False}
+
+
+def _parallel_tokenize_enabled() -> bool:
+    v = _ptok_os.environ.get(_PTOK_ENV)
+    if not v:
+        return False
+    if v.lower() in ("1", "true", "on", "yes"):
+        return True
+    return _ptok_os.path.exists(v)
+
+
+def _ptok_backend(tokenizer):
+    """Return (split_regex, rust_tokenizer) for an HF fast tokenizer, else None."""
+    hf = getattr(tokenizer, "tokenizer", tokenizer)
+    rt = getattr(hf, "_tokenizer", None) or getattr(hf, "backend_tokenizer", None)
+    if rt is None or not hasattr(rt, "encode_batch"):
+        return None
+    key = id(hf)
+    with _ptok_lock:
+        ent = _ptok_cache.get(key)
+        if ent is not None:
+            return ent
+        markers = set()
+        try:
+            for tok in rt.get_added_tokens_decoder().values():
+                # lstrip tokens swallow preceding whitespace; splitting before them
+                # would change the previous chunk -> exclude those.
+                if getattr(tok, "lstrip", False) or getattr(tok, "single_word", False):
+                    continue
+                if tok.content:
+                    markers.add(tok.content)
+        except Exception:
+            pass
+        for attr in ("all_special_tokens_extended", "all_special_tokens"):
+            for t in (getattr(hf, attr, None) or []):
+                if isinstance(t, str) and t:
+                    markers.add(t)
+        # Prefer markers the chat template can emit (role/turn delimiters) plus the special
+        # tokens; omitting other added tokens only reduces split points (still exact) but keeps
+        # the per-request presence scan cheap for tokenizers with >1000 added tokens.
+        template = getattr(hf, "chat_template", None)
+        if isinstance(template, dict):
+            template = "\n".join(str(v) for v in template.values())
+        if isinstance(template, str) and template:
+            in_template = {m for m in markers if m in template}
+            specials = {t for t in (getattr(hf, "all_special_tokens", None) or []) if isinstance(t, str)}
+            if in_template | specials:
+                markers = in_template | specials
+        # Keep the marker list (sorted longest-first); the split regex is built per
+        # request from the markers actually present in the text (C-speed ``in``
+        # scans), because a 60-way alternation lookahead over a 1 MB prompt costs
+        # ~100 ms in Python's ``re`` while 2-4 present markers cost ~10 ms.
+        ent = (sorted(markers, key=len, reverse=True) if markers else None, rt)
+        _ptok_cache[key] = ent
+        return ent
+
+
+_ptok_regex_cache: Dict[tuple, Any] = {}
+
+
+def _ptok_split(markers, text: str):
+    present = tuple(m for m in markers if m in text)
+    if not present:
+        return None
+    pat = _ptok_regex_cache.get(present)
+    if pat is None:
+        pat = _ptok_re.compile("(?=" + "|".join(_ptok_re.escape(m) for m in present) + ")")
+        if len(_ptok_regex_cache) < 256:
+            _ptok_regex_cache[present] = pat
+    return [p for p in pat.split(text) if p]
+
+
+def _parallel_encode(tokenizer, text: str):
+    """Exact parallel encode of ``text`` (no special tokens added); None -> caller falls back."""
+    ent = _ptok_backend(tokenizer)
+    if ent is None or ent[0] is None or len(text) < _PTOK_MIN_CHARS:
+        return None
+    markers, rt = ent
+    parts = _ptok_split(markers, text)
+    if parts is None or len(parts) < _PTOK_MIN_PARTS:
+        return None
+    ids: List[int] = []
+    for enc in rt.encode_batch(parts, add_special_tokens=False):
+        ids.extend(enc.ids)
+    return ids
+
+
 class DefaultInputProcessor(InputProcessor):
     """Preprocess the inputs to the model."""
 
@@ -195,15 +305,38 @@ class DefaultInputProcessor(InputProcessor):
             "<|reserved_200013|>",
         }
         with nvtx_range_debug("tokenize prompt"):
-            try:
-                token_ids = self.tokenizer.encode(
-                    inputs["prompt"],
-                    add_special_tokens=sampling_params.add_special_tokens,
-                    **kwargs)
-            except:
-                # Tiktoken path
-                token_ids = self.tokenizer.encode(
-                    inputs["prompt"], allowed_special=toktoken_special_tokens)
+            token_ids = None
+            if (not kwargs and not sampling_params.add_special_tokens
+                    and isinstance(inputs["prompt"], str)
+                    and _parallel_tokenize_enabled()):
+                try:
+                    token_ids = _parallel_encode(self.tokenizer, inputs["prompt"])
+                except Exception as e:  # never fail a request because of the fast path
+                    logger.warning(f"parallel tokenize failed, falling back: {e!r}")
+                    token_ids = None
+                if token_ids is not None:
+                    _ptok_stats["parallel"] += 1
+                    if not _ptok_stats["announced"]:
+                        _ptok_stats["announced"] = True
+                        logger.info("[parallel-tokenize] active: split-at-added-tokens + encode_batch "
+                                    f"(min_chars={_PTOK_MIN_CHARS}, verify={_PTOK_VERIFY})")
+                    if _PTOK_VERIFY:
+                        ref = self.tokenizer.encode(inputs["prompt"], add_special_tokens=False)
+                        if list(ref) != list(token_ids):
+                            _ptok_stats["mismatch"] += 1
+                            logger.error(f"[parallel-tokenize] MISMATCH len {len(ref)} vs {len(token_ids)}; using serial")
+                            token_ids = list(ref)
+            if token_ids is None:
+                _ptok_stats["serial"] += 1
+                try:
+                    token_ids = self.tokenizer.encode(
+                        inputs["prompt"],
+                        add_special_tokens=sampling_params.add_special_tokens,
+                        **kwargs)
+                except:
+                    # Tiktoken path
+                    token_ids = self.tokenizer.encode(
+                        inputs["prompt"], allowed_special=toktoken_special_tokens)
 
         return token_ids, None
 

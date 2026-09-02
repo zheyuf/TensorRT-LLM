@@ -65,6 +65,8 @@ from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.incremental_tokenize import (
+    get_incremental_tokenizer, incremental_tokenize_enabled)
 from tensorrt_llm.serve.disagg_auth import (
     request_requires_internal_disagg_auth, validate_internal_disagg_request)
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
@@ -2175,6 +2177,31 @@ class OpenAIServer(_VideoRoutesMixin):
                     # Force the model to start generation inside the tool call.
                     # See ``_build_forced_tool_call_decoding`` for details.
                     prompt = prompt + forced_tool_begin_prefix
+                # Exact incremental tokenization keyed by the conversation id (the same
+                # id the KV-cache per_conversation policy uses): text-only requests are
+                # converted to token ids here so the input processor's full-prompt
+                # tokenization is skipped. The ids are identical to the serial encode.
+                if (isinstance(prompt, str) and not mm_data and not mm_embeddings
+                        and not request.add_special_tokens
+                        and incremental_tokenize_enabled()):
+                    inc_tokenizer = get_incremental_tokenizer(self.tokenizer)
+                    if inc_tokenizer is not None:
+                        resolve_request_conversation_id(
+                            request,
+                            None if raw_request is None else raw_request.headers)
+                        conv_id = (request.conversation_params.conversation_id
+                                   if request.conversation_params is not None else None)
+                        try:
+                            prompt = await asyncio.get_event_loop().run_in_executor(
+                                self._input_proc_executor, inc_tokenizer.encode,
+                                conv_id, prompt)
+                            if not getattr(self, "_incremental_tokenize_announced", False):
+                                self._incremental_tokenize_announced = True
+                                logger.info("[incremental-tokenize] active "
+                                            "(conversation-keyed exact incremental encode)")
+                        except Exception as e:  # never fail a request because of the fast path
+                            logger.warning(
+                                f"[incremental-tokenize] failed, falling back to text prompt: {e!r}")
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:

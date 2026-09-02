@@ -1719,6 +1719,23 @@ def load_minimax_m3_vl_state_dict(
 # ---------------------------------------------------------------------------
 
 
+# ---- experimental exact parallel tokenization for text-only prompts (see tensorrt_llm/inputs/registry.py) ----
+try:
+    from tensorrt_llm.inputs.registry import _PTOK_VERIFY as _ptok_verify_flag
+    from tensorrt_llm.inputs.registry import _parallel_encode as _ptok_encode
+    from tensorrt_llm.inputs.registry import _parallel_tokenize_enabled as _ptok_enabled
+    from tensorrt_llm.inputs.registry import _ptok_stats
+except Exception:  # registry overlay not installed -> feature off
+    _ptok_encode = None
+    _ptok_enabled = lambda: False
+    _ptok_verify_flag = False
+    _ptok_stats = {"parallel": 0, "serial": 0, "mismatch": 0, "announced": False}
+try:
+    from tensorrt_llm.logger import logger as _ptok_logger
+except Exception:  # pragma: no cover
+    import logging as _ptok_logging
+    _ptok_logger = _ptok_logging.getLogger(__name__)
+
 class MiniMaxM3VLInputProcessor:
     """LLM-API input processor for MiniMax-M3 VL multimodal requests.
 
@@ -2050,6 +2067,32 @@ class MiniMaxM3VLInputProcessor:
                 templated_text = "\n".join(explicit)
         else:
             templated_text = text_prompt or ""
+
+        # Text-only fast path: exact parallel tokenization (split at added-token
+        # boundaries + Rust encode_batch). The HF processor path below is
+        # equivalent to ``tokenizer.encode(text, add_special_tokens=False)`` for
+        # this checkpoint (verified: identical ids), so the ids are interchangeable.
+        if (not images and not videos and _ptok_encode is not None
+                and isinstance(templated_text, str) and _ptok_enabled()):
+            try:
+                fast_ids = _ptok_encode(self._tokenizer, templated_text)
+            except Exception as e:  # never fail a request because of the fast path
+                _ptok_logger.warning(f"[parallel-tokenize] failed, falling back: {e!r}")
+                fast_ids = None
+            if fast_ids is not None:
+                _ptok_stats["parallel"] += 1
+                if not _ptok_stats["announced"]:
+                    _ptok_stats["announced"] = True
+                    _ptok_logger.info("[parallel-tokenize] active in MiniMaxM3VLInputProcessor "
+                                      f"(verify={_ptok_verify_flag})")
+                if _ptok_verify_flag:
+                    ref = self._processor(text=[templated_text], return_tensors="pt")["input_ids"][0].to(torch.int32).tolist()
+                    if ref != fast_ids:
+                        _ptok_stats["mismatch"] += 1
+                        _ptok_logger.error(f"[parallel-tokenize] MISMATCH len {len(ref)} vs {len(fast_ids)}; using processor ids")
+                        fast_ids = ref
+                return fast_ids, {"multimodal_data": {}}
+            _ptok_stats["serial"] += 1
 
         # Run the HF processor. ``return_tensors='pt'`` yields tensors
         # in the BatchFeature output.
