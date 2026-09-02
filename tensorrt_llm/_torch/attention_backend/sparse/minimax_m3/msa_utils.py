@@ -8,7 +8,7 @@ import functools
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 
@@ -55,26 +55,59 @@ def msa_ported_decode_active(metadata) -> bool:
     )
 
 
-def msa_decode_span_bounds(metadata, num_tokens: int) -> Tuple[int, int, int, int]:
-    """Bounds of the generation span, as (token_first, row_first, row_last, query_len).
+class MsaSpanBounds(NamedTuple):
+    """The generation span's bounds.
 
-    The span is what the ported decode kernels own this step; see
-    _MsaDecodeSpan in msa_backend. Reading it through getattr keeps this module
-    free of an import back into the backend, and covers the standalone kernel
-    tests, whose metadata never ran prepare() and so carries no span: there the
-    whole batch is the span, derived from the query length alone.
+    Labelled so that a call site taking only some of the five does not depend
+    on their order. Unpacks positionally.
+    """
+
+    token_first: int
+    token_last: int
+    row_first: int
+    row_last: int
+    query_len: int
+
+
+def msa_decode_span_bounds(metadata, num_tokens: int) -> MsaSpanBounds:
+    """Bounds of the generation span the ported decode kernels own this step.
+
+    See _MsaDecodeSpan in msa_backend for what the span is. Reading it through
+    getattr keeps this module free of an import back into the backend, and
+    covers the standalone kernel tests, whose metadata never ran prepare() and
+    so carries no span: there the whole batch is the span, derived from the
+    query length alone.
+
+    token_last is where the span's tokens end, and so where the step's live
+    tokens end: the span is the whole token axis minus the context prefix.
 
     Returns zeros when no query length is resolved either, in which case every
     caller is on the fmha_sm100 path and ignores these bounds.
     """
     span = getattr(metadata, "msa_decode_span", None)
     if span is not None:
-        return span.token_first, span.row_first, span.row_last, span.query_len
+        return MsaSpanBounds(
+            span.token_first, span.token_last, span.row_first, span.row_last, span.query_len
+        )
     query_len = getattr(metadata, "msa_decode_query_len", None)
     if query_len is None:
-        return 0, 0, 0, 0
+        return MsaSpanBounds(0, 0, 0, 0, 0)
     query_len = int(query_len)
-    return 0, 0, num_tokens // query_len, query_len
+    rows = num_tokens // query_len
+    return MsaSpanBounds(0, rows * query_len, 0, rows, query_len)
+
+
+def check_decode_span_shape(kernel: str, total_q: int, batch: int, query_len: int) -> None:
+    """Reject a q that does not cover exactly the batch it was handed.
+
+    The ported decode kernels derive the request id as token // query_len, so
+    a longer q reads page table rows and lengths past the batch's last one.
+    """
+    if total_q != batch * query_len:
+        raise ValueError(
+            f"{kernel}: total_q ({total_q}) must be batch ({batch}) * "
+            f"decode_query_len ({query_len})."
+        )
 
 
 @functools.lru_cache(maxsize=1)
@@ -170,6 +203,11 @@ def msa_paged_kv(kv_cache_manager, layer_idx: int) -> Tuple[torch.Tensor, torch.
     runtime and needs only each page's [page_size, head_dim] block to be
     contiguous, which this view satisfies, so no copy is required.
     """
+    if getattr(kv_cache_manager, "is_fp8_subpaged_layer", lambda _layer_idx: False)(layer_idx):
+        raise RuntimeError(
+            "hybrid FP8 dense/Eagle cache is physically P32; use the direct "
+            "TRTLLM-Gen dense adapter instead of msa_paged_kv"
+        )
     buffers = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
     return buffers[:, 0], buffers[:, 1]
 
@@ -187,6 +225,16 @@ def write_msa_main_kv(
     resident before the sparse GQA runs. The write uses the head-major HND view
     so `msa_paged_kv` can return a zero-copy view.
     """
+    if getattr(kv_cache_manager, "is_fp8_subpaged_layer", lambda _layer_idx: False)(layer_idx):
+        from .msa_scatter import fused_write_subpaged_layer_caches
+
+        k_view, v_view = kv_cache_manager.get_fp8_dense_buffers(layer_idx)
+        if not fused_write_subpaged_layer_caches(k_view, v_view, out_cache_loc, k, v):
+            raise RuntimeError(
+                "MiniMax-M3 hybrid FP8 dense/Eagle cache write requires CUDA "
+                "P32 sub-page views and contiguous K/V rows"
+            )
+        return
     buffers = kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
     k_view, v_view = buffers[:, 0], buffers[:, 1]
     num_kv_heads = int(k_view.shape[1])
@@ -300,7 +348,9 @@ def select_blocks_from_maxscore(
 __all__ = [
     "MSA_REQUIRED_HEAD_DIM",
     "MSA_REQUIRED_TOPK",
+    "MsaSpanBounds",
     "build_kv_page_indices",
+    "check_decode_span_shape",
     "msa_decode_span_bounds",
     "msa_package_available",
     "msa_paged_kv",

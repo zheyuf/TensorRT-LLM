@@ -9,6 +9,7 @@ Numerical parity against the Triton reference is covered by the SM100
 integration accuracy test.
 """
 
+from inspect import signature
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,8 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3Msa
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import write_kv_slots
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_scatter import (
     fused_write_layer_caches,
+    fused_write_layer_caches_nvfp4,
+    fused_write_subpaged_layer_caches,
 )
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
     msa_ported_decode_active,
@@ -59,6 +62,34 @@ def test_msa_fp8_indexer_config_is_explicit_and_lowered():
             indexer_kv_dtype="fp8",
             sparse_disable_index_value=False,
         )
+
+
+def test_msa_main_kv_fp8_probe_retries_legacy_layout_signature() -> None:
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
+        MiniMaxM3MsaSparseAttentionMetadata,
+    )
+
+    class _LegacyManager:
+        def get_buffers(self, layer_idx: int) -> torch.Tensor:
+            assert layer_idx == 0
+            return torch.empty(1, 2, 1, 1, 1, dtype=torch.float8_e4m3fn)
+
+    metadata = SimpleNamespace(kv_cache_manager=_LegacyManager())
+    assert MiniMaxM3MsaSparseAttentionMetadata._msa_main_kv_is_fp8(metadata)
+
+
+def test_msa_main_kv_fp8_probe_does_not_hide_manager_errors() -> None:
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
+        MiniMaxM3MsaSparseAttentionMetadata,
+    )
+
+    class _BrokenManager:
+        def get_buffers(self, layer_idx: int, kv_layout: str | None = None) -> torch.Tensor:
+            raise RuntimeError(f"broken layer {layer_idx} layout {kv_layout}")
+
+    metadata = SimpleNamespace(kv_cache_manager=_BrokenManager())
+    with pytest.raises(RuntimeError, match="broken layer 0 layout HND"):
+        MiniMaxM3MsaSparseAttentionMetadata._msa_main_kv_is_fp8(metadata)
 
 
 def test_fused_qkv_index_projection_is_explicit_and_shards_index_heads():
@@ -178,6 +209,8 @@ def test_msa_metadata_clears_padded_cache_slot_tail():
     metadata.msa_out_cache_loc = torch.full((4,), 99, dtype=torch.int32)
     metadata.msa_block_table = torch.zeros((1, 1), dtype=torch.int32)
     metadata.msa_seq_lens_cuda = torch.zeros(1, dtype=torch.int32)
+    metadata.msa_cu_q_lens = torch.zeros(2, dtype=torch.int32)
+    metadata.msa_cu_kv_lens = torch.zeros(2, dtype=torch.int32)
     metadata.msa_subpage_block_table = None
     metadata.msa_req_to_token = torch.zeros((1, 4), dtype=torch.int32)
     metadata.msa_q_batch_row = torch.zeros(4, dtype=torch.int32)
@@ -798,6 +831,55 @@ def test_a_span_without_its_buffers_is_not_active():
     assert msa_ported_decode_active(metadata) is False
 
 
+def test_span_bounds_stop_at_the_span_rather_than_the_padded_token_count():
+    """token_last is the span's own end, not the length of the tensor it came
+    with, so a caller can tell a padded step from the bounds alone."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_decode_span_bounds,
+    )
+
+    # Eleven speculative decode requests of 4 query tokens, padded to 512.
+    metadata = SimpleNamespace(
+        msa_decode_span=_MsaDecodeSpan(
+            row_first=0, row_last=11, token_first=0, token_last=44, query_len=4
+        )
+    )
+    bounds = msa_decode_span_bounds(metadata, 512)
+    assert bounds == (0, 44, 0, 11, 4)
+    # Labelled, so a call site taking only some of the five cannot reorder them.
+    assert (bounds.token_first, bounds.token_last) == (0, 44)
+    assert (bounds.row_first, bounds.row_last, bounds.query_len) == (0, 11, 4)
+
+    # No span (the standalone kernel tests, which never run prepare()): the
+    # whole batch is the span, and token_last follows the rows the query length
+    # implies rather than a count that does not divide into them.
+    assert msa_decode_span_bounds(SimpleNamespace(msa_decode_query_len=4), 513) == (
+        0,
+        512,
+        0,
+        128,
+        4,
+    )
+
+    # Neither: every caller is on the fmha_sm100 path and ignores the bounds.
+    assert msa_decode_span_bounds(SimpleNamespace(), 512) == (0, 0, 0, 0, 0)
+
+
+def test_decode_span_shape_check_names_the_kernel_that_rejected_the_q():
+    """The guard both ported decode kernels share. Naming the kernel is the
+    point: the alternative is an assert several frames inside one of them."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        check_decode_span_shape,
+    )
+
+    check_decode_span_shape("kernel", 44, 11, 4)
+
+    # A piecewise CUDA graph's pad folded into the batch: 128 rows, not 11.
+    with pytest.raises(ValueError, match=r"kernel: total_q \(512\) must be batch \(11\)"):
+        check_decode_span_shape("kernel", 512, 11, 4)
+
+
 @pytest.mark.parametrize(
     ("num_contexts", "qo_lens", "kv_lens"),
     [
@@ -932,6 +1014,62 @@ def test_indexer_raises_when_a_committed_cutedsl_scorer_declines():
         )
 
 
+def test_select_blocks_scores_only_the_span_it_was_given(monkeypatch):
+    """The scorer reads the page table row a query token maps to, so it sees
+    the span alone even when idx_q runs longer. Tokens past the span keep a row
+    in the returned table, selecting nothing."""
+    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer as indexer_module
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
+
+    config = MiniMaxM3SparseConfig(
+        num_q_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        num_index_heads=4,
+        sparse_index_dim=128,
+        block_size=128,
+        topk=16,
+    )
+    indexer = indexer_module.MsaIndexer(config)
+    captured = {}
+
+    def fake_cutedsl_score(idx_q, idx_k_paged, max_score, **kwargs):
+        del idx_k_paged, max_score, kwargs
+        captured["scored_tokens"] = int(idx_q.shape[0])
+        return True
+
+    def fake_select_blocks_from_maxscore(max_score_kv, *, topk, n_valid_blocks, **kwargs):
+        del max_score_kv, kwargs
+        captured["selected_tokens"] = int(n_valid_blocks.shape[0])
+        return torch.zeros(n_valid_blocks.shape[0], config.num_kv_heads, topk, dtype=torch.int32)
+
+    monkeypatch.setattr(indexer_module, "_cutedsl_score", fake_cutedsl_score)
+    monkeypatch.setattr(
+        indexer_module, "select_blocks_from_maxscore", fake_select_blocks_from_maxscore
+    )
+
+    # Three decode requests of 4 query tokens inside a 32-token idx_q.
+    total_q, span_tokens = 32, 12
+    table = indexer.select_blocks(
+        torch.zeros(total_q, 4, 128, dtype=torch.bfloat16),
+        torch.zeros(3, 1, 128, 128, dtype=torch.bfloat16),
+        idx_sm_scale=1.0,
+        kv_indices=torch.zeros(3, dtype=torch.int32),
+        max_score=torch.zeros(4, 2, span_tokens),
+        n_valid_blocks=torch.ones(total_q, dtype=torch.int32),
+        block_table=torch.zeros(3, 2, dtype=torch.int32),
+        seq_lens_cuda=torch.full((3,), 8, dtype=torch.int32),
+        decode_query_len=4,
+        require_cutedsl=True,
+        gen_token_last=span_tokens,
+    )
+
+    assert captured["scored_tokens"] == span_tokens
+    assert captured["selected_tokens"] == span_tokens
+    assert table.shape == (total_q, config.num_kv_heads, config.topk)
+    assert torch.equal(table[span_tokens:], torch.full_like(table[span_tokens:], -1))
+
+
 @pytest.mark.parametrize("head_major", [False, True])
 def test_combined_topk_table_preserves_the_requested_backing(head_major):
     """Joining the two halves of a mixed step's table must not change its layout.
@@ -949,13 +1087,34 @@ def test_combined_topk_table_preserves_the_requested_backing(head_major):
     ctx = torch.arange(5 * num_kv_heads * topk, dtype=torch.int32).reshape(5, num_kv_heads, topk)
     gen = -ctx[:3] - 1
 
-    combined = _combined_topk_table(ctx, gen, head_major=head_major)
+    combined = _combined_topk_table(ctx, gen, total_q=8, head_major=head_major)
 
     assert combined.shape == (8, num_kv_heads, topk)
     assert torch.equal(combined[:5], ctx)
     assert torch.equal(combined[5:], gen)
     assert combined.permute(1, 0, 2).is_contiguous() is head_major
     assert combined.is_contiguous() is not head_major
+
+
+@pytest.mark.parametrize("head_major", [False, True])
+def test_combined_topk_table_empties_the_tokens_past_the_span(head_major):
+    """The table keeps a row per token so consumers can address it absolutely.
+    A row beyond the two halves selects nothing rather than carrying whatever
+    the scratch buffer held."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import (
+        _combined_topk_table,
+    )
+
+    num_kv_heads, topk = 2, 16
+    gen = torch.arange(3 * num_kv_heads * topk, dtype=torch.int32).reshape(3, num_kv_heads, topk)
+
+    # No context prefix, three scored tokens, eight rows to fill.
+    combined = _combined_topk_table(None, gen, total_q=8, head_major=head_major)
+
+    assert combined.shape == (8, num_kv_heads, topk)
+    assert torch.equal(combined[:3], gen)
+    assert torch.equal(combined[3:], torch.full_like(combined[3:], -1))
+    assert combined.permute(1, 0, 2).is_contiguous() is head_major
 
 
 def test_paged_gqa_raises_when_a_committed_dense_step_declines():
@@ -996,6 +1155,335 @@ def test_paged_gqa_raises_when_a_committed_dense_step_declines():
             kv_block_indexes=None,
             plan=None,
         )
+
+
+def test_paged_gqa_rejects_a_q_that_outruns_the_span():
+    """A q longer than the span no longer describes the batch, so the ported
+    kernels would read rows it does not have. Name that here rather than let it
+    surface as a kernel-internal assert."""
+    from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_paged_gqa
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
+
+    num_heads, head_dim, num_pages, page_size = 8, 128, 4, 16
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.layer_idx = 3
+    attention.head_dim = head_dim
+    attention.num_heads = num_heads
+    attention.q_scaling = 1.0
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            get_buffers=lambda layer_idx, kv_layout=None: torch.zeros(
+                num_pages, 2, 1, page_size, head_dim
+            )
+        ),
+        # Two decode requests of one token each, padded up to five tokens.
+        msa_decode_span=_MsaDecodeSpan(
+            row_first=0, row_last=2, token_first=0, token_last=2, query_len=1
+        ),
+        msa_decode_query_len=1,
+        msa_block_table=torch.zeros(2, 1, dtype=torch.int32),
+        msa_seq_lens_cuda=torch.zeros(2, dtype=torch.int32),
+    )
+
+    with pytest.raises(RuntimeError, match=r"5 query tokens for a span ending at token 2"):
+        run_msa_paged_gqa(
+            attention,
+            torch.zeros(5, num_heads * head_dim),
+            None,
+            None,
+            metadata,
+            torch.zeros(5, num_heads * head_dim),
+            kv_block_indexes=None,
+            plan=None,
+        )
+
+
+def test_nvfp4_sparse_dispatch_uses_only_the_msa_csr_path(monkeypatch):
+    """Packed NVFP4 bytes must never reach the Triton sparse decode path."""
+    import tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa as msa_gqa
+
+    monkeypatch.setattr(msa_gqa, "_MSA_NVFP4_STANDARD_STAGE_ENABLED", False)
+    num_tokens, num_heads, head_dim = 2, 8, 128
+    pages, kv_heads, page_size = 4, 1, 128
+    packed = torch.zeros(pages, 2, kv_heads, page_size, head_dim // 2, dtype=torch.int8)
+    scales = torch.zeros(pages, 2, kv_heads, page_size, head_dim // 16, dtype=torch.uint8)
+    manager = SimpleNamespace(
+        get_buffers=lambda layer_idx, kv_layout=None: packed,
+        get_block_scale_buffers=lambda layer_idx, kv_layout=None: scales,
+        is_nvfp4_layer=lambda layer_idx: layer_idx == 3,
+    )
+    metadata = SimpleNamespace(
+        kv_cache_manager=manager,
+        _msa_prewritten_layer=3,
+        _msa_main_kv_is_nvfp4=lambda: True,
+    )
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.layer_idx = 3
+    attention.head_dim = head_dim
+    attention.num_heads = num_heads
+    attention.q_scaling = 1.0
+    called = {}
+
+    def fake_nvfp4(q, k, v, scale_buffers, indexes, meta, **kwargs):
+        called.update(q=q, k=k, v=v, scales=scale_buffers, indexes=indexes, kwargs=kwargs)
+
+    monkeypatch.setattr(msa_gqa, "run_msa_nvfp4_sparse_gqa", fake_nvfp4)
+    q = torch.zeros(num_tokens, num_heads * head_dim)
+    output = torch.empty_like(q)
+    indexes = torch.zeros(num_tokens, kv_heads, 16, dtype=torch.int32)
+    dequant = torch.ones(3, dtype=torch.float32)
+
+    msa_gqa.run_msa_paged_gqa(
+        attention,
+        q,
+        None,
+        None,
+        metadata,
+        output,
+        kv_block_indexes=indexes,
+        plan=None,
+        kv_scale_orig_quant=torch.ones_like(dequant),
+        kv_scale_quant_orig=dequant,
+    )
+
+    assert called["k"].shape[-1] == head_dim // 2
+    assert called["scales"] is scales
+    assert called["indexes"] is indexes
+    k_scale = called["kwargs"]["k_global_scale"]
+    v_scale = called["kwargs"]["v_global_scale"]
+    assert k_scale.item() == dequant[1].item()
+    assert v_scale.item() == dequant[2].item()
+    assert k_scale.data_ptr() % 16 == 0
+    assert v_scale.data_ptr() % 16 == 0
+    assert called["kwargs"]["k_global_scale_value"] is None
+    assert called["kwargs"]["v_global_scale_value"] is None
+
+    # The padded aligned storage is persistent on the layer object rather than
+    # allocated once per sparse layer call or once per CUDA-graph replay.
+    first_ptrs = (k_scale.data_ptr(), v_scale.data_ptr())
+    msa_gqa.run_msa_paged_gqa(
+        attention,
+        q,
+        None,
+        None,
+        metadata,
+        output,
+        kv_block_indexes=indexes,
+        plan=None,
+        kv_scale_orig_quant=torch.ones_like(dequant),
+        kv_scale_quant_orig=dequant,
+    )
+    assert (
+        called["kwargs"]["k_global_scale"].data_ptr(),
+        called["kwargs"]["v_global_scale"].data_ptr(),
+    ) == first_ptrs
+
+
+def test_fp8_subpaged_dispatch_forwards_dequant_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared Eagle cache path must preserve its FP8 dequant scale."""
+    import tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa as msa_gqa
+    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils as msa_utils
+    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode as dense_decode
+
+    monkeypatch.setattr(
+        msa_utils, "msa_decode_span_bounds", lambda metadata, num_tokens: (0, 0, 0, 0, 0)
+    )
+    parameter = signature(dense_decode.minimax_m3_trtllm_gen_dense_attention).parameters[
+        "kv_scale_quant_orig"
+    ]
+    assert parameter.default is None
+    captured: dict[str, object] = {}
+
+    def fake_dense_attention(*_args: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        dense_decode,
+        "minimax_m3_trtllm_gen_dense_attention",
+        fake_dense_attention,
+    )
+
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.layer_idx = 3
+    attention.head_dim = 128
+    attention.num_heads = 8
+    attention.q_scaling = 1.0
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            is_nvfp4_layer=lambda layer_idx: False,
+            is_fp8_subpaged_layer=lambda layer_idx: layer_idx == 3,
+        ),
+        _msa_prewritten_layer=3,
+    )
+    q = torch.zeros(2, attention.num_heads * attention.head_dim)
+    output = torch.empty_like(q)
+    dequant_scale = torch.ones(3, dtype=torch.float32)
+
+    msa_gqa.run_msa_paged_gqa(
+        attention,
+        q,
+        None,
+        None,
+        metadata,
+        output,
+        kv_block_indexes=None,
+        plan=None,
+        kv_scale_quant_orig=dequant_scale,
+    )
+
+    assert captured["kv_scale_quant_orig"] is dequant_scale
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", [(64, 4), (16, 1)])
+def test_nvfp4_standard_stage_uses_preplanned_msa_and_stable_scratch(
+    monkeypatch, q_heads, kv_heads
+):
+    """The opt-in decode route stages selected pages and reuses fixed scratch."""
+    import tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa as msa_gqa
+    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils as msa_utils
+
+    monkeypatch.setattr(msa_gqa, "_MSA_NVFP4_STANDARD_STAGE_ENABLED", True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    batch, decode_query_len = 2, 3
+    total_q, capacity, head_dim = batch * decode_query_len, 8, 128
+    pages, page_size, topk = 16, 128, 16
+    q = torch.zeros(total_q, q_heads, head_dim, dtype=torch.float8_e4m3fn)
+    packed = torch.zeros(pages, kv_heads, page_size, head_dim // 2, dtype=torch.uint8)
+    scales = torch.zeros(pages, 2, kv_heads, page_size, head_dim // 16, dtype=torch.uint8)
+    indexes = torch.zeros(total_q, kv_heads, topk, dtype=torch.int32)
+    packed_mask = torch.tensor([[[1], [3], [5]], [[1], [3], [7]]], dtype=torch.int32)
+    q_batch_row = torch.zeros(capacity, dtype=torch.int32)
+    q_batch_row[:total_q] = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32)
+    q_intra = torch.zeros(capacity, dtype=torch.int32)
+    q_intra[:total_q] = torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int32)
+    plan = object()
+    stage_calls = []
+    fmha_calls = []
+
+    def fail_csr(*args, **kwargs):
+        raise AssertionError("standard staged M3 decode must not build CSR metadata")
+
+    def stage_selected_nvfp4_to_fp8(*args, **kwargs):
+        stage_calls.append((args, kwargs))
+
+    def standard_fmha(*args, **kwargs):
+        fmha_calls.append((args, kwargs))
+        return kwargs["out"], None
+
+    fake_sparse = SimpleNamespace(
+        build_k2q_csr=fail_csr,
+        sparse_atten_nvfp4_kv_func=fail_csr,
+        stage_selected_nvfp4_to_fp8=stage_selected_nvfp4_to_fp8,
+    )
+    fake_msa = SimpleNamespace(sparse=fake_sparse, fmha_sm100=standard_fmha)
+    monkeypatch.setattr(msa_utils, "require_msa_module", lambda: fake_msa)
+    metadata = SimpleNamespace(
+        _msa_live_batch=batch,
+        msa_cu_q_lens=torch.tensor([0, 3, 6], dtype=torch.int32),
+        msa_cu_kv_lens=torch.tensor([0, 640, 1280], dtype=torch.int32),
+        _msa_max_q_len=decode_query_len,
+        msa_block_table=torch.zeros(batch, 8, dtype=torch.int32),
+        msa_seq_lens_cuda=torch.tensor([640, 640], dtype=torch.int32),
+        msa_q_batch_row=q_batch_row,
+        msa_q_intra=q_intra,
+        spec_decoding_packed_mask=packed_mask,
+        is_spec_dec_dynamic_tree=True,
+        num_contexts=0,
+        num_generations=batch,
+        kv_cache_manager=SimpleNamespace(),
+    )
+    global_scales = torch.ones(2, 4, dtype=torch.float32)
+    output = torch.empty(total_q, q_heads, head_dim, dtype=torch.bfloat16)
+
+    msa_gqa.run_msa_nvfp4_sparse_gqa(
+        q,
+        packed,
+        packed,
+        scales,
+        indexes,
+        metadata,
+        sm_scale=head_dim**-0.5,
+        k_global_scale=global_scales[0, :1],
+        v_global_scale=global_scales[1, :1],
+        k_global_scale_value=1.25,
+        v_global_scale_value=0.75,
+        plan=plan,
+        out=output,
+    )
+
+    assert len(stage_calls) == 2
+    assert stage_calls[0][1]["is_v"] is False
+    assert stage_calls[1][1]["is_v"] is True
+    assert tuple(stage_calls[0][0][5].shape) == (
+        total_q * topk,
+        kv_heads,
+        page_size,
+        head_dim,
+    )
+    assert len(fmha_calls) == 1
+    args, kwargs = fmha_calls[0]
+    assert args[3] is plan
+    assert kwargs["kv_block_indexes"] is indexes
+    assert kwargs["sparse_custom_mask"] is packed_mask
+    assert kwargs["sparse_custom_mask_q_indices"].data_ptr() == q_intra.data_ptr()
+    assert kwargs["sparse_custom_mask_batch_indices"].data_ptr() == q_batch_row.data_ptr()
+    assert kwargs["k_scale"] == 1.25
+    assert kwargs["v_scale"] == 0.75
+    assert kwargs["out"] is output
+    physical = kwargs["kv_physical_block_indexes"]
+    assert tuple(physical.shape) == (total_q, kv_heads, topk)
+    assert torch.equal(physical[:, 0], torch.arange(total_q * topk).view(total_q, topk))
+
+    first_k_scratch = stage_calls[0][0][5]
+    first_v_scratch = stage_calls[1][0][5]
+    first_physical = physical
+    metadata._msa_live_batch = 1
+    metadata.num_generations = 1
+    smaller_q = q[:decode_query_len]
+    smaller_indexes = indexes[:decode_query_len]
+    smaller_output = output[:decode_query_len]
+    msa_gqa.run_msa_nvfp4_sparse_gqa(
+        smaller_q,
+        packed,
+        packed,
+        scales,
+        smaller_indexes,
+        metadata,
+        sm_scale=head_dim**-0.5,
+        k_global_scale=global_scales[0, :1],
+        v_global_scale=global_scales[1, :1],
+        k_global_scale_value=1.25,
+        v_global_scale_value=0.75,
+        plan=plan,
+        out=smaller_output,
+    )
+    assert stage_calls[2][0][5].data_ptr() == first_k_scratch.data_ptr()
+    assert stage_calls[3][0][5].data_ptr() == first_v_scratch.data_ptr()
+    assert tuple(stage_calls[2][0][5].shape) == (
+        decode_query_len * topk,
+        kv_heads,
+        page_size,
+        head_dim,
+    )
+    smaller_physical = fmha_calls[1][1]["kv_physical_block_indexes"]
+    assert smaller_physical.data_ptr() == first_physical.data_ptr()
+    assert tuple(smaller_physical.shape) == (decode_query_len, kv_heads, topk)
+    assert len(metadata.kv_cache_manager._msa_nvfp4_selected_scratch_cache) == 1
+
+
+def test_nvfp4_standard_stage_capacity_ignores_context_token_capacity():
+    """Pure-decode scratch is request-bound, not chunked-prefill-bound."""
+    import tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa as msa_gqa
+
+    metadata = SimpleNamespace(
+        msa_q_batch_row=torch.empty(16384, dtype=torch.int32),
+        msa_block_table=torch.empty(128, 1024, dtype=torch.int32),
+    )
+
+    assert msa_gqa._nvfp4_standard_stage_capacity(metadata) == 128 * 8
 
 
 def test_per_token_valid_blocks_multi_token_decode():
@@ -1172,6 +1660,130 @@ def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx):
 
     torch.testing.assert_close(pool.to(torch.float32), ref_pool.to(torch.float32))
     torch.testing.assert_close(idx_pool, ref_idx_pool)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fp8_subpage_scatter_places_tokens_inside_p32_pages():
+    torch.manual_seed(17)
+    num_slots, pages_per_role, num_heads = 3, 4, 2
+    physical_page, head_dim = 32, 128
+    k_cache = torch.zeros(
+        (num_slots, pages_per_role, num_heads, physical_page, head_dim),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    v_cache = torch.zeros_like(k_cache)
+    slots = torch.tensor([0, 31, 32, 127, 128, 255, -1], dtype=torch.int32, device="cuda")
+    qkv = torch.randn(
+        slots.numel(), 2 * num_heads * head_dim + 13, dtype=torch.bfloat16, device="cuda"
+    )
+    k = qkv[:, : num_heads * head_dim]
+    v = qkv[:, num_heads * head_dim : 2 * num_heads * head_dim]
+
+    assert fused_write_subpaged_layer_caches(k_cache, v_cache, slots, k, v)
+    expected_k = k.reshape(slots.numel(), num_heads, head_dim).to(torch.float8_e4m3fn)
+    expected_v = v.reshape(slots.numel(), num_heads, head_dim).to(torch.float8_e4m3fn)
+    for row, slot in enumerate(slots[:-1].tolist()):
+        page, logical_within = divmod(slot, 128)
+        subpage, within = divmod(logical_within, physical_page)
+        assert torch.equal(k_cache[page, subpage, :, within], expected_k[row])
+        assert torch.equal(v_cache[page, subpage, :, within], expected_v[row])
+    # The invalid row is masked and therefore cannot touch any cache location.
+    assert torch.count_nonzero(k_cache[2]).item() == 0
+    assert torch.count_nonzero(v_cache[2]).item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_nvfp4_scatter_writes_physical_p32_data_and_scale_layouts():
+    from tensorrt_llm._utils import get_sm_version
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("NVFP4 quantization requires Blackwell")
+    torch.manual_seed(13)
+    num_slots, pages_per_role, num_heads = 2, 4, 1
+    physical_page, head_dim = 32, 128
+    packed_dim, scale_cols = head_dim // 2, head_dim // 16
+    shape = (num_slots, pages_per_role, num_heads, physical_page, packed_dim)
+    scale_shape = (num_slots, pages_per_role, num_heads, physical_page, scale_cols)
+    k_cache = torch.zeros(shape, dtype=torch.uint8, device="cuda")
+    v_cache = torch.zeros_like(k_cache)
+    k_scale_cache = torch.zeros(scale_shape, dtype=torch.uint8, device="cuda")
+    v_scale_cache = torch.zeros_like(k_scale_cache)
+    slots = torch.tensor([0, 31, 32, 127, 128, -1], dtype=torch.int32, device="cuda")
+    k = torch.randn(slots.numel(), head_dim, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
+    inv_scales = torch.ones(3, dtype=torch.float32, device="cuda")
+
+    # The kernel flattens token-row scale offsets, so an exact shape and
+    # contiguous columns are insufficient when rows contain hidden padding.
+    padded_k_scale_cache = torch.zeros(
+        (*scale_shape[:-1], scale_cols + 1), dtype=torch.uint8, device="cuda"
+    )[..., :scale_cols]
+    padded_v_scale_cache = torch.zeros(
+        (*scale_shape[:-1], scale_cols + 1), dtype=torch.uint8, device="cuda"
+    )[..., :scale_cols]
+    assert padded_k_scale_cache.stride(-1) == 1
+    assert padded_k_scale_cache.stride(-2) == scale_cols + 1
+    assert padded_v_scale_cache.stride(-2) == scale_cols + 1
+    assert not fused_write_layer_caches_nvfp4(
+        k_cache,
+        v_cache,
+        padded_k_scale_cache,
+        v_scale_cache,
+        None,
+        slots,
+        k,
+        v,
+        None,
+        inv_scales,
+    )
+    assert not fused_write_layer_caches_nvfp4(
+        k_cache,
+        v_cache,
+        k_scale_cache,
+        padded_v_scale_cache,
+        None,
+        slots,
+        k,
+        v,
+        None,
+        inv_scales,
+    )
+
+    wrote = fused_write_layer_caches_nvfp4(
+        k_cache,
+        v_cache,
+        k_scale_cache,
+        v_scale_cache,
+        None,
+        slots,
+        k,
+        v,
+        None,
+        inv_scales,
+    )
+    assert wrote
+    expected_k, expected_ksf = torch.ops.trtllm.fp4_quantize(
+        k.view(slots.numel(), 1, head_dim), inv_scales[1:2], 16, False, False
+    )
+    expected_v, expected_vsf = torch.ops.trtllm.fp4_quantize(
+        v.view(slots.numel(), 1, head_dim), inv_scales[2:3], 16, False, False
+    )
+    expected_k = expected_k.view(torch.uint8)
+    expected_v = expected_v.view(torch.uint8)
+    expected_ksf = expected_ksf.view(slots.numel(), 1, scale_cols)
+    expected_vsf = expected_vsf.view(slots.numel(), 1, scale_cols)
+
+    for row, slot in enumerate(slots[:-1].tolist()):
+        logical_page, logical_within = divmod(slot, 128)
+        subpage, within = divmod(logical_within, physical_page)
+        assert torch.equal(k_cache[logical_page, subpage, 0, within], expected_k[row, 0])
+        assert torch.equal(v_cache[logical_page, subpage, 0, within], expected_v[row, 0])
+        assert torch.equal(k_scale_cache[logical_page, subpage, 0, within], expected_ksf[row, 0])
+        v_region = v_scale_cache[logical_page, subpage, 0].view(-1)
+        offsets = torch.arange(scale_cols, device="cuda") * 4
+        offsets += (within // 4) * (4 * scale_cols) + within % 4
+        assert torch.equal(v_region[offsets], expected_vsf[row, 0])
 
 
 def _mixed_batch_sparse_gqa_case(*, page_size, head_dim, num_kv_heads, group, topk, seed):

@@ -24,6 +24,39 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 GB = 1 << 30
 
 
+@pytest.mark.parametrize(
+    "manager_dtype,target_dtype,expected_draft_dtype",
+    [
+        ("fp8", "nvfp4", "fp8"),
+        (None, "nvfp4", "nvfp4"),
+        ("fp8", "auto", "auto"),
+        ("fp8", "fp8", "fp8"),
+    ],
+)
+def test_one_model_draft_dtype_override_is_copy_on_write(
+    manager_dtype: str | None,
+    target_dtype: str,
+    expected_draft_dtype: str,
+) -> None:
+    creator = object.__new__(KvCacheCreator)
+
+    class _HybridTargetManager:
+        pass
+
+    if manager_dtype is not None:
+        _HybridTargetManager.draft_manager_kv_cache_dtype = manager_dtype
+
+    creator._kv_cache_manager_cls = _HybridTargetManager
+    target = KvCacheConfig(dtype=target_dtype, tokens_per_block=128)
+
+    draft = creator._get_one_model_draft_kv_cache_config(target)
+
+    assert target.dtype == target_dtype
+    assert target.tokens_per_block == 128
+    assert draft.dtype == expected_draft_dtype
+    assert draft.tokens_per_block == 128
+
+
 def _make_creator(
     max_gpu_total_bytes: int,
     host_cache_size=None,
@@ -347,3 +380,79 @@ class TestGpuSplitChargesFixedCost:
         assert draft_config is not None
         assert target_config.host_cache_size == 8 * GB
         assert draft_config.host_cache_size == 2 * GB
+
+
+class TestBuildManagersBudgetGates:
+    """Which splits build_managers applies, as opposed to how they divide."""
+
+    @staticmethod
+    def _make_build_creator(total_host: int, total_gpu: int) -> KvCacheCreator:
+        c = _make_creator(
+            max_gpu_total_bytes=total_gpu,
+            host_cache_size=total_host,
+            total_kv_per_token=100,
+            target_kv_per_token=80,
+        )
+        c._skip_est = False
+        c._draft_model_engine = None
+        c._kv_connector_manager = None
+        c._is_kv_cache_manager_v2 = True
+        c._model_engine.model.model_config.is_encoder_decoder = False
+        c._should_create_separate_draft_kv_cache = Mock(return_value=True)
+        c._needs_gpu_kv_cache_budget_split = Mock(return_value=True)
+        c._create_kv_cache_manager = Mock(return_value=Mock())
+        c._create_one_model_draft_kv_cache_manager = Mock(return_value=Mock())
+        return c
+
+    @staticmethod
+    def _configs_passed_to_managers(c: KvCacheCreator):
+        return (
+            c._create_kv_cache_manager.call_args.kwargs["kv_cache_config_override"],
+            c._create_one_model_draft_kv_cache_manager.call_args.kwargs["kv_cache_config_override"],
+        )
+
+    @pytest.mark.parametrize("estimating_kv_cache", [False, True])
+    def test_no_manager_receives_the_full_host_budget(self, estimating_kv_cache):
+        """No manager may be handed the whole host tier, estimating or not.
+
+        Each one pins what it is given, so two full-budget managers make a run
+        need twice the configured host memory.
+        """
+        total_host = 20 * GB
+        c = self._make_build_creator(total_host, total_gpu=10 * GB)
+
+        c.build_managers({}, estimating_kv_cache=estimating_kv_cache)
+
+        target_config, draft_config = self._configs_passed_to_managers(c)
+        assert target_config.host_cache_size != total_host
+        assert draft_config.host_cache_size != total_host
+
+    def test_host_budget_is_split_between_target_and_draft(self):
+        total_host = 20 * GB
+        c = self._make_build_creator(total_host, total_gpu=10 * GB)
+
+        c.build_managers({}, estimating_kv_cache=False)
+
+        target_config, draft_config = self._configs_passed_to_managers(c)
+        assert target_config.host_cache_size + draft_config.host_cache_size == total_host
+        assert draft_config.host_cache_size < total_host
+
+    def test_estimation_managers_fall_back_to_the_auto_host_tier(self):
+        """An explicit host tier only pins memory a probe cannot use."""
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB)
+
+        c.build_managers({}, estimating_kv_cache=True)
+
+        target_config, draft_config = self._configs_passed_to_managers(c)
+        assert target_config.host_cache_size is None
+        assert draft_config.host_cache_size is None
+
+    def test_gpu_budget_split_stays_skipped_during_estimation(self):
+        """Estimation sizes GPU pools from max_tokens, so it keeps the budget whole."""
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB)
+
+        c.build_managers({}, estimating_kv_cache=True)
+
+        target_config, _ = self._configs_passed_to_managers(c)
+        assert target_config.max_gpu_total_bytes == 10 * GB
+        c._needs_gpu_kv_cache_budget_split.assert_not_called()

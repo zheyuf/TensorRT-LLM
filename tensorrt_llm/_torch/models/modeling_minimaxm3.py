@@ -34,6 +34,7 @@ from tensorrt_llm._utils import nvtx_range_debug
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (
@@ -51,8 +52,8 @@ from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMax
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fp32_router_gemm import router_gemm, split_router_weight
 from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
+from ..modules.fused_moe.interface import MoESchedulerKind
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
     Linear,
@@ -85,6 +86,17 @@ _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 # Experimental A/B gate for producing compact FP8 Q while inserting main K/V
 # directly into the MSA paged cache during supported eager pure-prefill steps.
 _FUSED_MAIN_KV_WRITE_ENV = "TRTLLM_MINIMAX_M3_FUSED_MAIN_KV_WRITE"
+
+
+def _moe_routed_output_is_global(experts: nn.Module) -> bool:
+    """Whether the MoE backend returns an already combined routed output.
+
+    Fused-communication backends own dispatch and combine inside the MoE
+    kernel.  Their output therefore contains the complete routed-expert
+    contribution for each input token, irrespective of ``reduce_results``.
+    """
+    backend = getattr(experts, "backend", experts)
+    return getattr(backend, "scheduler_kind", None) == MoESchedulerKind.FUSED_COMM
 
 
 class MiniMaxM3QKVIndexerLinear(Linear):
@@ -408,20 +420,19 @@ def _build_swiglu_oai_dense_mlp(
     1 via ``overridden_tp_size=1`` so the MLP is replicated and operates
     purely rank-locally (no sharding, no allreduce on ``down_proj``).
 
-    For the MoE shared-expert path (``is_shared_expert=True``)
-    ``reduce_output`` is forced ``False`` regardless of ADP: the routed
-    branch is also constructed with ``reduce_results=False`` and the
-    composition runs a single external AllReduce on
-    ``routed + shared``, matching the DeepSeekV3 / GLM convention.
+    For the MoE shared-expert path (``is_shared_expert=True``),
+    ``reduce_output`` is forced ``False`` regardless of ADP. External-
+    communication MoE backends reduce ``routed + shared`` together, while
+    fused-communication backends reduce only this TP-local shared term before
+    adding their already-global routed output.
     """
     config = model_config.pretrained_config
     swiglu_alpha = float(getattr(config, "swiglu_alpha", 1.702))
     swiglu_limit = float(getattr(config, "swiglu_limit", 7.0))
     enable_adp = model_config.mapping.enable_attention_dp
-    # Shared experts inside the MoE block defer the cross-rank reduction
-    # to the MoE's single external AllReduce. The dense MLP path (no
-    # MoE composition) carries its own reduction unless ADP collapses
-    # TP to 1.
+    # Shared experts inside the MoE block defer cross-rank reduction to the
+    # MoE composition. The dense MLP path (no MoE composition) carries its own
+    # reduction unless ADP collapses TP to 1.
     reduce_output = False if is_shared_expert else (not enable_adp)
     # SwiGLU-OAI is plain SwiGLU with an alpha gain and (up + 1) offset, so it
     # routes through the fused silu_and_mul kernel (one launch, optional fp8
@@ -501,15 +512,10 @@ class MiniMaxM3Gate(nn.Module):
             torch.empty((num_experts,), dtype=torch.float32),
             requires_grad=False,
         )
-        # The fp32 weight rewritten as stacked bf16 terms for the CuTe DSL gate
-        # GEMM, filled by load_weights and None where that kernel cannot run.
-        # Costs a second copy of a 3MB weight per layer.
-        self.register_buffer("weight_split", None, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # The router runs in fp32 to match SGLang. router_gemm picks the kernel
-        # that suits the token count.
-        return router_gemm(hidden_states, self.weight, self.weight_split)
+        # Router runs in fp32 to match SGLang.
+        return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
 
     def load_weights(self, weights: List[Dict]):
         """Load the router weight and the e_score_correction_bias.
@@ -527,8 +533,6 @@ class MiniMaxM3Gate(nn.Module):
         w = weights[0]
         if "weight" in w:
             self.weight.copy_(w["weight"][:].to(self.weight.dtype))
-            # The weight is frozen, so it is split here rather than per call.
-            self.weight_split = split_router_weight(self.weight)
         if "e_score_correction_bias" in w:
             self.e_score_correction_bias.copy_(
                 w["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)
@@ -557,15 +561,14 @@ class MiniMaxM3MoE(nn.Module):
     ``swiglu_no_interleaved_with_alpha_and_limit`` shape. We plumb
     ``alpha``, ``beta=1.0`` (the ``up + 1`` offset), and ``limit`` per
     local expert into ``create_moe`` together with
-    ``ActivationType.SwigluBias``, which dispatches the CUTLASS-family
-    ``SwigluBiasAdaptor`` operator inside the fused MoE kernel.
+    ``ActivationType.SwigluBias``. Each supported backend then selects its
+    matching fused activation implementation.
 
-    The routed branch and the shared expert both produce local partial
-    outputs (``reduce_results=False`` / ``reduce_output=False``); their
-    sum runs through a single external AllReduce only when not under
-    Attention DP and ``tp_size > 1``. This matches the
-    DeepSeekV3 / GLM convention and avoids the duplicate communication
-    that the previous independent-reduction wiring incurred.
+    External-communication backends return a TP-local routed contribution, so
+    ``routed + shared`` is reduced once. Fused-communication backends already
+    return the EP-global routed contribution, so only the TP-local shared term
+    is reduced before composition. Attention DP performs neither outer
+    reduction because each rank owns independent tokens.
     """
 
     @staticmethod
@@ -644,11 +647,11 @@ class MiniMaxM3MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
-        # Routed branch produces local partial outputs; the external
-        # AllReduce below combines routed + shared in a single round
-        # (matches DeepSeekV3). Under Attention DP the fused MoE already
-        # skips its in-op all-reduce, so ``reduce_results=False`` is
-        # also the correct flag there.
+        # External-communication backends return a local routed contribution;
+        # fused-communication backends own the EP combine and return a global
+        # routed contribution. ``reduce_results=False`` avoids a second
+        # backend-side reduction in both cases; composition below performs
+        # only the outer reduction still required by the selected contract.
         experts_quant_config = MiniMaxM3MoE._get_experts_quant_config(model_config, layer_idx)
         self.experts = create_moe(
             routing_method=self.gate.routing_method,
@@ -663,6 +666,7 @@ class MiniMaxM3MoE(nn.Module):
             swiglu_limit=self.swiglu_limit,
             activation_type=ActivationType.SwigluBias,
         )
+        self.routed_output_is_global = _moe_routed_output_is_global(self.experts)
         # Defensive: if a future MoE-resolution path (new load-balancer
         # mode, new DWDP variant) shifts the local expert count in a
         # way our resolver doesn't yet model, fail here with a
@@ -676,11 +680,10 @@ class MiniMaxM3MoE(nn.Module):
             f"match the MoE module's resolved layout."
         )
 
-        # Shared expert: dense MLP fused into MoE output. Constructed
-        # with ``is_shared_expert=True`` so ``reduce_output=False``
-        # (the external AllReduce below performs the combined
-        # reduction) and so the LoRA module types match the shared-
-        # expert convention.
+        # Shared expert: dense MLP fused into MoE output. Constructed with
+        # ``is_shared_expert=True`` so ``reduce_output=False`` (composition
+        # below performs the required reduction) and so the LoRA module types
+        # match the shared-expert convention.
         n_shared = int(getattr(config, "n_shared_experts", 0) or 0)
         if n_shared > 0:
             shared_intermediate = (
@@ -695,10 +698,10 @@ class MiniMaxM3MoE(nn.Module):
         else:
             self.shared_experts = None
 
-        # External AllReduce on the combined routed + shared output.
-        # Skipped under Attention DP (each rank's tokens are independent
-        # so cross-rank reduction would mix them) and under tp_size==1
-        # (nothing to reduce).
+        # Outer TP AllReduce used either on routed + shared (external comm) or
+        # on shared alone (fused comm). Skipped under Attention DP (each rank's
+        # tokens are independent, so cross-rank reduction would mix them) and
+        # under tp_size==1 (nothing to reduce).
         self.allreduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
             self.allreduce = AllReduce(
@@ -734,7 +737,8 @@ class MiniMaxM3MoE(nn.Module):
             return self.shared_experts(hidden_states)
 
         if self.shared_experts is None:
-            result = _compute_routed_output()
+            routed_output = _compute_routed_output()
+            result = routed_output
         else:
             routed_output, shared_output = maybe_execute_in_parallel(
                 _compute_routed_output,
@@ -744,11 +748,19 @@ class MiniMaxM3MoE(nn.Module):
                 self.aux_stream,
                 disable_on_compile=True,
             )
+            if self.routed_output_is_global and self.allreduce is not None:
+                # Fused-communication MoE already combined the routed result
+                # across EP ranks.  Only the TP-local shared expert needs an
+                # AllReduce; reducing their sum would multiply the routed
+                # contribution by TP size.
+                shared_output = self.allreduce(shared_output)
+                return shared_output.add_(routed_output)
+
             # In-place add into ``shared_output`` to avoid allocating a
             # temporary (matches DeepSeekV3 / GLM convention).
             result = shared_output.add_(routed_output)
 
-        if self.allreduce is not None:
+        if self.allreduce is not None and not self.routed_output_is_global:
             result = self.allreduce(result, all_reduce_params=final_all_reduce_params)
         return result
 
@@ -807,6 +819,42 @@ def _extract_minimax_m3_attention_extra_attrs(layer_idx: str):
     return metadata, attn_layer
 
 
+def _dispatch_attention_over_live_tokens(
+    attn_layer: "MiniMaxM3Attention",
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    idx_q: Optional[torch.Tensor],
+    idx_k: Optional[torch.Tensor],
+    attn_metadata: AttentionMetadata,
+    output: torch.Tensor,
+) -> None:
+    """Run the attention core over the step's live tokens alone.
+
+    A piecewise CUDA graph pads token-shaped inputs up to its capture bucket
+    without adding requests to go with them (see _get_padding_params in
+    model_engine), so q can outrun the rows the batch has. The kernels below
+    read a request out of a token index, so the pad comes off here, once for
+    both dispatch paths rather than at each kernel.
+
+    No kernel writes the pad rows of output, so they are zeroed instead of
+    left holding whatever the buffer came with, which no one can tell from a
+    real NaN.
+    """
+    num_tokens = int(attn_metadata.num_tokens)
+    if num_tokens < int(output.shape[0]):
+        output[num_tokens:].zero_()
+    attn_layer._dispatch_attention_backend(
+        q[:num_tokens],
+        k[:num_tokens] if k is not None else None,
+        v[:num_tokens] if v is not None else None,
+        idx_q[:num_tokens] if idx_q is not None else None,
+        idx_k[:num_tokens] if idx_k is not None else None,
+        attn_metadata,
+        output[:num_tokens],
+    )
+
+
 @torch.library.custom_op("trtllm::minimax_m3_attn_custom_op_inplace", mutates_args=("output",))
 def minimax_m3_attn_custom_op_inplace(
     q: torch.Tensor,
@@ -819,16 +867,9 @@ def minimax_m3_attn_custom_op_inplace(
 ) -> None:
     """Run MiniMax-M3 cache and attention work behind a compile boundary."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
-    num_tokens = attn_metadata.num_tokens
-    attn_layer._dispatch_attention_backend(
-        q[:num_tokens],
-        k[:num_tokens] if k is not None else None,
-        v[:num_tokens] if v is not None else None,
-        idx_q[:num_tokens] if idx_q is not None else None,
-        idx_k[:num_tokens] if idx_k is not None else None,
-        attn_metadata,
-        output[:num_tokens],
-    )
+    # The live token count is a host value, so the compiled graph above must
+    # not see it: it would guard on it and recapture per count.
+    _dispatch_attention_over_live_tokens(attn_layer, q, k, v, idx_q, idx_k, attn_metadata, output)
 
 
 @torch.library.custom_op("trtllm::minimax_m3_fused_sparse_qkv_producer", mutates_args=())
@@ -837,7 +878,7 @@ def minimax_m3_fused_sparse_qkv_producer(
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
 ) -> List[torch.Tensor]:
-    """Run the existing fused sparse producer in a captured graph segment."""
+    """Run the fused sparse producer in a captured graph segment."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     packed = attn_layer.qkv_proj(hidden_states)
     result = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
@@ -847,7 +888,7 @@ def minimax_m3_fused_sparse_qkv_producer(
         allow_graph_padding=True,
     )
     if result is None:
-        raise RuntimeError("MiniMax-M3 piecewise graph requires the fused FP8 sparse QKV producer.")
+        raise RuntimeError("MiniMax-M3 piecewise graph requires the fused sparse QKV producer.")
     return list(result)
 
 
@@ -930,6 +971,11 @@ class MiniMaxM3Attention(Attention):
             quant_config is not None
             and quant_config.quant_mode is not None
             and quant_config.quant_mode.has_fp8_kv_cache()
+        )
+        self.main_kv_is_nvfp4 = bool(
+            quant_config is not None
+            and quant_config.quant_mode is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()
         )
         self.enable_fused_main_kv_write = os.environ.get(_FUSED_MAIN_KV_WRITE_ENV, "0") == "1"
 
@@ -1365,12 +1411,14 @@ class MiniMaxM3Attention(Attention):
 
         The CUDA kernel is token-major and batch-type agnostic: per-token
         positions and cache slots cover pure prefill, mixed aggregate batches,
-        and CUDA-graph decode.
+        and CUDA-graph decode.  FP8 caches receive FP8 K/V directly.  NVFP4
+        caches receive packed E2M1 K/V plus their E4M3 SF16 scale bytes while
+        Q, index-Q, and index-K remain FP8.
         """
         if (
             not self.enable_fused_qkv_index_projection
             or not isinstance(self.attn, MiniMaxM3MsaSparseAttention)
-            or not self._emit_fp8_main_qkv()
+            or not (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
             or self.attn.indexer_kv_dtype != "fp8"
         ):
             return None
@@ -1400,15 +1448,47 @@ class MiniMaxM3Attention(Attention):
         index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
         out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
         num_tokens = int(packed.shape[0])
-        supported_main_cache = (
-            buffers is not None
-            and buffers.is_cuda
-            and buffers.dtype == torch.float8_e4m3fn
-            and buffers.dim() == 5
-            and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 128)
-            and buffers.stride(4) == 1
-            and buffers.stride(3) == 128
+        layer_uses_nvfp4 = bool(
+            getattr(kv_cache_manager, "is_nvfp4_layer", lambda _layer_idx: False)(self.layer_idx)
         )
+        scale_buffers = (
+            kv_cache_manager.get_block_scale_buffers(self.layer_idx, kv_layout="HND")
+            if layer_uses_nvfp4
+            else None
+        )
+        kv_quant_scale = getattr(self.qkv_proj, "inv_kv_scales", None) if layer_uses_nvfp4 else None
+        if layer_uses_nvfp4:
+            supported_main_cache = (
+                buffers is not None
+                and buffers.is_cuda
+                and buffers.dtype in (torch.int8, torch.uint8)
+                and buffers.dim() == 5
+                and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 64)
+                and buffers.stride(4) == 1
+                and buffers.stride(3) == 64
+                and scale_buffers is not None
+                and scale_buffers.is_cuda
+                and scale_buffers.dtype == torch.uint8
+                and scale_buffers.dim() == 5
+                and tuple(scale_buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 8)
+                and scale_buffers.stride(4) == 1
+                and scale_buffers.stride(3) == 8
+                and kv_quant_scale is not None
+                and kv_quant_scale.is_cuda
+                and kv_quant_scale.dtype == torch.float32
+                and kv_quant_scale.numel() >= 3
+                and kv_quant_scale.is_contiguous()
+            )
+        else:
+            supported_main_cache = (
+                buffers is not None
+                and buffers.is_cuda
+                and buffers.dtype == torch.float8_e4m3fn
+                and buffers.dim() == 5
+                and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 128)
+                and buffers.stride(4) == 1
+                and buffers.stride(3) == 128
+            )
         supported_index_cache = (
             index_k_cache.is_cuda
             and index_k_cache.dtype == torch.float8_e4m3fn
@@ -1437,10 +1517,7 @@ class MiniMaxM3Attention(Attention):
         ):
             return None
 
-        q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
-            packed.contiguous(),
-            buffers,
-            index_k_cache,
+        common_args = (
             out_cache_loc[:num_tokens],
             self.num_heads,
             self.num_key_value_heads,
@@ -1455,6 +1532,23 @@ class MiniMaxM3Attention(Attention):
             rotary_cos_sin,
             position_ids.reshape(-1).contiguous().to(torch.int32),
         )
+        if layer_uses_nvfp4:
+            q, index_q = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
+                packed.contiguous(),
+                buffers.view(torch.uint8),
+                scale_buffers,
+                index_k_cache,
+                common_args[0],
+                kv_quant_scale,
+                *common_args[1:],
+            )
+        else:
+            q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
+                packed.contiguous(),
+                buffers,
+                index_k_cache,
+                *common_args,
+            )
         attn_metadata._msa_prewritten_layer = self.attn.layer_idx
         return q.flatten(1), index_q.flatten(1)
 
@@ -1882,7 +1976,10 @@ class MiniMaxM3Attention(Attention):
                 output,
             )
         else:
-            self._dispatch_attention_backend(q, k, v, idx_q, idx_k, attn_metadata, output)
+            # A generation-only step runs here rather than through compile
+            # (_ContextOnlyCompiledModel) and is padded all the same, since the
+            # bucket is agreed across ranks.
+            _dispatch_attention_over_live_tokens(self, q, k, v, idx_q, idx_k, attn_metadata, output)
         return output
 
     def _dispatch_attention_backend(
@@ -1933,6 +2030,16 @@ class MiniMaxM3Attention(Attention):
         """
         prewritten_main_kv = k is None or v is None
         assert (k is None) == (v is None)
+        kv_scale_orig_quant = (
+            getattr(self.qkv_proj, "inv_kv_scales", None) if self.main_kv_is_nvfp4 else None
+        )
+        kv_scale_quant_orig = (
+            getattr(self.qkv_proj, "kv_scales", None) if self.main_kv_is_nvfp4 else None
+        )
+        if self.main_kv_is_nvfp4 and (kv_scale_orig_quant is None or kv_scale_quant_orig is None):
+            raise RuntimeError(
+                "MiniMax-M3 NVFP4 KV cache requires qkv_proj.inv_kv_scales and kv_scales"
+            )
         if prewritten_main_kv:
             # Captured cache writes replay without replaying Python-side state.
             # Re-publish the marker in this eager boundary before the paged-GQA
@@ -1944,7 +2051,13 @@ class MiniMaxM3Attention(Attention):
             if not prewritten_main_kv:
                 # General #16755 path: one Triton launch writes this layer's
                 # K/V and, on the BF16 path, index-K.
-                attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v, idx_k)
+                attn_metadata.msa_write_layer_caches(
+                    self.attn.layer_idx,
+                    k,
+                    v,
+                    idx_k,
+                    kv_scale_orig_quant=kv_scale_orig_quant,
+                )
             # Publish the selected blocks so the FMHA runs the sparse path.
             kv_block_indexes = self.attn.run_indexer(
                 idx_q,
@@ -1952,14 +2065,28 @@ class MiniMaxM3Attention(Attention):
                 attn_metadata,
                 idx_k_prewritten=(not prewritten_main_kv or idx_k is None),
             )
-            forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
+            forward_args = AttentionForwardArgs(
+                output=output,
+                topk_indices=kv_block_indexes,
+                kv_scale_orig_quant=kv_scale_orig_quant,
+                kv_scale_quant_orig=kv_scale_quant_orig,
+            )
         else:
             assert idx_q is None and idx_k is None
             if not prewritten_main_kv:
                 # Dense layers retain the same general #16755 K/V scatter.
-                attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v)
+                attn_metadata.msa_write_layer_caches(
+                    self.attn.layer_idx,
+                    k,
+                    v,
+                    kv_scale_orig_quant=kv_scale_orig_quant,
+                )
             # No top-k selection means the FMHA attends the full page table.
-            forward_args = AttentionForwardArgs(output=output)
+            forward_args = AttentionForwardArgs(
+                output=output,
+                kv_scale_orig_quant=kv_scale_orig_quant,
+                kv_scale_quant_orig=kv_scale_quant_orig,
+            )
         if prewritten_main_kv:
             self.attn.forward_prepopulated_kv(q, attn_metadata, forward_args)
         else:
@@ -2020,7 +2147,7 @@ class MiniMaxM3Attention(Attention):
             and is_torch_compiling()
             and self.enable_fused_qkv_index_projection
             and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
-            and self._emit_fp8_main_qkv()
+            and (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
             and self.attn.indexer_kv_dtype == "fp8"
         ):
             q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
@@ -2352,6 +2479,12 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         self.enable_fusion &= (not self.enable_attention_dp) and self.mapping.tp_size > 1
         self.pre_feed_forward_fusion = self.enable_fusion
         self.post_feed_forward_fusion = self.enable_fusion
+        if self.block_sparse_moe is not None and self.block_sparse_moe.routed_output_is_global:
+            # POST fusion would defer a reduction of routed+shared to the
+            # layer boundary, but a fused-communication MoE has already
+            # combined the routed term.  Let the MoE reduce only its local
+            # shared-expert output before adding the routed result.
+            self.post_feed_forward_fusion = False
 
         self.allreduce = None
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
@@ -2713,6 +2846,12 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         raw_pretrained = model_config.pretrained_config
         if is_minimax_m3_vl_config(raw_pretrained):
             model_config = get_text_model_config(model_config)
+        if model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4:
+            # M3's 57 sparse target layers have an MSA NVFP4 consumer, but the
+            # one-model Eagle layer has no shipped P32 NVFP4 decode cubin.
+            # Keep its modules and separate cache on their established FP8
+            # representation while the target remains NVFP4.
+            model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8
         super().__init__(MiniMaxM3Model(model_config), model_config)
 
     def load_weights(
