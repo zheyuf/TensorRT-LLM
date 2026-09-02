@@ -1992,6 +1992,156 @@ class PyTorchModelEngine(ModelEngine):
                 self._reset_moe_alltoall_state()
                 torch.cuda.empty_cache()
 
+        # Cached-prefix warmup (see _run_cached_prefix_warmup): the first
+        # runtime context batch that carries a KV-cache prefix hit and a small
+        # chunk otherwise pays a one-time ~45 s specialization stall.
+        self._run_cached_prefix_warmup(resource_manager)
+
+    def _get_cached_prefix_warmup_configs(self) -> List[Tuple[int, int, int]]:
+        """(cached_tokens, chunk_tokens, num_gen_requests) triples; env TLLM_WARMUP_CACHED_PREFIX
+        ("cached:chunk[:gen],...") overrides, "off" disables."""
+        spec = os.environ.get("TLLM_WARMUP_CACHED_PREFIX", "").strip()
+        if spec.lower() in ("0", "off", "false", "no"):
+            return []
+        if spec:
+            configs = []
+            for item in spec.split(","):
+                parts = [int(x) for x in item.split(":")]
+                configs.append((parts[0], parts[1], parts[2] if len(parts) > 2 else 0))
+            return configs
+        # tiny fully-cached chunk alone, a mid-size cached-prefix chunk, and a mixed batch (tiny cached chunk +
+        # a few generation requests) -- the three shapes seen at the first runtime stall.
+        # short-query context rows over long and short cached prefixes: q<=64 / 65..128 select different
+        # fmha_sm100 kernel variants (qo_tile_size 128, max_qo_len<=64 flag, split-KV, pack_factor), none of
+        # which the position-0 warmup requests ever reach.
+        # One short-query context row per fmha_sm100 pack-factor bucket (pack_factor = f(max_qo_len, heads):
+        # q<=8 -> 16, 9..16 -> 8, 17..32 -> 4, 33..64 -> 1/single_wg, 65..128 -> 1/tile128), each over a long
+        # cached prefix, plus a mixed batch and a short-prefix case. Each new variant costs one nvcc JIT (~45-95 s)
+        # here instead of inside serving.
+        return [(131072, 5, 0), (131072, 12, 0), (131072, 24, 0), (131072, 40, 0), (131072, 100, 0),
+                (16384, 5, 4), (4096, 5, 0)]
+
+    def _create_cached_prefix_warmup_request(
+            self, resource_manager: ResourceManager, cached_tokens: int,
+            chunk_tokens: int, num_gen_requests: int = 0) -> Optional[ScheduledRequests]:
+        """One context request whose first ``cached_tokens`` are treated as a
+        KV-cache prefix hit, with ``chunk_tokens`` left to compute. Mirrors what
+        KVCacheManager(V2).prepare_resources does after a block-reuse lookup:
+        context_current_position / prepopulated_prompt_len advance past the
+        reused blocks and the scheduler assigns the remaining chunk."""
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        draft_kv_cache_manager = self._get_draft_kv_cache_manager(
+            resource_manager)
+        spec_resource_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        total = cached_tokens + chunk_tokens
+        num_extra_decoding_steps = self._get_num_extra_decoding_steps()
+        num_gen_requests = min(num_gen_requests, max(0, self.batch_size - 1))
+        num_gen_tokens = num_gen_requests * (1 + self.max_total_draft_tokens)
+        if chunk_tokens + num_gen_tokens > self.max_num_tokens or total > self.max_seq_len - 1 - num_extra_decoding_steps:
+            return None
+        available_tokens = kv_cache_manager.get_num_available_tokens(
+            token_num_upper_bound=total,
+            max_num_draft_tokens=self.max_total_draft_tokens)
+        if total > available_tokens:
+            return None
+        ctx_requests = kv_cache_manager.add_dummy_requests(
+            [0],
+            token_nums=[total],
+            is_gen=False,
+            max_num_draft_tokens=self.max_total_draft_tokens,
+            kv_reserve_draft_tokens=self.max_draft_loop_tokens,
+            use_mrope=self.use_mrope,
+            num_extra_decoding_steps=num_extra_decoding_steps,
+            draft_kv_cache_manager=draft_kv_cache_manager)
+        if not ctx_requests:
+            return None
+        req = ctx_requests[0]
+        tokens_per_block = getattr(kv_cache_manager, "tokens_per_block", 1)
+        req.context_current_position = cached_tokens
+        try:
+            req.set_prepopulated_prompt_len(cached_tokens, tokens_per_block)
+        except Exception:  # noqa: BLE001 - bookkeeping only
+            pass
+        req.context_chunk_size = chunk_tokens
+        if spec_resource_manager is not None:
+            spec_resource_manager.add_dummy_requests(request_ids=[0])
+        gen_requests = []
+        if num_gen_requests > 0:
+            gen_requests = kv_cache_manager.add_dummy_requests(
+                list(range(1, 1 + num_gen_requests)),
+                token_nums=[1] * num_gen_requests,
+                is_gen=True,
+                max_num_draft_tokens=self.max_total_draft_tokens,
+                kv_reserve_draft_tokens=self.max_draft_loop_tokens,
+                use_mrope=self.use_mrope,
+                max_beam_width=self.max_beam_width,
+                num_extra_decoding_steps=num_extra_decoding_steps,
+                draft_kv_cache_manager=draft_kv_cache_manager)
+            if gen_requests is None:
+                for r in ctx_requests:
+                    kv_cache_manager.free_resources(r)
+                    if draft_kv_cache_manager is not None:
+                        draft_kv_cache_manager.free_resources(r)
+                return None
+            if spec_resource_manager is not None:
+                spec_resource_manager.add_dummy_requests(
+                    request_ids=list(range(1, 1 + num_gen_requests)))
+        result = ScheduledRequests()
+        result.reset_context_requests(ctx_requests)
+        result.generation_requests = gen_requests
+        return result
+
+    def _run_cached_prefix_warmup(self, resource_manager: ResourceManager) -> None:
+        """Specialize the context path for prefix-cached requests during warmup.
+
+        Every general warmup request starts at context position 0. In serving,
+        requests that hit the KV-cache prefix arrive with
+        context_current_position > 0 (num_cached_tokens > 0) and, when the
+        remaining chunk is small, are routed through the compiled/piecewise
+        context path. The first such batch was measured to stall the executor
+        for ~45 s (once per server) on MiniMax-M3; running the same shape here
+        moves that one-time cost into startup.
+        """
+        import time as _time
+        configs = self._get_cached_prefix_warmup_configs()
+        if not configs or self.mapping.has_cp_helix():
+            return
+        for cached_tokens, chunk_tokens, num_gen_requests in configs:
+            try:
+                with self._release_batch_context(
+                        self._create_cached_prefix_warmup_request(
+                            resource_manager, cached_tokens, chunk_tokens,
+                            num_gen_requests),
+                        resource_manager) as batch:
+                    self._assert_all_tp_ranks_have_warmup_batch(
+                        batch, cached_tokens + chunk_tokens)
+                    if batch is None:
+                        logger.warning(
+                            f"Skipping cached-prefix warmup (cached={cached_tokens}, "
+                            f"chunk={chunk_tokens}): not enough KV cache space.")
+                        continue
+                    start = _time.monotonic()
+                    logger.info(
+                        f"Run warmup with cached-prefix context: cached={cached_tokens} tokens, chunk={chunk_tokens} tokens, gen_requests={num_gen_requests}"
+                    )
+                    self.forward(batch,
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager)
+                    torch.cuda.synchronize()
+                    logger.info(
+                        f"Cached-prefix warmup (cached={cached_tokens}, chunk={chunk_tokens}) took {_time.monotonic() - start:.1f} s"
+                    )
+            except torch.OutOfMemoryError:
+                logger.warning(
+                    f"OOM during cached-prefix warmup (cached={cached_tokens}, chunk={chunk_tokens}). Skipping.")
+                self._reset_moe_alltoall_state()
+                torch.cuda.empty_cache()
+            except Exception as e:  # noqa: BLE001 - warmup must never abort startup
+                logger.warning(
+                    f"Cached-prefix warmup (cached={cached_tokens}, chunk={chunk_tokens}) failed: {e!r}. Continuing without it.")
+
     def _reset_moe_alltoall_state(self) -> None:
         """Reset all MoE all-to-all state machines reachable from ``self.model``.
 
