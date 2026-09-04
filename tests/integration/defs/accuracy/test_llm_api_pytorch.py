@@ -8911,8 +8911,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
 
     def _run_nvfp4_eagle3_disagg(self, model_name, model_path, max_draft_len,
-                                 attention_dp, overlap_scheduler, use_msa,
-                                 cuda_graph):
+                                 inferencemax, attention_dp, overlap_scheduler,
+                                 use_msa, cuda_graph):
         """Disaggregated arm of test_nvfp4_eagle3.
 
         CI coverage for Eagle3 with the unified (shared) draft KV cache
@@ -8955,7 +8955,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "scheduler_config": {
                 "capacity_scheduler_policy": "MAX_UTILIZATION"
             },
-            "max_seq_len": 4096,
+            # The InferenceMAX protocol needs room for thinking output
+            # (12288 generated tokens on a ~2k chat prompt).
+            "max_seq_len": 16384 if inferencemax else 4096,
             "trust_remote_code": True,
         }
         kv_cache_common = {
@@ -9021,7 +9023,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             # checkpoint's hf_quant_config is MIXED_PRECISION (which is what
             # the in-process arm asserts and the accuracy references key on).
             llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
-            task = GSM8K(model_name)
+            task = (GSM8KInferenceMax(model_name)
+                    if inferencemax else GSM8K(model_name))
             task.evaluate(llm)
 
             # Chat-format acceptance probe: 200 GSM8K questions, chat
@@ -9083,19 +9086,24 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("disagg", [False, True])
+    @parametrize_with_ids("eval_mode", ["default", "inferencemax"])
     @parametrize_with_ids("cuda_graph", [True])
     @parametrize_with_ids("use_msa", [True])
     @parametrize_with_ids("overlap_scheduler", [False, True])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
-                          overlap_scheduler, use_msa, cuda_graph, disagg):
+                          overlap_scheduler, use_msa, cuda_graph, eval_mode,
+                          disagg):
         # One-model Eagle3 on the MSA backend with the unified draft KV cache:
         # the GQA drafter's layer shares the target manager's blocks and is
         # exposed to the dense attention kernels through the manager's draft
-        # view. Accuracy (MMLU + GSM8K) plus a chat-GSM8K acceptance probe,
-        # which accuracy alone cannot replace: rejected draft tokens are
-        # re-verified, so a corrupted drafter KV only shows up as acceptance.
+        # view. Accuracy plus a chat-GSM8K acceptance probe, which accuracy
+        # alone cannot replace: rejected draft tokens are re-verified, so a
+        # corrupted drafter KV only shows up as acceptance.
+        # eval_mode selects the accuracy protocol: "default" = completion-format
+        # MMLU + GSM8K; "inferencemax" = chat-format GSM8K matching the public
+        # InferenceMAX benchmark (needs a 16k context for thinking output).
         if use_msa:
             from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import \
                 msa_package_available
@@ -9103,11 +9111,13 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 pytest.skip("MSA kernels (fmha_sm100) not available")
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        inferencemax = eval_mode == "inferencemax"
         max_draft_len = 3
         if disagg:
             self._run_nvfp4_eagle3_disagg(model_name, model_path, max_draft_len,
-                                          attention_dp, overlap_scheduler,
-                                          use_msa, cuda_graph)
+                                          inferencemax, attention_dp,
+                                          overlap_scheduler, use_msa,
+                                          cuda_graph)
             return
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
@@ -9118,6 +9128,16 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
                                         dtype="fp8" if use_msa else "auto")
+        # The fmha_sm100 decode planner caps total_q x num_qo_heads at 65536;
+        # with 1 + draft_len = 4 verify tokens per row that bounds the batch
+        # at 1024 / TP-sharded heads (256 unsharded under attention DP). The
+        # inferencemax cap of 64 matches the InferenceMAX eval regime (client
+        # concurrency 64) and keeps every decode iteration inside the
+        # captured graph range, as in real serving at that concurrency.
+        if inferencemax:
+            max_batch_size = 64
+        else:
+            max_batch_size = 256 if attention_dp else 512
         with LLM(
                 model_path,
                 tensor_parallel_size=tp_size,
@@ -9127,19 +9147,18 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                     implementation="msa" if use_msa else "triton",
                     indexer_kv_dtype="fp8" if use_msa else "bf16"),
                 moe_config=MoeConfig(backend="CUTLASS"),
-                max_seq_len=4096,
-                # The fmha_sm100 decode planner caps total_q x num_qo_heads at
-                # 65536; with 1 + draft_len = 4 verify tokens per row that
-                # bounds the batch at 1024 / TP-sharded heads (256 unsharded
-                # under attention DP).
-                max_batch_size=256 if attention_dp else 512,
+                # The InferenceMAX protocol needs room for thinking output
+                # (12288 generated tokens on a ~2k chat prompt).
+                max_seq_len=16384 if inferencemax else 4096,
+                max_batch_size=max_batch_size,
                 speculative_config=spec_config,
                 # Graphs + spec requires the MSA path: its verify batches
                 # are decode-shaped and capture-safe (the reference path
                 # rejects graphs+spec at creation).
                 cuda_graph_config=CudaGraphConfig(
                     enable_padding=True,
-                    max_batch_size=64 if attention_dp else 128,
+                    max_batch_size=64 if
+                    (inferencemax or attention_dp) else 128,
                 ) if cuda_graph else None,
                 disable_overlap_scheduler=not overlap_scheduler,
                 enable_attention_dp=attention_dp,
@@ -9157,10 +9176,14 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                     steps += sd.get("numRequestsWithDraftTokens", 0)
                 return drafted, accepted, steps
 
-            task = MMLU(model_name)
-            task.evaluate(llm)
-            task = GSM8K(model_name)
-            task.evaluate(llm)
+            if inferencemax:
+                task = GSM8KInferenceMax(model_name)
+                task.evaluate(llm)
+            else:
+                task = MMLU(model_name)
+                task.evaluate(llm)
+                task = GSM8K(model_name)
+                task.evaluate(llm)
 
             # Chat-format acceptance — the drafter's training distribution.
             # Reuses the live engine and the cached dataset; ~20 s under
