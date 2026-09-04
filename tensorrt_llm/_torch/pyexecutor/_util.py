@@ -2381,6 +2381,16 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
+    if (draft_config_for_kv is not None and spec_config is not None
+            and hasattr(kv_cache_manager_cls, "get_draft_kv_cache_view")):
+        # One-model speculative decoding with shared draft layers appends the
+        # drafter's layers to this manager (see get_pp_layers). Managers that
+        # expose the appended layers through a draft view (MiniMax-M3) need
+        # the count to locate them; the layer range passed as num_layers
+        # stays the pretrained target's.
+        from ..speculative.utils import get_num_spec_layers
+        manager_extra_kwargs["num_one_model_draft_layers"] = (
+            get_num_spec_layers(spec_config))
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

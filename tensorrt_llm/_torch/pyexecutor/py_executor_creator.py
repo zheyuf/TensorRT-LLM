@@ -499,7 +499,13 @@ def create_py_executor(
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode
         # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
-        if cache_transceiver_config is not None:
+        # MiniMax-M3 also uses the unified target cache in every supported
+        # one-model configuration: its drafter's dense K/V pages live inside
+        # M3's non-uniform mega-slot and are exposed through the manager's
+        # draft view (MiniMaxM3DraftKVCacheView), so reuse, eviction and
+        # disaggregated KV transfer cover the drafter's KV natively.
+        if (cache_transceiver_config is not None
+                or is_minimax_m3(m3_sparse_config)):
             spec_config._allow_separate_draft_kv_cache = False
 
     # chunk_unit_size may be changed to 64 when using flash mla
