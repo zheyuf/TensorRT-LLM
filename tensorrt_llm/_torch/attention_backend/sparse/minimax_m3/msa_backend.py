@@ -16,6 +16,10 @@
     into them. The standard CUDAGraphRunner clones one metadata per graph
     batch size (create_cuda_graph_metadata), so no per-batch-size cache is
     needed here.
+  * Decode steps may carry several query tokens per request (one-model
+    speculative verify: 1 + draft_len). The plans, cache slots and valid-block
+    counts are per query token, and on_update_kv_lens re-derives them on
+    device after the overlap scheduler corrects kv_lens.
 
 The classes subclass TrtllmAttention and TrtllmAttentionMetadata, imported at
 module scope. This is cycle-free because the fmha registry defers its
@@ -115,6 +119,19 @@ _MSA_SPLIT_KV_KEYS = (
     "workspace_o",
     "workspace_lse",
 )
+# Per-row length mirrors that on_update_kv_lens patches inside a plan's
+# sub-dicts once the overlap scheduler has corrected kv_lens on device. Dense
+# plans expose them as kv_segment_lens/qo_offset; fmha_sm100 tags its sparse
+# plans with "MM-SA-Nv" and exposes the attended length as seqused_k instead.
+# The worklists and the page-table layout need no patch: the correction only
+# shrinks lengths, so the pages already listed stay valid.
+_MSA_DENSE_LENGTH_KEYS = ("kv_segment_lens", "qo_offset")
+_MSA_SPARSE_LENGTH_KEYS = ("seqused_k",)
+
+
+def _msa_plan_length_keys(sub_plan: dict) -> tuple:
+    """The length mirrors to patch in one fmha_sm100 sub-plan."""
+    return _MSA_SPARSE_LENGTH_KEYS if sub_plan.get("MM-SA-Nv") else _MSA_DENSE_LENGTH_KEYS
 
 
 class _MsaGraphSafePlan:
@@ -223,6 +240,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     need no graph-stable storage. Plans are built in _build_step_plans:
     pure-decode batches use the graph-safe owners (msa_decode_*_plan) while
     prefill/mixed batches keep plain eager tuples (msa_eager_*_plan).
+
+    Under one-model speculative decoding a decode row carries 1 + draft_len
+    query tokens, so the cache slots, valid-block counts and plan rows are
+    per query token, and the overlap scheduler corrects kv_lens on device
+    after prepare() staged optimistic (full-acceptance) values; see
+    on_update_kv_lens for the sync-free re-derivation.
     """
 
     # Graph-stable buffers; consumers slice to the live count at the call
@@ -231,6 +254,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     msa_kv_indices: Optional[torch.Tensor] = None
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
+    # Staging for on_update_kv_lens: the step's [batch, max_kv_len]
+    # request->slot table, each query token's request row and intra-request
+    # offset, and the kv_lens prepare() staged before the overlap scheduler
+    # corrected them (the upper bound the correction is clamped to).
+    msa_req_to_token: Optional[torch.Tensor] = None
+    msa_q_batch_row: Optional[torch.Tensor] = None
+    msa_q_intra: Optional[torch.Tensor] = None
+    msa_kv_lens_staged: Optional[torch.Tensor] = None
 
     # _msa_buffers_ready gates the once-only device buffers;
     # _msa_fields_ready marks that the current step's buffers are populated.
@@ -257,6 +288,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # persistent backing store for the view.
     _msa_eager_n_valid_buf: Optional[torch.Tensor] = None
     _msa_eager_n_valid_blocks: Optional[torch.Tensor] = None
+    # Host-side query-token offset of each request (plus the total as the
+    # tail), so on_update_kv_lens can slice a sub-plan's token range without
+    # a device read.
+    _msa_q_token_starts: tuple = (0,)
+    # Whether kv_lens can move after prepare() this run (speculative decoding
+    # is active); without it the staging and the device-side patch are
+    # skipped, so non-speculative steps run exactly as before.
+    _msa_kv_lens_dynamic: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -282,11 +321,20 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     @property
     def msa_kv_lens_cpu(self) -> Optional[torch.Tensor]:
-        """Per-request KV length, cached plus new tokens (host int32)."""
+        """Per-request KV length, cached plus new tokens (host int32).
+
+        The base kv_lens includes num_extra_kv_tokens (speculative draft-loop
+        slots consumed by the C++ kernels); the MSA plans, ladder slots and
+        page counts need the true attended length, so it is excluded here.
+        """
         kv_lens = getattr(self, "kv_lens", None)
         if self.seq_lens is None or kv_lens is None:
             return None
         out = kv_lens[: self.num_seqs]
+        params = self.kv_cache_params
+        extra = params.num_extra_kv_tokens if params is not None else 0
+        if extra:
+            out = out - extra
         if out.dtype != torch.int32:
             out = out.to(torch.int32)
         return maybe_pin_memory(out)
@@ -382,6 +430,37 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # Staging for on_update_kv_lens, which re-derives the cache slots and
+        # valid-block counts on device from the corrected kv_lens, sync-free.
+        tokens_per_block = int(kv_cache_manager.tokens_per_block)
+        self.msa_req_to_token = self.get_empty(
+            buffers,
+            (max_num_sequences, max_blocks_per_seq * tokens_per_block),
+            cache_name="msa_req_to_token",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.msa_q_batch_row = self.get_empty(
+            buffers,
+            (max_num_tokens,),
+            cache_name="msa_q_batch_row",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.msa_q_intra = self.get_empty(
+            buffers,
+            (max_num_tokens,),
+            cache_name="msa_q_intra",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.msa_kv_lens_staged = self.get_empty(
+            buffers,
+            (max_num_sequences,),
+            cache_name="msa_kv_lens_staged",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
         # The proxy scratch needs the fmha_sm100 plan geometry. This metadata
         # exists only for the MSA backend, whose selection already required the
         # kernels, so a failed import here is a hard error rather than a reason
@@ -397,37 +476,53 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             )
             self._alloc_msa_proxy_scratch(
                 num_index_heads=params.num_index_heads,
-                max_batch=max_num_sequences,
+                max_tokens=self._msa_max_decode_tokens(),
                 max_k_tiles=max_k_tiles,
                 capture_graph=capture_graph,
             )
         self._msa_buffers_ready = True
 
+    def _msa_max_decode_tokens(self) -> int:
+        """Worst-case query tokens of one decode step.
+
+        Speculative verify emits 1 + draft_len tokens per row, so this is
+        bounded by max_num_tokens rather than the batch size. 16384 keeps
+        total_q * num_qo_heads under the fmha_sm100 planner cap (65536,
+        fmha_sm100/api.py) at 4 sharded index heads.
+        """
+        max_seqs = int(self.max_num_sequences)
+        max_toks = int(self.max_num_tokens or 0)
+        if max_toks <= 0:
+            return max_seqs
+        return max(max_seqs, min(max_toks, 16384))
+
     def _alloc_msa_proxy_scratch(
         self,
         *,
         num_index_heads: int,
-        max_batch: int,
+        max_tokens: int,
         max_k_tiles: int,
         capture_graph: bool,
     ) -> None:
         """Allocate the flat proxy max-score store and the valid-block scratch.
 
-        The store is sized for the worst-case max_k_tiles so one allocation
-        serves every decode step. msa_proxy_max_score_view slices the per-step
-        shape out of it.
+        The store is sized for the worst-case max_k_tiles and the worst-case
+        per-step query-token count (which exceeds the batch size under
+        speculative multi-token verify), so one allocation serves every
+        decode step. msa_proxy_max_score_view slices the per-step shape out
+        of it.
         """
         buffers = self.cuda_graph_buffers
         self.msa_max_score = self.get_empty(
             buffers,
-            (num_index_heads * max_k_tiles * max_batch,),
+            (num_index_heads * max_k_tiles * max_tokens,),
             cache_name="msa_max_score",
             dtype=torch.float32,
             capture_graph=capture_graph,
         )
         self.msa_n_valid_blocks = self.get_empty(
             buffers,
-            (max_batch,),
+            (max_tokens,),
             cache_name="msa_n_valid_blocks",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -442,14 +537,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         required_max_k_tiles: int,
     ) -> None:
         """Ensure proxy scratch buffers exist and cover the current plan."""
-        required_numel = num_index_heads * required_max_k_tiles * max_batch
+        max_tokens = max(int(max_batch), self._msa_max_decode_tokens())
+        required_numel = num_index_heads * required_max_k_tiles * max_tokens
         if self.msa_max_score is not None:
             if self.msa_max_score.numel() < required_numel:
                 raise ValueError(
                     f"msa_max_score backing store ({self.msa_max_score.numel()} "
                     f"elements) is smaller than the decode plan needs "
                     f"({required_numel} = {num_index_heads} heads * "
-                    f"{required_max_k_tiles} k-tiles * {max_batch} batch)."
+                    f"{required_max_k_tiles} k-tiles * {max_tokens} tokens)."
                 )
             return
 
@@ -471,7 +567,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             )
         self._alloc_msa_proxy_scratch(
             num_index_heads=num_index_heads,
-            max_batch=max_batch,
+            max_tokens=max_tokens,
             max_k_tiles=max_k_tiles,
             capture_graph=capture_graph,
         )
@@ -494,6 +590,142 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         super().prepare()
         self._build_msa_fields()
         self._build_step_plans()
+
+    def _msa_kv_lens_may_change(self) -> bool:
+        """Whether kv_lens can be corrected on device after prepare().
+
+        Only speculative decoding advances kv_lens_cuda past the staged
+        values (the overlap scheduler's accepted-token correction, the draft
+        loop); mirrors the spec_active predicate in TrtllmAttentionMetadata.
+        """
+        params = self.kv_cache_params
+        runtime_features = self.runtime_features
+        return bool(
+            self.draft_kv_cache_manager is not None
+            or self.is_spec_decoding_enabled
+            or (params is not None and params.num_extra_kv_tokens)
+            or (runtime_features is not None and runtime_features.has_speculative_draft_tokens)
+        )
+
+    def _msa_live_plans(self) -> tuple:
+        """The fmha_sm100 plans in play this step.
+
+        Decode steps populate the graph-safe owners, prefill and mixed steps
+        the plain eager tuples; _build_step_plans clears whichever set does
+        not apply, so only one set is ever live per site.
+        """
+        live = []
+        for owner, eager in (
+            (self._msa_proxy_plan, self._msa_eager_proxy_plan),
+            (self._msa_gqa_plan, self._msa_eager_gqa_plan),
+            (self._msa_dense_plan, self._msa_eager_dense_plan),
+        ):
+            plan = owner.plan if owner is not None else None
+            if plan is None:
+                plan = eager
+            if plan is not None:
+                live.append(plan)
+        return tuple(live)
+
+    def on_update_kv_lens(self) -> None:
+        """Re-derive length-dependent MSA state from the corrected kv_lens_cuda.
+
+        The overlap scheduler corrects kv_lens_cuda on device after prepare()
+        staged optimistic (full-acceptance) lens. The correction only shrinks
+        lengths, so the host-baked plan worklists and the page-table layout
+        stay valid and only the per-row lengths need patching. The clamp
+        against msa_kv_lens_staged enforces that bound rather than trusting
+        it: a longer length would drive the kernels past the extent prepare()
+        planned for. The same clamp covers CUDA-graph warmup, where the draft
+        loop advances kv_lens_cuda in place between warmup runs that share one
+        prepare(). Decode, prefill and mixed steps share one device-side
+        patch, so this is capture-safe, sync-free and idempotent. Without
+        speculative decoding kv_lens never moves after prepare(), so the patch
+        is skipped (see _msa_kv_lens_may_change).
+        """
+        super().on_update_kv_lens()
+        if not self._msa_fields_ready or not self._msa_kv_lens_dynamic:
+            return
+        batch = int(self.num_seqs)
+        total_q = int(self.num_tokens)
+        if batch <= 0 or total_q <= 0:
+            return
+        kv_true = torch.minimum(self.kv_lens_cuda[:batch], self.msa_kv_lens_staged[:batch])
+        qbr = self.msa_q_batch_row[:total_q].to(torch.long)
+        qo_dev = self.seq_lens_cuda[:batch]
+        kv_true_tok = kv_true[qbr]
+        # Attended position of each query token within its request.
+        pos = kv_true_tok - qo_dev[qbr] + self.msa_q_intra[:total_q]
+
+        # KV/idx-K write slots: slot[j] = req_to_token[request[j], pos[j]].
+        width = int(self.msa_req_to_token.shape[1])
+        idx = pos.to(torch.long).clamp(min=0, max=width - 1)
+        slots = self.msa_req_to_token.reshape(-1).index_select(0, qbr * width + idx)
+        self.msa_out_cache_loc[:total_q].copy_(slots)
+
+        # Per-token valid-block counts for top-k selection. clamp_min(1)
+        # keeps degenerate (graph-padding) rows from -inf-masking every
+        # block, which would NaN the fully-masked GQA row.
+        page = int(self.kv_cache_manager.tokens_per_block)
+        n_valid = torch.div((pos + 1).clamp_min(1) + (page - 1), page, rounding_mode="floor")
+        n_valid_buf = (
+            self._msa_eager_n_valid_blocks
+            if self._msa_eager_n_valid_blocks is not None
+            else self.msa_n_valid_blocks
+        )
+        if n_valid_buf is not None:
+            n_valid_buf[:total_q].copy_(n_valid.to(torch.int32))
+
+        # Plan length mirrors. A plan is (has_mixed, split, batch, decode_sub,
+        # prefill_sub), whose last two entries cover the plan's own rows
+        # [0, split) and [split, batch). Which of the two holds the prefill
+        # requests depends on the batch order, so those names are positional
+        # only and nothing here may key off them; each sub-plan mirrors just
+        # its own range. A sub-plan holds either one row per request or one
+        # per query token (the planner row-expands qo_len > 1 requests), so
+        # the row count selects the source. qo_offset must stay non-negative:
+        # negative values hit the kernel's packed-length sentinel fallback.
+        per_request = {
+            "kv_segment_lens": kv_true,
+            "qo_offset": (kv_true - qo_dev).clamp_min(0),
+            "seqused_k": kv_true,
+        }
+        per_token = {
+            "kv_segment_lens": kv_true_tok,
+            "qo_offset": pos.clamp_min(0),
+            "seqused_k": (pos + 1).clamp_min(0),
+        }
+        starts = self._msa_q_token_starts
+        for plan in self._msa_live_plans():
+            has_mixed, split, _, decode_sub, prefill_sub = plan
+            subs = (
+                ((decode_sub, 0, split), (prefill_sub, split, batch))
+                if has_mixed
+                else ((decode_sub, 0, batch),)
+            )
+            for sub, first, last in subs:
+                if sub is None:
+                    continue
+                tok_first, tok_last = starts[first], starts[last]
+                for key in _msa_plan_length_keys(sub):
+                    dst = sub.get(key)
+                    if dst is None:
+                        raise RuntimeError(
+                            f"MSA plan has no length mirror {key!r}, so the corrected "
+                            "kv_lens cannot reach the kernel."
+                        )
+                    rows = int(dst.shape[0])
+                    if rows == last - first:
+                        src = per_request[key][first:last]
+                    elif rows == tok_last - tok_first:
+                        src = per_token[key][tok_first:tok_last]
+                    else:
+                        raise RuntimeError(
+                            f"MSA plan {key!r} has {rows} rows for requests "
+                            f"[{first}, {last}); expected {last - first} (one per "
+                            f"request) or {tok_last - tok_first} (one per query token)."
+                        )
+                    dst.copy_(src)
 
     def _build_step_plans(self) -> None:
         """Build the three layer-invariant fmha_sm100 plans once per step.
@@ -536,7 +768,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         qo_offset_cpu = self.msa_qo_offset_cpu
         if qo_lens_cpu is None or kv_lens_cpu is None or qo_offset_cpu is None:
             return
-        batch = int(qo_lens_cpu.shape[0])
         device = _cache_device(self)
         page_size = int(self.kv_cache_manager.tokens_per_block)
         capture_graph = self.is_cuda_graph
@@ -596,14 +827,18 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._msa_eager_gqa_plan = gqa_plan
             self._msa_eager_dense_plan = dense_plan
             # Stage the valid-block count to the device once for the whole step
-            # (see _msa_eager_n_valid_blocks).
+            # (see _msa_eager_n_valid_blocks). clamp_min(1) matches the decode
+            # path and on_update_kv_lens: a zero-valid row would -inf-mask every
+            # block and NaN the GQA row that consumes the selection.
             n_valid_host = per_token_valid_blocks(
                 qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, causal=True, block_size=page_size
             )
             total_q = int(n_valid_host.shape[0])
             if total_q > 0:
                 dev_buf = self._ensure_eager_n_valid_buffer(total_q, device)
-                dev_buf[:total_q].copy_(n_valid_host.to(torch.int32), non_blocking=True)
+                dev_buf[:total_q].copy_(
+                    n_valid_host.clamp_min(1).to(torch.int32), non_blocking=True
+                )
                 self._msa_eager_n_valid_blocks = dev_buf[:total_q]
             return
 
@@ -616,27 +851,31 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         )
 
         # Allocate the graph-safe plan owners once per metadata; later steps
-        # only refresh their contents below.
+        # only refresh their contents below. The plan worklists are sized per
+        # expanded row (the planner splits qo_len > 1 requests into per-token
+        # rows under speculative multi-token verify), so use the worst-case
+        # decode-step token count rather than the batch size.
         if self._msa_proxy_plan is None:
+            max_plan_rows = max(max_batch, self._msa_max_decode_tokens())
             num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
             self._msa_proxy_plan = _MsaGraphSafePlan(
                 self,
                 "msa_proxy_plan",
-                max_batch=max_batch,
+                max_batch=max_plan_rows,
                 num_ctas=num_ctas,
                 capture_graph=capture_graph,
             )
             self._msa_gqa_plan = _MsaGraphSafePlan(
                 self,
                 "msa_gqa_plan",
-                max_batch=max_batch,
+                max_batch=max_plan_rows,
                 num_ctas=num_ctas,
                 capture_graph=capture_graph,
             )
             self._msa_dense_plan = _MsaGraphSafePlan(
                 self,
                 "msa_dense_plan",
-                max_batch=max_batch,
+                max_batch=max_plan_rows,
                 num_ctas=num_ctas,
                 capture_graph=capture_graph,
             )
@@ -650,14 +889,18 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         n_valid = per_token_valid_blocks(
             qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, causal=True, block_size=page_size
         )
-        self.msa_n_valid_blocks[:batch].copy_(n_valid.to(torch.int32), non_blocking=True)
+        # One entry per query token (qo_len > 1 under spec verify).
+        total_q = int(n_valid.shape[0])
+        self.msa_n_valid_blocks[:total_q].copy_(n_valid.to(torch.int32), non_blocking=True)
 
     def _build_msa_fields(self) -> None:
         """Populate the MSA cache-write buffers for this step.
 
         The page table and per-new-token cache slots are derived via the
         build_paged_kv_slot_mapping helper, then copied into the persistent
-        buffers. The transient builder tensors are discarded.
+        buffers. The transient builder tensors are discarded. Under
+        speculative decoding the request -> slot table and the per-token
+        row/offset maps are staged as well, for on_update_kv_lens.
         """
         self._msa_fields_ready = False
         if not self._msa_buffers_ready:
@@ -676,18 +919,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         cache_device = _cache_device(self)
         page_size = int(kv_cache_manager.tokens_per_block)
 
-        is_prefill = int(self.num_contexts or 0) > 0
-        if not is_prefill and int(qo_lens_cpu.max().item()) > 1:
-            raise NotImplementedError(
-                "MiniMax-M3 MSA attention does not support speculative decoding "
-                "(multiple query tokens per decode step). Disable speculative "
-                "decoding or use the non-MSA MiniMax-M3 backend."
-            )
-
         # Built in prepare() (outside capture), so these transients are
         # fine: forwards read only the persistent buffers filled below.
         # qo_offset is the prefix length, so one build covers prefill
-        # (num_cached) and decode (kv_len - 1 with qo_len 1).
+        # (num_cached) and decode (kv_len - qo_len; qo_len is 1 + draft_len
+        # under speculative verify).
         mapping = build_paged_kv_slot_mapping(
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
@@ -695,6 +931,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             qo_offset_cpu=qo_offset_cpu,
             device=cache_device,
         )
+        req_to_token = mapping.req_to_token
         out_cache_loc = mapping.out_cache_loc
         # The page table comes from the same host block ids the mapping was
         # built from, so it costs no device work.
@@ -715,6 +952,38 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
         self.msa_out_cache_loc[:total_new_tokens].copy_(out_cache_loc, non_blocking=True)
         self.msa_kv_indices[:total_pages].copy_(kv_indices, non_blocking=True)
+
+        self._msa_kv_lens_dynamic = self._msa_kv_lens_may_change()
+        if not self._msa_kv_lens_dynamic:
+            self._msa_fields_ready = True
+            return
+
+        # Staging for on_update_kv_lens: the request -> slot table and each
+        # query token's (request row, intra-request offset). Pinned and
+        # non-blocking: a plain copy_ from pageable host memory ends in
+        # cudaStreamSynchronize, which drains the whole queue.
+        step_width = int(req_to_token.shape[1])
+        self.msa_req_to_token[:batch_size, :step_width].copy_(req_to_token, non_blocking=True)
+        qo_long = qo_lens_cpu.to(torch.long)
+        batch_row_cpu = torch.repeat_interleave(
+            torch.arange(batch_size, dtype=torch.int32), qo_long
+        )
+        starts = torch.cumsum(qo_long, 0) - qo_long
+        intra_cpu = (
+            torch.arange(total_new_tokens, dtype=torch.int64)
+            - torch.repeat_interleave(starts, qo_long)
+        ).to(torch.int32)
+        self.msa_q_batch_row[:total_new_tokens].copy_(
+            maybe_pin_memory(batch_row_cpu), non_blocking=True
+        )
+        self.msa_q_intra[:total_new_tokens].copy_(maybe_pin_memory(intra_cpu), non_blocking=True)
+        # Snapshot the staged lens as the upper bound on_update_kv_lens clamps
+        # to. Device-to-device, so it stays sync-free.
+        self.msa_kv_lens_staged[:batch_size].copy_(
+            self.kv_lens_cuda[:batch_size], non_blocking=True
+        )
+        # Token offset of each request, plus the total as the tail.
+        self._msa_q_token_starts = (0, *torch.cumsum(qo_long, 0).tolist())
         self._msa_fields_ready = True
 
     def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
