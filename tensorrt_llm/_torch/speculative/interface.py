@@ -2679,12 +2679,18 @@ class SpecWorkerBase(nn.Module, ABC):
 
     def get_draft_kv_cache_manager(self, resource_manager):
         """
-        Get the draft KV cache manager if using separate KV cache layouts.
+        Get the draft-side KV cache manager: the separate manager when one is
+        used, else the target manager's draft view for shared layouts that need
+        one (see utils.get_draft_kv_cache_manager). None when the drafter
+        attends the shared manager directly.
         """
-        if self.use_separate_draft_kv_cache and resource_manager is not None:
+        if resource_manager is None:
+            return None
+        if self.use_separate_draft_kv_cache:
             return resource_manager.get_resource_manager(
                 ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-        return None
+        from .utils import get_shared_draft_kv_cache_view
+        return get_shared_draft_kv_cache_view(resource_manager)
 
     @contextmanager
     def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
@@ -2697,7 +2703,8 @@ class SpecWorkerBase(nn.Module, ABC):
         tables and kernel wrappers are manager-specific.
         """
 
-        # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
+        # draft_kv_cache_manager is None for two-engine speculative decoding
+        # and for shared draft layers that need no adapter view.
         if draft_kv_cache_manager is None:
             yield attn_metadata
             return

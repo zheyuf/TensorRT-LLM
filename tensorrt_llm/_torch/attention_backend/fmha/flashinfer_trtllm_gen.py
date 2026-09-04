@@ -874,8 +874,17 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if tokens_per_block & (tokens_per_block - 1) != 0:
             return False, f"tokens_per_block ({tokens_per_block}) that is not a power of 2."
         if tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK:
-            supported = sorted(self.SUPPORTED_TOKENS_PER_BLOCK)
-            return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
+            # P128 is not exported for every TRTLLM-Gen shape family, so keep
+            # it out of the global allowlist. A cache-manager view whose exact
+            # shapes are exported may opt in (MiniMax-M3's shared Eagle3 draft
+            # layer, see MiniMaxM3DraftKVCacheView); checked only once the
+            # allowlist has already rejected the page size.
+            extra_tokens_per_block = getattr(
+                meta.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ()
+            )
+            if tokens_per_block not in extra_tokens_per_block:
+                supported = sorted(self.SUPPORTED_TOKENS_PER_BLOCK | set(extra_tokens_per_block))
+                return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
 
         return True, ""
 

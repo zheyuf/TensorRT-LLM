@@ -829,19 +829,43 @@ def get_num_extra_kv_tokens(spec_config):
     return 0
 
 
-def get_draft_kv_cache_manager(spec_config, resource_manager):
+def get_shared_draft_kv_cache_view(resource_manager):
     """
-    Returns the draft KV cache manager only in one-model speculative decoding
-    mode where the target model manages a separate draft KV cache.
+    Returns the target KV cache manager's draft-side view for one-model
+    speculative decoding with shared draft layers, or None.
+
+    A target manager whose shared layout cannot be addressed by the generic
+    pool mapping (e.g. MiniMax-M3's index-K-coalesced mega-slot) exposes the
+    appended draft layers through ``get_draft_kv_cache_view``; uniform shared
+    layouts need no adapter and yield None.
     """
     from ..pyexecutor.resource_manager import ResourceManagerType
 
-    if spec_config is None:
+    target_manager = resource_manager.get_resource_manager(
+        ResourceManagerType.KV_CACHE_MANAGER)
+    # Fetch the method before calling it so construction failures propagate
+    # instead of being mistaken for a manager without a view.
+    get_view = getattr(target_manager, "get_draft_kv_cache_view", None)
+    return get_view() if get_view is not None else None
+
+
+def get_draft_kv_cache_manager(spec_config, resource_manager):
+    """
+    Returns the draft-side KV cache manager for one-model speculative decoding:
+    the registered separate draft manager when there is one, else the target
+    manager's draft view (see get_shared_draft_kv_cache_view), else None.
+    """
+    from ..pyexecutor.resource_manager import ResourceManagerType
+
+    if spec_config is None or resource_manager is None:
         return None
     if not spec_config.spec_dec_mode.use_one_engine():
         return None
-    return resource_manager.get_resource_manager(
+    draft_manager = resource_manager.get_resource_manager(
         ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+    if draft_manager is not None:
+        return draft_manager
+    return get_shared_draft_kv_cache_view(resource_manager)
 
 
 def update_spec_config_from_model_config(spec_config,
