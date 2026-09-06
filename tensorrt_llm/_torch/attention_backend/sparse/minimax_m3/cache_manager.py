@@ -20,12 +20,13 @@ Provides:
     construction).
   * :class:`MiniMaxM3KVCacheManagerV2` — :class:`KVCacheManagerV2`
     subclass that registers a per-sparse-layer ``Role.INDEX_KEY`` paged
-    buffer alongside the standard K/V buffers.
+    buffer alongside the standard K/V buffers, and presents shared one-model
+    Eagle3 draft layers to the attention op as their own virtual pools.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
@@ -38,6 +39,10 @@ from tensorrt_llm._utils import (
 )
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
+from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+    copy_batch_block_offsets_to_device,
+)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
@@ -134,6 +139,97 @@ class MiniMaxM3SparseIndexCache:
         buf.index_copy_(0, out_cache_loc.to(torch.long), idx_v.to(buf.dtype))
 
 
+def shared_draft_layer_count(spec_config, layer_mask) -> int:
+    """Number of one-model draft layers the base manager appends to this one.
+
+    Mirrors ``get_pp_layers``: speculative layers are appended only when a
+    speculative config is present and the caller did not pin the layer set
+    with ``layer_mask`` (a separate draft manager, or the target manager
+    paired with one, always passes a mask).
+    """
+    if spec_config is None or layer_mask is not None:
+        return 0
+    from ....speculative.utils import get_num_spec_layers
+
+    return int(get_num_spec_layers(spec_config))
+
+
+def derive_shared_draft_layout(
+    num_layers: Optional[int],
+    num_kv_heads,
+    num_draft: int,
+) -> Tuple[List[int], Optional[int]]:
+    """Locate the appended one-model draft tail in the manager's layer range.
+
+    The creation site passes the pretrained TARGET layer count as
+    ``num_layers`` and lets the base manager append the ``num_draft`` shared
+    draft layers (see ``get_pp_layers``). When target and drafter differ in KV
+    heads the per-layer ``num_kv_heads`` list is already extended and its
+    length is the unambiguous total; a scalar head count extends
+    ``num_layers`` by the draft tail instead.
+
+    Returns ``(draft_layer_ids, num_target_layers)``: the target range is
+    ``[0, num_target_layers)`` and the draft tail sits directly above it.
+    ``num_target_layers`` is ``None`` when neither input pins the range.
+    """
+    num_draft = max(0, int(num_draft))
+    if isinstance(num_kv_heads, (list, tuple)):
+        total = len(num_kv_heads)
+        if num_layers is not None:
+            total = max(total, int(num_layers))
+    elif num_layers is not None:
+        total = int(num_layers) + num_draft
+    else:
+        return [], None
+    num_target = total - num_draft
+    return list(range(num_target, total)), num_target
+
+
+def extend_attention_op_pools_for_shared_draft_layers(
+    pool_pointers: torch.Tensor,
+    pool_mapping: torch.Tensor,
+    num_pools: int,
+    draft_layers: Sequence[Tuple[int, int, int]],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[Tuple[int, int]]]:
+    """Append one virtual attention-op pool per shared draft layer.
+
+    ``draft_layers`` holds ``(local_layer_idx, key_base_addr, sub_pages_per_slot)``
+    for each appended draft layer. Each gets a pool rooted at its own K page:
+    with ``index_scales = sub_pages_per_slot`` and ``kv_offset = 1`` the
+    attention op's block-offset copy maps logical slot ``s`` to page
+    ``s * scale`` for K and ``s * scale + 1`` for V, which is where the layer's
+    pages sit inside the mega-slot. The layer's row in ``pool_mapping`` moves
+    to the new pool with offset 0.
+
+    Returns ``(pool_pointers, pool_mapping, index_scales, kv_offsets,
+    op_pools)`` where ``op_pools`` lists ``(attention_op_pool_id,
+    source_storage_pool_id)``; the source pool's host block offsets (raw slot
+    ids) feed the virtual pool's copy.
+    """
+    pointer_rows = pool_pointers.tolist()
+    mapping_rows = pool_mapping.tolist()
+    nested = pool_pointers.dim() == 3  # NVFP4 carries [data, scale] pointer pairs
+    index_scales: List[int] = []
+    kv_offsets: List[int] = []
+    op_pools: List[Tuple[int, int]] = []
+    for i, (local_layer_idx, key_base_addr, sub_pages_per_slot) in enumerate(draft_layers):
+        op_pool_id = num_pools + i
+        source_pool_id = int(mapping_rows[local_layer_idx][0])
+        pointer_rows.append([[key_base_addr, 0], [0, 0]] if nested else [key_base_addr, 0])
+        mapping_rows[local_layer_idx] = [op_pool_id, 0]
+        index_scales.append(int(sub_pages_per_slot))
+        kv_offsets.append(1)
+        op_pools.append((op_pool_id, source_pool_id))
+    pinned = prefer_pinned()
+    return (
+        torch.tensor(pointer_rows, dtype=pool_pointers.dtype, device="cpu", pin_memory=pinned),
+        torch.tensor(mapping_rows, dtype=pool_mapping.dtype, device="cpu", pin_memory=pinned),
+        torch.tensor(index_scales, dtype=torch.int32, device="cpu", pin_memory=pinned),
+        torch.tensor(kv_offsets, dtype=torch.int32, device="cpu", pin_memory=pinned),
+        op_pools,
+    )
+
+
 class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     """KVCacheManagerV2 subclass with a V2-managed paged index-K cache
     per sparse layer.
@@ -153,7 +249,36 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
       * ``disable_index_value_layer_ids`` — subset whose index-V is
         omitted.
       * ``sparse_index_dim`` — width of the index-K/V vectors.
+
+    Shared one-model Eagle3 draft layers. The base manager appends the
+    drafter's layers after the target's (see :func:`shared_draft_layer_count`).
+    They carry no MSA index cache, but they do run the generic TRTLLM
+    attention op, which addresses K/V through pool pointers, ``index_scales``
+    and block offsets and assumes every layer of a pool has the same per-block
+    stride. KVCacheManagerV2 groups sub-pages into pools by size alone, and at
+    M3's production geometry (one FP8 KV head per rank, 128-dim index-K) the
+    index-K page is the same size as a K or V page, so K, V and index-K of
+    every layer coalesce into one pool whose slot is non-uniform: sparse layers
+    own three sub-pages, dense and draft layers two. M3's own kernels never
+    notice (they use the per-layer views from :meth:`get_buffers`), but the
+    draft layer would be addressed wrongly. So this manager presents each
+    shared draft layer to the attention op as its own virtual pool rooted at
+    that layer's K page (the same trick DeepseekV4CacheManager and the SWA
+    scratch-reuse path use), see :meth:`_prepare_page_table_tensor`. The draft
+    loop then runs on this manager exactly like every other unified-KV model.
+    Retirement: once V2 can keep a buffer role in its own pool, the K/V pool is
+    uniform again and the virtual pools can go.
     """
+
+    # Attention-op pools appended for shared draft layers, as
+    # (attention_op_pool_id, source_storage_pool_id); empty without them.
+    _draft_op_pools: Tuple[Tuple[int, int], ...] = ()
+    _draft_index_scales: Optional[torch.Tensor] = None
+    _draft_kv_offsets: Optional[torch.Tensor] = None
+    # Page sizes beyond trtllm-gen's global allowlist that this manager's dense
+    # draft layers are known to have exported kernels for (read by
+    # FlashInferTrtllmGenFmha). Set alongside the virtual pools.
+    trtllm_gen_extra_tokens_per_block: frozenset = frozenset()
 
     def __init__(
         self,
@@ -169,6 +294,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # disable_index_value=True, sparse_index_dim=128). Honoring the
         # executor keyword also makes non-default sparse_index_dim values
         # authoritative for the cache layout instead of falling back to 128.
+        # num_layers / num_kv_heads / spec_config / layer_mask /
+        # sparse_attention_config belong to the base __init__: peeked here
+        # (get, not pop) so super() still receives them.
         sparse_attention_config = kwargs.get("sparse_attention_config")
         num_layers = kwargs.get("num_layers")
 
@@ -181,9 +309,16 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             raise ValueError(
                 f"MiniMax M3 sparse_index_dim must be greater than 0, got {sparse_index_dim}."
             )
+        # Shared one-model draft layers sit above the target range and carry
+        # no MSA index cache, so the sparse-layer default stops at the target.
+        self._shared_draft_layer_ids, num_target_layers = derive_shared_draft_layout(
+            num_layers,
+            kwargs.get("num_kv_heads"),
+            shared_draft_layer_count(kwargs.get("spec_config"), kwargs.get("layer_mask")),
+        )
         if sparse_layer_ids is None:
-            if num_layers is not None:
-                sparse_layer_ids = list(range(3, int(num_layers)))
+            if num_target_layers is not None:
+                sparse_layer_ids = list(range(3, num_target_layers))
             else:
                 sparse_layer_ids = []
         if disable_index_value_layer_ids is None:
@@ -228,6 +363,83 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                     dtype=torch_dtype,
                     device=device,
                 )
+
+    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+        """Build the attention-op pool tables, plus one virtual pool per shared draft layer.
+
+        See the class docstring for why the draft layers cannot be addressed
+        through the coalesced pool's uniform mapping. The virtual pool reuses
+        the source pool's host block offsets (raw slot ids); the copy in
+        :meth:`copy_batch_block_offsets` scales them to the draft layer's
+        pages.
+        """
+        super()._prepare_page_table_tensor(index_mapper_capacity)
+        draft_layers = [
+            layer_idx
+            for layer_idx in self._shared_draft_layer_ids
+            if layer_idx in self.layer_offsets
+        ]
+        if self.is_draft or not draft_layers:
+            return
+        if self.enable_swa_scratch_reuse:
+            raise NotImplementedError(
+                "MiniMax-M3 shared Eagle3 draft layers do not support SWA scratch reuse."
+            )
+        geometry = []
+        for layer_idx in draft_layers:
+            key_base_addr, _dtype, _num_slots, sub_pages_per_slot, _shape = self._kv_slot_geometry(
+                layer_idx, "HND"
+            )
+            geometry.append((self.layer_offsets[layer_idx], key_base_addr, sub_pages_per_slot))
+        (
+            self.kv_cache_pool_pointers,
+            self.kv_cache_pool_mapping,
+            self._draft_index_scales,
+            self._draft_kv_offsets,
+            op_pools,
+        ) = extend_attention_op_pools_for_shared_draft_layers(
+            self.kv_cache_pool_pointers, self.kv_cache_pool_mapping, self.num_pools, geometry
+        )
+        self._draft_op_pools = tuple(op_pools)
+        self.num_attention_op_pools = self.num_pools + len(op_pools)
+        # The dense draft layers run at the MSA target's page size. P128 is
+        # exported for their dense-GQA shapes but not for every shape family in
+        # the trtllm-gen artifact, hence a per-manager opt-in rather than an
+        # allowlist change.
+        if self.tokens_per_block == 128:
+            self.trtllm_gen_extra_tokens_per_block = frozenset({128})
+        logger.info(
+            f"[unified-kv] draft layers {draft_layers} share the target KV cache manager "
+            f"(sparse layers {self.sparse_layer_ids[0]}..{self.sparse_layer_ids[-1]}); "
+            f"attention-op pools {[pool for pool, _ in op_pools]} address their pages."
+        )
+
+    def copy_batch_block_offsets(
+        self,
+        dst_tensor: torch.Tensor,
+        request_ids: List[int],
+        beam_width: int,
+        num_contexts: int,
+        num_seqs: int,
+        max_blocks: Optional[int] = None,
+    ) -> None:
+        super().copy_batch_block_offsets(
+            dst_tensor, request_ids, beam_width, num_contexts, num_seqs, max_blocks=max_blocks
+        )
+        if not self._draft_op_pools:
+            return
+        # Same device copy the base ran for the storage pools, over the source
+        # pool's slot ids with the draft layer's scale and K->V offset.
+        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
+        for i, (op_pool_id, source_pool_id) in enumerate(self._draft_op_pools):
+            copy_batch_block_offsets_to_device(
+                self.host_kv_cache_block_offsets[source_pool_id : source_pool_id + 1],
+                dst_tensor[op_pool_id : op_pool_id + 1],
+                copy_idx,
+                self._draft_index_scales[i : i + 1],
+                self._draft_kv_offsets[i : i + 1],
+                self._stream.cuda_stream,
+            )
 
     def _extra_buffers_per_layer(self, *, tokens_per_block):
         """Register a per-sparse-layer ``Role.INDEX_KEY`` :class:`BufferConfig`.
@@ -296,28 +508,23 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     def has_index_value(self, layer_idx: int) -> bool:
         return layer_idx in self._index_v_buffers
 
-    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
-        """Return a paged K+V view with strides spanning the coalesced pool.
+    def _kv_slot_geometry(
+        self, layer_idx: int, kv_layout: str
+    ) -> Tuple[int, torch.dtype, int, int, List[int]]:
+        """Resolve one layer's position in the coalesced K/V pool.
 
-        The base :meth:`KVCacheManagerV2.get_buffers` produces a
-        ``[num_pages, kv_factor, ...]`` view with contiguous strides
-        that assume the slot holds exactly one layer's K+V. In M3's
-        pool the slot packs K+V for *all* layers of the group
-        (``scale >= 2 * num_layers_in_group``), so the base view's
-        dim-0 stride does not reach the next slot's K for this layer.
-        (When INDEX_KEY's per-block size coincides with K/V's, it is
-        coalesced into the same pool and contributes to ``scale`` too.)
-
-        The override builds a ``[num_slots, scale, ...]`` view rooted
-        at K's base, then slices ``[:, :2]`` to extract K+V. The slice
-        preserves the dim-0 stride (``scale * page_stride``), so
-        ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
+        Returns ``(addr_key, torch_dtype, num_slots, scale, page_shape)``,
+        where ``scale`` is the number of equal-sized sub-pages a slot packs
+        and ``page_shape`` is one sub-page's shape in ``kv_layout``. This
+        layer's K is sub-page 0 and its V sub-page 1, counting from
+        ``addr_key``. Shared by :meth:`get_buffers` (M3's own kernels) and the
+        draft layers' virtual attention-op pools.
         """
         if kv_layout not in ("NHD", "HND"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
         if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
             raise NotImplementedError(
-                "MiniMaxM3KVCacheManagerV2.get_buffers does not support SELFKONLY cache type"
+                "MiniMaxM3KVCacheManagerV2 does not support the SELFKONLY cache type"
             )
 
         layer_offset = self.layer_offsets[layer_idx]
@@ -328,13 +535,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # V2 always lays V immediately after K within the per-layer
         # contribution to a slot. The slice ``[:, :2]`` depends on this.
         assert addr_key + page_stride_value == addr_value, (
-            f"MiniMaxM3 get_buffers requires addr_K + page_stride "
+            f"MiniMaxM3 requires addr_K + page_stride "
             f"== addr_V (V immediately after K in slot); got "
             f"addr_K={addr_key} page_stride_V={page_stride_value} "
             f"addr_V={addr_value} for layer {layer_idx}."
         )
         assert page_stride_key == page_stride_value, (
-            f"MiniMaxM3 get_buffers requires equal K and V page "
+            f"MiniMaxM3 requires equal K and V page "
             f"strides; got K={page_stride_key} V="
             f"{page_stride_value}."
         )
@@ -361,24 +568,35 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         layer_head_dim = self.head_dim_per_layer[layer_offset]
         num_kv_heads = self.num_kv_heads_per_layer[layer_offset]
+        containers = layer_head_dim // element_per_container
 
         if kv_layout == "NHD":
-            full_slot_shape = [
-                num_slots,
-                scale,
-                self.tokens_per_block,
-                num_kv_heads,
-                layer_head_dim // element_per_container,
-            ]
+            page_shape = [self.tokens_per_block, num_kv_heads, containers]
         else:
-            full_slot_shape = [
-                num_slots,
-                scale,
-                num_kv_heads,
-                self.tokens_per_block,
-                layer_head_dim // element_per_container,
-            ]
+            page_shape = [num_kv_heads, self.tokens_per_block, containers]
+        return addr_key, torch_dtype, num_slots, scale, page_shape
 
+    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        """Return a paged K+V view with strides spanning the coalesced pool.
+
+        The base :meth:`KVCacheManagerV2.get_buffers` produces a
+        ``[num_pages, kv_factor, ...]`` view with contiguous strides
+        that assume the slot holds exactly one layer's K+V. In M3's
+        pool the slot packs K+V for *all* layers of the group
+        (``scale >= 2 * num_layers_in_group``), so the base view's
+        dim-0 stride does not reach the next slot's K for this layer.
+        (When INDEX_KEY's per-block size coincides with K/V's, it is
+        coalesced into the same pool and contributes to ``scale`` too.)
+
+        The override builds a ``[num_slots, scale, ...]`` view rooted
+        at K's base, then slices ``[:, :2]`` to extract K+V. The slice
+        preserves the dim-0 stride (``scale * page_stride``), so
+        ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
+        """
+        addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
+            layer_idx, kv_layout
+        )
+        full_slot_shape = [num_slots, scale, *page_shape]
         full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
         return full_view[:, :2]
 
@@ -487,5 +705,8 @@ def get_minimax_m3_kv_cache_manager_cls():
 __all__ = [
     "MiniMaxM3KVCacheManagerV2",
     "MiniMaxM3SparseIndexCache",
+    "derive_shared_draft_layout",
+    "extend_attention_op_pools_for_shared_draft_layers",
     "get_minimax_m3_kv_cache_manager_cls",
+    "shared_draft_layer_count",
 ]
