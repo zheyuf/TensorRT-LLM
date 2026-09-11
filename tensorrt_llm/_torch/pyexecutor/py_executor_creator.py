@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import functools
 import gc
 import importlib
 import os
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -43,7 +45,7 @@ from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .dwdp import DwdpManager
+from .dwdp import DwdpManager, get_global_dwdp_manager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
@@ -323,7 +325,7 @@ def log_memory_usage(stage: str):
     )
 
 
-def create_py_executor(
+def _create_py_executor_impl(
     llm_args: TorchLlmArgs,
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
@@ -500,8 +502,21 @@ def create_py_executor(
         # drafters, which it stranded on their private max_seq_len-dense arena.
         is_standalone_drafter = (spec_config.spec_dec_mode.is_dflash()
                                  or spec_config.spec_dec_mode.is_dspark())
-        if cache_transceiver_config is not None and not is_standalone_drafter:
+        # MiniMax-M3 supports one-model Eagle3 only; its drafter shares the
+        # target KV cache.
+        is_m3_eagle3 = (is_minimax_m3(m3_sparse_config)
+                        and spec_config.spec_dec_mode.is_eagle3_one_model())
+        if ((cache_transceiver_config is not None and not is_standalone_drafter)
+                or is_m3_eagle3):
             spec_config._allow_separate_draft_kv_cache = False
+        # The triton reference backend runs multi-token verify through its
+        # prefill builder, which cannot be CUDA-graph captured.
+        if (is_m3_eagle3 and m3_sparse_config.implementation != "msa"
+                and llm_args.cuda_graph_config is not None):
+            raise ValueError(
+                "MiniMax-M3 Eagle3 on the triton reference backend does not "
+                "support CUDA graphs; use implementation='msa' or set "
+                "cuda_graph_config=None.")
 
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
@@ -1065,3 +1080,34 @@ def create_py_executor(
     py_executor.start_worker()
 
     return py_executor
+
+
+@functools.wraps(_create_py_executor_impl)
+def create_py_executor(
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: Optional[str] = None,
+    tokenizer: Optional[TokenizerBase] = None,
+    profiling_stage_data: Optional[dict] = None,
+    resource_governor_queue=None,
+) -> PyExecutor:
+    """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
+    previous_dwdp_manager = get_global_dwdp_manager()
+    try:
+        return _create_py_executor_impl(
+            llm_args=llm_args,
+            checkpoint_dir=checkpoint_dir,
+            tokenizer=tokenizer,
+            profiling_stage_data=profiling_stage_data,
+            resource_governor_queue=resource_governor_queue,
+        )
+    except BaseException:
+        current_dwdp_manager = get_global_dwdp_manager()
+        if (current_dwdp_manager is not None
+                and current_dwdp_manager is not previous_dwdp_manager):
+            try:
+                current_dwdp_manager.__exit__(None, None, None)
+            except BaseException:
+                logger.error(
+                    "Failed to roll back DWDP after PyExecutor construction error\n"
+                    f"{traceback.format_exc()}")
+        raise
