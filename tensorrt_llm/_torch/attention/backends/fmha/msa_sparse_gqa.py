@@ -125,7 +125,11 @@ def run_msa_paged_gqa(
     Shared by the sparse layers (kv_block_indexes is the per-query top-k table,
     with the sparse plan) and the dense layers (kv_block_indexes None, with the
     dense plan, attending the full page table). fmha_sm100 reads the paged cache
-    directly, so the new-token K/V must be resident before the run.
+    directly, so the new-token K/V must be resident before the run: they are
+    written here when the caller passes k and v, and are expected to be
+    resident already when the caller passes None for both (the MiniMax-M3
+    model layer writes them through
+    MiniMaxM3MsaSparseAttention.write_layer_caches ahead of the indexer).
     """
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
         msa_paged_kv,
@@ -136,12 +140,7 @@ def run_msa_paged_gqa(
     head_dim = attn.head_dim
     kv_cache_manager = metadata.kv_cache_manager
     num_tokens = int(q.shape[0])
-    # The fused per-layer scatter (msa_write_layer_caches) may have written
-    # this layer's K/V already; consume the marker so it never goes stale.
-    prewritten = getattr(metadata, "_msa_prewritten_layer", None) == layer_idx
-    if prewritten:
-        metadata._msa_prewritten_layer = None
-    if k is not None and v is not None and not prewritten:
+    if k is not None and v is not None:
         write_msa_main_kv(
             kv_cache_manager, layer_idx, metadata.msa_out_cache_loc[:num_tokens], k, v
         )
