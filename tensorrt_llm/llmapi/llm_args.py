@@ -2039,8 +2039,9 @@ class DecodingBaseConfig(StrictBaseModel):
         default=None,
         description=
         "When specified (>0), speculation is reduced at batch sizes above this value to the shortest "
-        "draft length the algorithm sustains (min_runtime_draft_len: 1 for one-model speculation, whose "
-        "drafter state would go stale otherwise, else 0). Otherwise, speculation will always be on. "
+        "draft length the algorithm sustains (min_runtime_draft_len: 0 for Eagle3 / MTP-Eagle one-model, "
+        "which keep the drafter warm without proposing tokens, and for stateless drafters; 1 for the other "
+        "one-model modes, whose drafter state would go stale). Otherwise, speculation will always be on. "
         "PyTorch backend only. "
         "Mutually exclusive with draft_len_schedule since draft_len_schedule implicitly supports max concurrency control."
     )
@@ -2055,7 +2056,8 @@ class DecodingBaseConfig(StrictBaseModel):
         " - Batch sizes 5-8:   use draft_len=2"
         " - Batch sizes 9-32:  use draft_len=1"
         " - Batch sizes 33+:   use draft_len=0 (implicit). "
-        "Resolved draft lengths are floored at min_runtime_draft_len (1 for one-model speculation). "
+        "Resolved draft lengths are floored at min_runtime_draft_len (1 for one-model modes without "
+        "keep-warm, see keep_drafter_warm). "
         "Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control."
     )
 
@@ -2294,12 +2296,30 @@ class DecodingBaseConfig(StrictBaseModel):
 
         A one-engine drafter's state (draft KV cache, hidden-state pools) is
         only written by the draft forward; at draft length 0 it goes stale while
-        the target keeps committing tokens, so it never drops below 1. Stateless
-        drafters (NGram, user-provided) and a drafter attending over the target's
-        own KV cache need no floor.
+        the target keeps committing tokens, so it never drops below 1 unless the
+        worker keeps the drafter warm (``keep_drafter_warm``). Stateless drafters
+        (NGram, user-provided) and a drafter attending over the target's own KV
+        cache need no floor.
         """
         one_engine = self.spec_dec_mode.use_one_engine()
-        return 1 if one_engine and not self._use_shared_kv_cache else 0
+        if not one_engine or self._use_shared_kv_cache or self.keep_drafter_warm:
+            return 0
+        return 1
+
+    @property
+    def keep_drafter_warm(self) -> bool:
+        """Whether the worker still runs the drafter's first forward at runtime
+        draft length 0, so the draft KV cache keeps tracking the target while no
+        draft tokens are proposed (Eagle3OneModelWorker, linear drafting, no SA
+        enhancer). Such modes honour a 0 tier of ``draft_len_schedule``.
+        """
+        if not self.spec_dec_mode.is_eagle_one_model(
+        ) or self._use_shared_kv_cache:
+            return False
+        if getattr(self, "use_dynamic_tree", False) or getattr(
+                self, "eagle_choices", None) is not None:
+            return False
+        return getattr(self, "sa_config", None) is None
 
     @functools.cached_property
     def is_linear_tree(self) -> bool:

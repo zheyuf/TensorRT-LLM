@@ -469,6 +469,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self.use_dynamic_tree = getattr(spec_config, 'use_dynamic_tree', False)
         self._uses_external_shared_target_kv = (
             spec_config._use_shared_kv_cache)
+        # Keep-warm: at runtime_draft_len == 0 still run the drafter's first
+        # forward so its KV cache tracks the target's committed tokens (see
+        # DecodingBaseConfig.keep_drafter_warm and _forward_impl).
+        self._keep_drafter_warm = bool(
+            getattr(spec_config, "keep_drafter_warm", False))
         self.spec_tree_manager = None
 
         # MTP Eagle: lazily-resolved flag for Mamba hybrid cache support
@@ -548,11 +553,32 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                       resource_manager=None):
 
         runtime_draft_len = spec_metadata.runtime_draft_len
-        # skip the draft forward if the runtime draft length is 0
         if runtime_draft_len == 0:
-            return self.skip_drafting(input_ids, position_ids, hidden_states,
-                                      logits, attn_metadata, spec_metadata,
-                                      draft_model)
+            # Nothing to verify and nothing to propose: the target commits the
+            # one token it samples per request, exactly as with speculation off.
+            outputs = self.skip_drafting(input_ids, position_ids, hidden_states,
+                                         logits, attn_metadata, spec_metadata,
+                                         draft_model)
+            if self._keep_drafter_warm:
+                # Keep-warm. The draft KV cache (and, for DSA targets, the draft
+                # indexer cache) is only written by the draft forward, so a
+                # target-only iteration would leave the positions it commits
+                # uninitialized, and the drafter would attend to them once the
+                # draft length rises again. Run the first draft forward over the
+                # committed tokens - the same pass a drafting iteration starts
+                # with; at runtime_draft_len == 0 the draft loop stops right
+                # after it and proposes nothing (see _forward_linear_draft_loop).
+                self._run_drafter(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    accepted_tokens=outputs['new_tokens'],
+                    num_accepted_tokens=outputs['new_tokens_lens'],
+                    attn_metadata=attn_metadata,
+                    spec_metadata=spec_metadata,
+                    draft_model=draft_model,
+                    resource_manager=resource_manager)
+            return outputs
 
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
@@ -608,39 +634,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     batch_size=batch_size,
                 ))
         else:
-            # Save the old attn_metadata and spec_metadata
-            self._prepare_attn_metadata_for_spec_dec(attn_metadata)
-
-            # Prepare inputs for the 1st draft model forward
-            position_ids = position_ids.squeeze(0)
-            inputs = self.prepare_1st_drafter_inputs(
+            next_draft_tokens = self._run_drafter(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
                 attn_metadata=attn_metadata,
                 spec_metadata=spec_metadata,
-                draft_model=draft_model)
-
-            # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here
-            # so the post-loop restore (below) can put attn_metadata back into a
-            # state the target model expects.
-            original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-
-            # Get the draft KV cache manager if using separate layouts
-            draft_kv_cache_manager = self.get_draft_kv_cache_manager(
-                resource_manager)
-
-            next_draft_tokens = self._forward_draft_loop(
-                inputs, attn_metadata, spec_metadata, draft_model,
-                draft_kv_cache_manager, num_contexts, num_gens, batch_size,
-                num_accepted_tokens, original_all_rank_num_tokens,
-                resource_manager)
-            # restore attn_metadata to support cuda graph
-            self._restore_attn_metadata_from_spec_dec(attn_metadata)
-            # restore all_rank_num_tokens for attention DP
-            if original_all_rank_num_tokens is not None:
-                attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+                draft_model=draft_model,
+                resource_manager=resource_manager)
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = self._prepare_next_new_tokens(
@@ -666,6 +669,54 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             'next_draft_tokens': next_draft_tokens,
             'next_new_tokens': next_new_tokens,
         }
+
+    def _run_drafter(self, *, input_ids, position_ids, hidden_states,
+                     accepted_tokens, num_accepted_tokens, attn_metadata,
+                     spec_metadata, draft_model, resource_manager):
+        """Run this iteration's draft loop and return its draft tokens.
+
+        Shared by the drafting path and the keep-warm path: at
+        ``runtime_draft_len == 0`` the loop performs only the first draft
+        forward, which writes the draft KV cache for the tokens the target just
+        committed, and returns an empty ``[batch_size, 0]`` tensor.
+        """
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+
+        # Save the old attn_metadata and spec_metadata
+        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+
+        # Prepare inputs for the 1st draft model forward
+        position_ids = position_ids.squeeze(0)
+        inputs = self.prepare_1st_drafter_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            accepted_tokens=accepted_tokens,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=draft_model)
+
+        # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here
+        # so the post-loop restore (below) can put attn_metadata back into a
+        # state the target model expects.
+        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+
+        # Get the draft KV cache manager if using separate layouts
+        draft_kv_cache_manager = self.get_draft_kv_cache_manager(
+            resource_manager)
+
+        next_draft_tokens = self._forward_draft_loop(
+            inputs, attn_metadata, spec_metadata, draft_model,
+            draft_kv_cache_manager, num_contexts, num_gens, batch_size,
+            num_accepted_tokens, original_all_rank_num_tokens, resource_manager)
+        # restore attn_metadata to support cuda graph
+        self._restore_attn_metadata_from_spec_dec(attn_metadata)
+        # restore all_rank_num_tokens for attention DP
+        if original_all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+        return next_draft_tokens
 
     def _forward_external_shared_target_kv_draft_loop(
         self,
@@ -806,7 +857,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # refresh once more after rebinding so the first draft forward
                 # writes the separate DSA indexer cache at the same positions.
                 attn_metadata.on_update_kv_lens()
-            for i in range(runtime_draft_len):
+            # runtime_draft_len == 0 is a keep-warm iteration: run the first
+            # draft forward only - it writes the draft KV cache for the tokens
+            # the target just committed - and propose nothing.
+            for i in range(max(runtime_draft_len, 1)):
                 if uses_mtp_index_share:
                     attn_metadata.set_skip_topk(i > 0)
                 # Run draft model (mode-specific via helper). The helper
@@ -815,6 +869,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # uses try/finally); attn_metadata is left untouched here.
                 hidden_states, hidden_states_to_save = self._run_draft_forward(
                     draft_model, inputs, spec_metadata, i)
+                if runtime_draft_len == 0:
+                    break
 
                 # Compute gather_ids: on the first draft step each generation
                 # request may have accepted multiple tokens, so we index into
@@ -1014,11 +1070,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     "attn_metadata": attn_metadata,
                     "spec_metadata": spec_metadata,
                 }
-        next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+        if next_draft_tokens:
+            next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+        else:
+            # Keep-warm iteration: no draft token was proposed.
+            next_draft_tokens = torch.zeros((batch_size, 0),
+                                            dtype=torch.int32,
+                                            device=hidden_states.device)
 
         # Override with SA draft tokens after all draft layers have run,
         # so that draft layers never see SA tokens in their inputs.
-        if self.sa_enhancer is not None:
+        if self.sa_enhancer is not None and runtime_draft_len > 0:
             gen_draft_tokens = next_draft_tokens[num_contexts:]
             gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
                 gen_draft_tokens)

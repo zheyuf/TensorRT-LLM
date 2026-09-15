@@ -1685,11 +1685,13 @@ class SpecWorkerBase(nn.Module, ABC):
         draft_model,
     ):
         """
-        Target-only step for runtime_draft_len == 0, i.e. after the
-        acceptance-rate gate disabled speculation. Scheduled draft lengths are
-        floored at DecodingBaseConfig.min_runtime_draft_len instead of reaching
-        0, because a skipped drafter's KV cache goes stale while the target
-        keeps decoding.
+        Target-only step for runtime_draft_len == 0: after the acceptance-rate
+        gate disabled speculation, or for a draft_len_schedule tier of 0.
+        Skipping the drafter leaves its KV cache stale while the target keeps
+        decoding, so modes without keep-warm floor their scheduled draft
+        lengths at 1 (DecodingBaseConfig.min_runtime_draft_len) and keep-warm
+        modes run the drafter's first forward right after this step
+        (Eagle3OneModelWorker._forward_impl).
         """
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
