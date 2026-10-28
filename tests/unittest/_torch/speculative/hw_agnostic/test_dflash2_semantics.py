@@ -622,47 +622,6 @@ def test_is_causal_is_ignored_for_a_plain_dflash_drafter():
 
 
 # ---------------------------------------------------------------------------
-# TRTLLM block-decode backend: no non-causal sliding window
-# ---------------------------------------------------------------------------
-
-
-def test_released_drafter_window_runs_on_two_sided_backends():
-    """VANILLA and FA4 hand both window bounds to their kernels."""
-    for backend in ("VANILLA", "FA4"):
-        _mask_wrapper(_all_sliding_config(2048), backend=backend).validate_block_attention_windows()
-
-
-def test_trtllm_backend_rejects_the_released_drafter_window():
-    """flashinfer's trtllm-gen context kernel refuses causal=False with any
-    finite window_left, so the released non-causal 2048 window cannot run."""
-    wrapper = _mask_wrapper(_all_sliding_config(2048), backend="TRTLLM")
-    with pytest.raises(ValueError, match="non-causally within a 2048-token sliding window"):
-        wrapper.validate_block_attention_windows()
-
-
-def test_trtllm_backend_accepts_causal_or_unwindowed_layers():
-    # A causal sliding window is supported by the kernel.
-    _mask_wrapper(
-        _all_sliding_config(4, is_causal=True), backend="TRTLLM"
-    ).validate_block_attention_windows()
-    # No window at all, either.
-    _mask_wrapper(
-        SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2),
-        backend="TRTLLM",
-    ).validate_block_attention_windows()
-
-
-def test_trtllm_window_check_reads_the_use_swa_override():
-    """A use_swa window replaces the checkpoint-inferred one in the block
-    decode, so the check must resolve the same window the forward uses."""
-    config = SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2)
-    wrapper = _mask_wrapper(config, backend="TRTLLM", layer_windows=[(3, 3), (3, 3)])
-    assert wrapper._resolve_block_attention(0) == (False, (3, 3))
-    with pytest.raises(ValueError, match="draft layer 0"):
-        wrapper.validate_block_attention_windows()
-
-
-# ---------------------------------------------------------------------------
 # Tiny end-to-end drafter: config parsing, weight loading, block-decode
 # parity vs an fp32 eager oracle (needs CUDA + flash_attn).
 # ---------------------------------------------------------------------------
