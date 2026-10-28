@@ -362,6 +362,7 @@ def test_rejection_preserves_sampling_params_and_caps_acceptance(monkeypatch, ra
     widths = [2, 4] if ragged else [4, 4]
     metadata = _penalty_mapping_meta([4, 2, 9], widths if ragged else None)
     metadata.rng_accept_slot = 2 * worker.max_draft_len + 1
+    metadata.rejection_sample_method = "standard"
     metadata.dummy_slot_row = 9
     rows = 1 + sum(widths)
     metadata.temperatures = torch.arange(rows, dtype=torch.float32) + 0.5
@@ -507,6 +508,7 @@ def test_rejection_retains_request_local_bonus_distribution(
         lens = torch.tensor(local_windows * trials, dtype=torch.int32)
         metadata = _penalty_mapping_meta([5, *slots.tolist()], lens.tolist() if ragged else None)
         metadata.rng_accept_slot = 2 * worker.max_draft_len + 1
+        metadata.rejection_sample_method = "standard"
         metadata.dummy_slot_row = 9
         metadata.runtime_draft_len = width
         metadata.enable_penalty = False

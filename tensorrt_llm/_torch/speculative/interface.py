@@ -49,6 +49,7 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .block_verification import block_verify, counter_uniforms
 
 # Logit given to token 0 of a CUDA-graph padding row (see
 # SpecWorkerBase._zero_padding_rows). Finite in
@@ -733,6 +734,9 @@ class SpecMetadata:
     # Drop the sampler tail's no-op bookkeeping launches, bitwise the same
     # outputs (RuntimeHooks.spec_tail_bookkeep; see tail_bookkeep_draft_len).
     tail_bookkeep: bool = False
+    # Verification rule of the rejection path, "standard" or "block" (deploy-time;
+    # from DecodingBaseConfig.rejection_sample_method).
+    rejection_sample_method: str = "standard"
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Whether the occurrence penalties are enabled (deploy-time; from
@@ -2695,6 +2699,17 @@ class SpecWorkerBase(nn.Module, ABC):
             probs.masked_fill_(is_padding.unsqueeze(-1), 1.0 / probs.shape[-1])
         return probs
 
+    @staticmethod
+    def _temperature_only_params(
+        temperatures: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sampler arguments for ``temperatures`` without filters (device-side fills, graph-safe)."""
+        return (temperatures,
+                torch.full_like(temperatures,
+                                torch.iinfo(torch.int32).max,
+                                dtype=torch.int32),
+                torch.ones_like(temperatures), torch.zeros_like(temperatures))
+
     def advanced_sample_draft(self,
                               logits: torch.Tensor,
                               spec_metadata: "SpecMetadata",
@@ -3052,19 +3067,38 @@ class SpecWorkerBase(nn.Module, ABC):
                 batch_size,
                 slot=spec_metadata.rng_accept_slot)
 
+            use_block = spec_metadata.rejection_sample_method == "block"
             slot_out = None
             if slot_rows is not None:
-                slot_out = _CHAIN_SPEC_SLOT_OVERRIDE(slot_rows[0], slot_rows[1],
-                                                     runtime_draft_len,
-                                                     full_draft_tokens,
-                                                     target_probs, seed, offset)
+                if not use_block:
+                    slot_out = _CHAIN_SPEC_SLOT_OVERRIDE(
+                        slot_rows[0], slot_rows[1], runtime_draft_len,
+                        full_draft_tokens, target_probs, seed, offset)
                 if slot_out is None:
-                    # Declined: the gathered copy, as without the override.
+                    # Declined, or block verification: the gathered copy, as
+                    # without the override.
                     full_draft_probs = slot_rows[0][
                         slot_rows[1], :runtime_draft_len, :vocab_size]
             if slot_out is not None:
                 gen_accepted, gen_num_accepted = slot_out
+            elif use_block and not is_ragged:
+                unit = torch.ones_like(seed, dtype=torch.float32)
+                gen_accepted, gen_num_accepted = block_verify(
+                    full_draft_tokens, full_draft_probs, target_probs,
+                    counter_uniforms(seed, offset, runtime_draft_len),
+                    lambda weights: self._sample_from_logits(
+                        spec_metadata.advanced_sampling_mode,
+                        weights.log(),
+                        *self._temperature_only_params(unit),
+                        seed=seed,
+                        offset=offset))
             else:
+                if use_block:
+                    logger.warning_once(
+                        "rejection_sample_method='block' does not cover ragged "
+                        "(confidence-scheduled) verification; these steps use "
+                        "token-level rejection sampling.",
+                        key="block_verification_ragged_fallback")
                 gen_accepted, gen_num_accepted = rejection_sampling_one_model(
                     draft_probs=full_draft_probs,
                     draft_token_ids=full_draft_tokens,

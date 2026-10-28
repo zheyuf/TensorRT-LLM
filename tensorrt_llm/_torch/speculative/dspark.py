@@ -1251,6 +1251,10 @@ class DSparkWorker(DFlashWorker):
     def _try_fused_draft_head_and_refine(
         self, draft_model, hidden, attn_metadata, inputs, spec_metadata, num_gens, k
     ):
+        if self._samples_block_ancestrally(draft_model, spec_metadata):
+            return draft_model.logits_processor(
+                hidden, draft_model.lm_head, attn_metadata, True
+            ).reshape(num_gens, k, -1)
         # Only the M3.1 SM107 TP2 target's explicit A1 processor opts into this adapter.
         if not type(self).__module__.endswith("minimax_m31_nvfp4__sm_107__tp2.dspark"):
             return None
@@ -1261,6 +1265,70 @@ class DSparkWorker(DFlashWorker):
         return try_head_and_refine(
             self, draft_model, hidden, attn_metadata, inputs, spec_metadata, num_gens, k
         )
+
+    def _samples_block_ancestrally(self, draft_model, spec_metadata) -> bool:
+        """Sampled drafts follow the Markov head through the tokens actually drawn."""
+        return bool(
+            getattr(draft_model, "has_markov_head", False)
+            and spec_metadata.wants_advanced_draft_sampling
+        )
+
+    def _draft_block_tokens(
+        self, draft_model, gen_logits, inputs, spec_metadata, batch_size, num_contexts
+    ):
+        if self._samples_block_ancestrally(draft_model, spec_metadata):
+            return self._sample_block_ancestrally(
+                draft_model, gen_logits, inputs, spec_metadata, num_contexts, batch_size
+            )
+        return super()._draft_block_tokens(
+            draft_model, gen_logits, inputs, spec_metadata, batch_size, num_contexts
+        )
+
+    def _sample_block_ancestrally(
+        self, draft_model, gen_logits, inputs, spec_metadata, num_contexts, batch_size
+    ):
+        """Draw position k from ``softmax((base_k + bias(d_{k-1})) / T)``, ``d_{k-1}`` the token drawn
+        before it (the anchor for k = 0), with the temperature only, and store that distribution as
+        the proposal. Returns the int32 tokens and the stored vocab width."""
+        from ..models.modeling_speculative import dspark_markov_step_bias
+
+        num_gens, num_drafts, _ = gen_logits.shape
+        # The chain indexes the full Markov table; verification reads full-vocab q.
+        gen_logits = self.maybe_gather_sharded_draft_logits(gen_logits, spec_metadata)
+        vocab = gen_logits.shape[-1]
+        # Zero the CUDA-graph padding rows (uninitialized state) so every draw is legal.
+        gen_logits = self._zero_padding_rows(
+            gen_logits.reshape(num_gens * num_drafts, vocab),
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            num_drafts,
+        ).reshape(num_gens, num_drafts, vocab)
+        params = self._temperature_only_params(
+            spec_metadata.request_temperatures[num_contexts:batch_size]
+        )
+        draft_probs = spec_metadata.draft_probs
+        slots = spec_metadata.batch_slot_ids[num_contexts:batch_size]
+        tokens = inputs["first_prev_tokens"]
+        drafts = []
+        for step in range(num_drafts):
+            bias = dspark_markov_step_bias(tokens, draft_model.markov_w1, draft_model.markov_w2)
+            seed, offset = self._rng_state_per_request(
+                spec_metadata, num_contexts, batch_size, slot=spec_metadata.rng_draft_slot(step)
+            )
+            tokens, probs = self._sample_from_logits_with_probs(
+                spec_metadata.advanced_sampling_mode,
+                gen_logits[:, step] + bias.to(gen_logits.dtype),
+                *params,
+                seed=seed,
+                offset=offset,
+            )
+            if draft_probs is not None:
+                draft_probs[slots, step, :vocab] = probs
+            drafts.append(tokens)
+        if draft_probs is not None:
+            spec_metadata.draft_probs_last_dim = vocab
+        return torch.stack(drafts, dim=1).to(torch.int32), vocab
 
     def _refine_block_logits(
         self,
@@ -1295,8 +1363,9 @@ class DSparkWorker(DFlashWorker):
         logits, where prev_0 is the anchor (last accepted) token and prev_{i>0}
         is the greedy token from step i-1's biased logits. Greedy per-position
         argmax of the returned logits therefore reproduces the reference
-        sampled chain; the rejection-sampling path samples from the same
-        biased distributions (proposal conditioned on the greedy chain).
+        chain. Sampled drafts do not come through here: they are drawn by
+        :meth:`_sample_block_ancestrally`, which conditions each position on
+        the token actually drawn before it.
 
         Handles a TP vocab-sharded draft lm_head by slicing markov_w2's rows
         to this rank's contiguous shard and chaining through the TP-aware

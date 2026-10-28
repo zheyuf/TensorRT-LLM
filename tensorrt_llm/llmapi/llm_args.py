@@ -2367,6 +2367,16 @@ class DecodingBaseConfig(StrictBaseModel):
         "(default) to use exact-match verification on non-greedy batches. "
         "The non-dynamic-tree one-model path requires FlashInfer.")
 
+    rejection_sample_method: Literal["standard", "block"] = Field(
+        default="standard",
+        status="prototype",
+        description=
+        "Verification rule of rejection sampling (use_rejection_sampling=True): "
+        "'standard' is token-level rejection sampling; 'block' is block "
+        "verification (Sun et al., 2024, arXiv:2403.10444), which is lossless "
+        "and accepts at least as many tokens. Linear-chain one-model paths "
+        "only; ragged (confidence-scheduled) steps use 'standard'.")
+
     allow_advanced_sampling: bool = Field(
         default=False,
         status="deprecated",
@@ -7240,6 +7250,14 @@ class TorchLlmArgs(BaseLlmArgs):
                 # The enabled paths (Eagle3, vanilla MTP, PARD, DFlash,
                 # DraftTarget one-model) share the SpecMetadata slot-indexed
                 # dispatch.
+
+            if self.speculative_config.rejection_sample_method == "block" and (
+                    not self.speculative_config.use_rejection_sampling
+                    or getattr(self.speculative_config, "use_dynamic_tree",
+                               False)):
+                raise ValueError(
+                    "rejection_sample_method='block' requires "
+                    "use_rejection_sampling=True and no dynamic tree.")
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
