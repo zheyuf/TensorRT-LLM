@@ -1617,7 +1617,8 @@ class TestDraftPoolPageSize:
         [
             # Aggregated serving pairs the pools for the drafter's prefix-cache reuse.
             (False, True, False, True),
-            # A disaggregated worker that ships the drafter's window keeps the pool unpaired.
+            # A disaggregated worker that ships the drafter's window keeps the pool
+            # unpaired, at the static page size.
             (True, True, False, False),
             # Without the window transfer the disaggregated worker pairs as well.
             (True, True, True, True),
@@ -1635,7 +1636,7 @@ class TestDraftPoolPageSize:
 
         monkeypatch.setenv(DISABLE_DISAGG_DRAFT_KV_ENV, "1" if kill_switch else "0")
         # MiniMax-M3.1's standalone DSpark drafter runs no context kernel, so its
-        # pool takes the target's 128-token pages and can pair with it.
+        # pool can take the target's 128-token pages and pair with it.
         drafter = _dflash_draft_model(True, "TRTLLM")
         drafter.runs_trtllm_context_kernel = lambda: False
         creator = _page_size_creator(128, drafter)
@@ -1647,7 +1648,9 @@ class TestDraftPoolPageSize:
         creator._kv_cache_manager_cls = KVCacheManagerV2
         creator._speculative_config = DSparkDecodingConfig(max_draft_len=4)
 
-        assert creator._draft_tokens_per_block() == 128
+        # The 128-token pages serve only the pairing; unpaired, the static 64-token
+        # page rounds a prefix hit's first stored position up by less.
+        assert creator._draft_tokens_per_block() == (128 if expected else 64)
         paired = creator._joint_reuse_supported()
         assert paired is expected
         if is_disagg:

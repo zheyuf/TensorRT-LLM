@@ -2090,12 +2090,17 @@ class KvCacheCreator:
                 and not self._standalone_drafter_reads_draft_pool()):
             # Pairing a pool the drafter never reads would only cap the target.
             return False
-        if self._is_disagg and model_ships_disagg_draft_window(
-                self._model_engine.model):
+        if self._ships_disagg_draft_window():
             # The disagg draft-window transfer ships an unpaired draft pool
             # (select_disagg_draft_kv_cache_manager).
             return False
         return True
+
+    def _ships_disagg_draft_window(self) -> bool:
+        """Whether this disaggregated worker ships the standalone drafter's
+        context window, which needs a draft pool unpaired with block reuse."""
+        return self._is_disagg and model_ships_disagg_draft_window(
+            self._model_engine.model)
 
     def _standalone_drafter_reads_draft_pool(self) -> bool:
         """Mirrors ``DFlashWorker._lazy_init_ctx_buffers``: FA4 and VANILLA
@@ -2127,6 +2132,12 @@ class KvCacheCreator:
         (``DFlashDrafter._init_ctx_block_tables``). Joint block reuse is the
         one pairing that assumes equal page sizes; ``_joint_reuse_supported``
         declines it when they differ.
+
+        The dynamic page sizes (the target's pages beyond the static set) serve
+        only that pairing. A disaggregated worker that ships the drafter window
+        keeps its pool unpaired, where a prefix hit's first stored position is
+        rounded up to a draft page (``DFlashWorker._ctx_base_for_store``), so
+        it keeps the smaller static page and with it more of the tail readable.
         """
         tokens_per_block = self._tokens_per_block
         draft_model = getattr(self._model_engine.model, "draft_model", None)
@@ -2147,15 +2158,24 @@ class KvCacheCreator:
                                       None)
         has_context_attention = (runs_context_kernel is None
                                  or runs_context_kernel())
-        if dflash_trtllm_supports_page_size(
+        if tokens_per_block in supported:
+            return tokens_per_block
+        if not dflash_trtllm_supports_page_size(
                 tokens_per_block, has_context_attention=has_context_attention):
+            reason = (f"the DFlash TRTLLM attention backend supports "
+                      f"{sorted(supported)}, not the target's "
+                      f"{tokens_per_block}")
+        elif self._ships_disagg_draft_window():
+            reason = (f"the target's {tokens_per_block}-token pages would only "
+                      f"pair the pool with block reuse, which the disagg "
+                      f"draft-window transfer leaves unpaired")
+        else:
             return tokens_per_block
         smaller = [size for size in supported if size < tokens_per_block]
         draft_tokens_per_block = max(smaller) if smaller else min(supported)
         logger.info_once(
             f"Separate draft KV cache uses tokens_per_block="
-            f"{draft_tokens_per_block}: the DFlash TRTLLM attention backend "
-            f"supports {sorted(supported)}, not the target's {tokens_per_block}.",
+            f"{draft_tokens_per_block}: {reason}.",
             key="draft_tokens_per_block")
         return draft_tokens_per_block
 
