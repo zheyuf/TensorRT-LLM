@@ -1423,8 +1423,7 @@ class DFlashWorker(SpecWorkerBase):
             ):
                 # Gated on the drafter that actually runs the trtllm-gen ops:
                 # one paging its own block decode the same way is not shaped
-                # like them. No non-causal sliding window there either.
-                draft_model.validate_block_attention_windows()
+                # like them.
                 has_context_attention = any(
                     not draft_model._get_attention_mask_args(layer_idx)[0] for layer_idx in range(L)
                 )
@@ -2479,11 +2478,8 @@ class DFlashWorker(SpecWorkerBase):
                     )
                     vocab_size = gen_logits.shape[-1]
 
-                gen_draft_tokens = self.sample_draft_tokens(
-                    gen_logits,
-                    spec_metadata,
-                    batch_size,
-                    num_contexts=num_contexts,
+                gen_draft_tokens, vocab_size = self._draft_block_tokens(
+                    draft_model, gen_logits, inputs, spec_metadata, batch_size, num_contexts
                 )
 
                 # Opt-in confidence-calibration recording (env-gated). The
@@ -2597,6 +2593,15 @@ class DFlashWorker(SpecWorkerBase):
         intra-block bias.
         """
         return gen_logits
+
+    def _draft_block_tokens(
+        self, draft_model, gen_logits, inputs, spec_metadata, batch_size, num_contexts
+    ):
+        """The block's draft tokens and the vocab width they index."""
+        tokens = self.sample_draft_tokens(
+            gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
+        )
+        return tokens, gen_logits.shape[-1]
 
     def _apply_dflash2_selector(
         self,

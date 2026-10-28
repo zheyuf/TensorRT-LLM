@@ -2772,6 +2772,11 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             self.mask_token_id = int(spec_mask_token_id)
         self._init_dspark_heads(draft_config.pretrained_config)
 
+    def _get_attention_mask_args(self, layer_idx):
+        """DSpark drafters are trained non-causal; a sliding window bounds both sides."""
+        _, (window_left, _) = super()._get_attention_mask_args(layer_idx)
+        return False, (window_left, window_left)
+
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
         """Take the DSpark head weights, then hand the rest to DFlash."""
         weights, _ = self._take_dspark_head_weights(weights)

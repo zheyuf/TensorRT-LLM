@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+import math
 from dataclasses import replace
 from typing import Dict, Optional
 
@@ -28,6 +29,7 @@ from ..speculative.dflash_attention import (
     get_dflash_trtllm_gen_ops,
 )
 from ..speculative.interface import SpeculativeDecodingMode
+from ..utils import maybe_compile
 from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
 
 
@@ -61,6 +63,56 @@ def dspark_layer_window_size(
     ):
         return (-1, -1)
     return (swa_window - 1, swa_window - 1)
+
+
+@maybe_compile
+def dflash_merge_later_block_keys_(
+    out: torch.Tensor,
+    lse_log2: torch.Tensor,
+    query: torch.Tensor,
+    block_key: torch.Tensor,
+    block_value: torch.Tensor,
+    scale: float,
+    window_right: int,
+) -> None:
+    """Add each block query's later keys ``j < k <= j + window_right`` to its causal attention
+    ``out`` [B * blk, Hq, D], in place, given the base-2 log-sum-exp ``lse_log2`` [B * blk, Hq].
+    The softmax over the few block keys is unrolled so the merge compiles to one pointwise kernel."""
+    B, blk, num_heads, head_dim = query.shape
+    num_kv_heads = block_key.shape[2]
+    group = num_heads // num_kv_heads
+    q = query.float().reshape(B, blk, num_kv_heads, group, 1, head_dim)
+    keys = block_key.float().permute(0, 2, 1, 3)[:, None, :, None]  # [B, 1, Hkv, 1, blk, D]
+    logits = (q * keys).sum(-1) * scale  # [B, query j, Hkv, g, key k]
+    offsets = torch.arange(blk, device=query.device)
+    distance = offsets.view(1, -1) - offsets.view(-1, 1)  # [j, k] = k - j
+    later = distance > 0
+    if window_right >= 0:
+        later &= distance <= window_right
+    later_logits = [
+        logits[..., k].masked_fill(~later[:, k].view(1, blk, 1, 1), float("-inf"))
+        for k in range(blk)
+    ]
+    max_logit = later_logits[0]
+    for logit in later_logits[1:]:
+        max_logit = torch.maximum(max_logit, logit)
+    # A query without later keys has only -inf logits; its weight is 0 below.
+    max_logit = torch.where(torch.isfinite(max_logit), max_logit, 0.0)
+    exp_logits = [torch.exp(logit - max_logit) for logit in later_logits]
+    sum_exp = exp_logits[0]
+    for exp_logit in exp_logits[1:]:
+        sum_exp = sum_exp + exp_logit
+    has_later = sum_exp > 0
+    sum_exp = torch.where(has_later, sum_exp, 1.0)
+    lse_causal = lse_log2.float().reshape(B, blk, num_kv_heads, group) * math.log(2.0)
+    # exp(lse_later) / (exp(lse_causal) + exp(lse_later))
+    weight = torch.where(has_later, torch.sigmoid(max_logit + torch.log(sum_exp) - lse_causal), 0.0)
+    merged = out.float().reshape(B, blk, num_kv_heads, group, head_dim) * (1 - weight)[..., None]
+    value = block_value.float()
+    prob_scale = weight / sum_exp
+    for k in range(blk):
+        merged = merged + (prob_scale * exp_logits[k])[..., None] * value[:, k, None, :, None]
+    out.copy_(merged.reshape(B * blk, num_heads, head_dim))
 
 
 def _is_dflash2_architecture(config: PretrainedConfig) -> bool:
@@ -1385,30 +1437,6 @@ class DFlashForCausalLM(nn.Module):
             window_size = swa_window
         return causal, window_size
 
-    def validate_block_attention_windows(self) -> None:
-        """Refuse windows the TRTLLM block-decode kernel cannot apply.
-
-        TRTLLM-Gen only implements sliding windows for causal masks: flashinfer
-        rejects ``causal=False`` with any finite ``window_left`` outright. A
-        non-causal windowed layer must therefore run on VANILLA or FA4, which
-        take a two-sided window.
-        """
-        if self.dflash_attention_backend != "TRTLLM":
-            return
-        num_layers = getattr(self.config, "num_hidden_layers", None)
-        if num_layers is None:
-            num_layers = len(self.model.layers)
-        for layer_idx in range(num_layers):
-            causal, (window_left, _) = self._resolve_block_attention(layer_idx)
-            if causal or window_left < 0:
-                continue
-            raise ValueError(
-                f"DFlash draft layer {layer_idx} attends non-causally within a "
-                f"{window_left + 1}-token sliding window. The TRTLLM DFlash "
-                "attention backend does not support non-causal sliding-window "
-                "attention. Use attention_backend=VANILLA or FA4."
-            )
-
     def _prepare_dflash_trtllm_gen_buffers(
         self,
         dtype: torch.dtype,
@@ -1431,6 +1459,8 @@ class DFlashForCausalLM(nn.Module):
             rotary_embedding_dim=0,
             fp8_context_fmha=False,
         )
+        # Softmax stats flashinfer carves off the front when the decode returns its log-sum-exp.
+        workspace_bytes += 8 * num_heads * max_batch_size * 256 * -(-block_size // 256) + (1 << 20)
         device = torch.device(device)
         is_capturing = torch.cuda.is_current_stream_capturing()
         if self._dflash_trtllm_gen_device != device:
@@ -1873,8 +1903,10 @@ class DFlashForCausalLM(nn.Module):
                 q_flat = Q_bshd.reshape(-1, num_heads_per_rank, head_dim)
                 out_flat = out.reshape(-1, num_heads_per_rank, head_dim)
                 window_left = window_size[0]
-                if causal:
-                    trtllm_gen_ops.batch_decode_with_kv_cache(
+                # trtllm-gen windows only causal attention; a non-causal window adds the later block keys.
+                merge_later_keys = not causal and window_left >= 0 and block_size > 1
+                if causal or window_left >= 0:
+                    decoded = trtllm_gen_ops.batch_decode_with_kv_cache(
                         query=q_flat,
                         kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
                         workspace_buffer=self._dflash_trtllm_gen_workspace,
@@ -1897,8 +1929,19 @@ class DFlashForCausalLM(nn.Module):
                         kv_cache_sf=None,
                         uses_shared_paged_kv_idx=True,
                         bmm1_scale_log2=None,
+                        return_lse=merge_later_keys,
                         multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
                     )
+                    if merge_later_keys:
+                        dflash_merge_later_block_keys_(
+                            out_flat,
+                            decoded[1],
+                            Q_bshd,
+                            k_noise_bshd,
+                            v_noise_bshd,
+                            head_dim**-0.5,
+                            window_size[1],
+                        )
                 else:
                     cum_seq_lens_q = torch.arange(
                         0,
