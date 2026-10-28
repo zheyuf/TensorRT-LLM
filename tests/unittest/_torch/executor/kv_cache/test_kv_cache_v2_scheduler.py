@@ -640,6 +640,7 @@ def make_kv_cache_manager(
     # already-backed-off probe depths against each other.
     mgr.reuse_match_backoff = 0
     mgr.probe_context_reuse.side_effect = lambda req: None
+    mgr.fresh_mirror_claim_limit.side_effect = lambda req: 0
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
     mgr.try_allocate_draft_context.side_effect = lambda req, n: True
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)

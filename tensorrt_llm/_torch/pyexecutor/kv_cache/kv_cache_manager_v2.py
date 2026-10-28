@@ -1388,6 +1388,7 @@ class KVCacheManagerV2(BaseResourceManager):
     _block_offset_images: Optional[dict] = None
     block_offset_patches: int = 0
     block_offset_patch_ns: int = 0
+    _paired_hidden_state_draft_pool: bool = False
 
     def __init__(
         self,
@@ -1422,6 +1423,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_estimating_kv_cache: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         joint_kv_cache_reuse: bool = False,
+        hidden_state_draft_pool: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
         **kwargs,
     ) -> None:
@@ -1560,6 +1562,15 @@ class KVCacheManagerV2(BaseResourceManager):
         self.enable_joint_kv_cache_reuse = joint_kv_cache_reuse
         # A draft manager only publishes to its radix tree when it is paired.
         self._can_publish_block_reuse = joint_kv_cache_reuse or not self.is_draft
+        # DFlash/DSpark draft K/V derives per token from the target's hidden state, so a paired
+        # pool can follow a target claim with no page of its own (fresh_mirror_claim_limit).
+        self._paired_hidden_state_draft_pool = (
+            hidden_state_draft_pool and joint_kv_cache_reuse and self.is_draft
+        )
+        # Request id -> end of a prefix this pool holds no drafter K/V for.
+        self._unwritten_prefix_end: Dict[int, float] = {}
+        # Request id -> depth whose drafter window a fresh mirror publishes (branch_point_claim).
+        self._branch_points: Dict[int, int] = {}
         # Prompt tokens past a position that one-model draft layers read. The lender's refusal
         # check needs this raw value even where a subclass opts out of reuse-match backoff:
         # a block's reuse key covers no token past its end.
@@ -3229,9 +3240,13 @@ class KVCacheManagerV2(BaseResourceManager):
             reuse_match_backoff=self.reuse_match_backoff,
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
+            # Released out-of-window pages cannot publish what a fresh mirror never wrote.
             commit_min_snapshot=(
                 kv_cache_config.enable_block_reuse
-                and self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
+                and (
+                    self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
+                    or self._paired_hidden_state_draft_pool
+                )
             ),
             initial_pool_ratio=kv_cache_config.pool_ratio,
         )
@@ -4113,11 +4128,80 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
-        if not _draft_pool_fixes():
+        if not _draft_pool_fixes() and not self._paired_hidden_state_draft_pool:
             return kv_cache.resize(max(kv_cache.capacity, target))
         # Same committed-history hint as the unpaired path (_prepare_draft_resources).
         history = max(kv_cache.history_length, req.context_current_position)
         return _resize_draft_context(kv_cache, max(kv_cache.capacity, target), history)
+
+    def fresh_mirror_claim_limit(self, req: LlmRequest) -> int:
+        """Deepest target claim this pool can follow with no page of its own.
+
+        The drafter first reads its context from L + 2 - W on (L: prompt length, W: widest window),
+        so a page-aligned claim of at most L + 1 - W leaves all it reads to the prefill.
+        """
+        if not self._paired_hidden_state_draft_pool:
+            return 0
+        windows = self.max_attention_window_vec
+        if any(window is None for window in windows):
+            return 0
+        limit = req.prompt_len + 1 - max(windows)
+        return max(0, limit // self.tokens_per_block * self.tokens_per_block)
+
+    def branch_point_claim(self, req: LlmRequest, target_match: int) -> tuple[int, int]:
+        """``(claim, point)`` for a fresh mirror that recomputes the drafter's window at ``point``.
+
+        ``point`` is the target's match rounded down to a page, ``claim`` the page holding
+        ``point + 1 - W``; ``(0, 0)`` when the prompt runs more than a window past ``point``.
+        """
+        window = max(self.max_attention_window_vec)
+        point = target_match // self.tokens_per_block * self.tokens_per_block
+        if point <= 0 or req.prompt_len - point > window:
+            return 0, 0
+        claim = max(0, point + 1 - window) // self.tokens_per_block * self.tokens_per_block
+        return claim, point
+
+    def mark_branch_point(self, request_id: int, point: int) -> None:
+        """Have the request publish the drafter's window at ``point``."""
+        self._branch_points[request_id] = point
+
+    def _publish_branch_point(self, req: LlmRequest, kv_cache) -> None:
+        """Commit the prompt up to its branch point, publishing the drafter's window there."""
+        point = self._branch_points.get(req.py_request_id)
+        if point is None or req.context_current_position < point:
+            return
+        del self._branch_points[req.py_request_id]
+        if point <= kv_cache.num_committed_tokens or not self._commit_publishes_written_pages_only(
+            req.py_request_id, point
+        ):
+            return
+        self._resize_context_history(req, kv_cache, point)
+        tokens = self._augment_tokens_for_block_reuse(
+            self._reuse_token_source(req),
+            req,
+            start=kv_cache.num_committed_tokens,
+            end=point,
+        )
+        kv_cache.commit(tokens)
+
+    def mark_unwritten_prefix(self, request_id: int, end: float) -> None:
+        """Record that this pool holds no drafter K/V for the request below ``end``."""
+        if not self._paired_hidden_state_draft_pool:
+            return
+        self._unwritten_prefix_end[request_id] = max(
+            end, self._unwritten_prefix_end.get(request_id, 0)
+        )
+
+    def _commit_publishes_written_pages_only(self, request_id: int, commit_end: int) -> bool:
+        """Whether a commit at ``commit_end`` publishes only written pages (stale ones are released)."""
+        unwritten_end = self._unwritten_prefix_end.get(request_id)
+        if unwritten_end is None:
+            return True
+        windows = self.max_attention_window_vec
+        if any(window is None for window in windows):
+            return False
+        first_live = max(0, commit_end + 1 - max(windows))
+        return first_live // self.tokens_per_block * self.tokens_per_block >= unwritten_end
 
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
         """Prepare KV cache for a disagg generation init request.
@@ -5896,6 +5980,13 @@ class KVCacheManagerV2(BaseResourceManager):
             return
 
         commit_end = request.context_current_position
+        if self._paired_hidden_state_draft_pool and not self._commit_publishes_written_pages_only(
+            request.py_request_id, commit_end
+        ):
+            # A later chunk commits once the window has left the unwritten prefix.
+            if request.context_remaining_length == 0:
+                kv_cache.stop_committing()
+            return
         if commit_end > kv_cache.num_committed_tokens:
             tokens = self._augment_tokens_for_block_reuse(
                 self._reuse_token_source(request),
@@ -5963,6 +6054,9 @@ class KVCacheManagerV2(BaseResourceManager):
         # both leak and let a recycled page skip its fill.
         self._fresh_pages_filled.pop(request.py_request_id, None)
         self._disagg_receive_ready.pop(request.py_request_id, None)
+        if self._paired_hidden_state_draft_pool:
+            self._unwritten_prefix_end.pop(request.py_request_id, None)
+            self._branch_points.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             self.impl.clear_stats_excluded(request.py_request_id)
@@ -6649,9 +6743,16 @@ class KVCacheManagerV2(BaseResourceManager):
                 and not req.is_dummy_request
             )
             is_all_reusable = self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
-            should_resize = not should_block_reuse or not is_all_reusable
+            # commit_min_snapshot commits end at the history, so advance it under every policy.
+            should_resize = (
+                not should_block_reuse
+                or not is_all_reusable
+                or self._paired_hidden_state_draft_pool
+            )
             should_commit = is_all_reusable or req.context_remaining_length == 0
 
+            if should_block_reuse and self._paired_hidden_state_draft_pool:
+                self._publish_branch_point(req, kv_cache)
             if should_resize:
                 self._resize_context_history(req, kv_cache, req.context_current_position)
             if should_commit:

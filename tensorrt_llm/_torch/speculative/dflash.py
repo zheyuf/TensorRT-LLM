@@ -1439,10 +1439,9 @@ class DFlashWorker(SpecWorkerBase):
             ):
                 # Gated on the drafter that actually runs the trtllm-gen ops:
                 # one paging its own block decode the same way is not shaped
-                # like them.
-                has_context_attention = any(
-                    not draft_model._get_attention_mask_args(layer_idx)[0] for layer_idx in range(L)
-                )
+                # like them. Without runs_trtllm_context_kernel, assume the context kernel.
+                runs_context_kernel = getattr(draft_model, "runs_trtllm_context_kernel", None)
+                has_context_attention = runs_context_kernel is None or runs_context_kernel()
                 validate_dflash_trtllm_gen_runtime(
                     dtype=dtype,
                     num_heads=nh,
@@ -1597,6 +1596,11 @@ class DFlashWorker(SpecWorkerBase):
         if start == cur or self._ctx_reuse_addressable:
             return None
         return -(-start // self._ctx_page_size)
+
+    def _withhold_unstored_context(self, req_id: int) -> None:
+        """Keep a paired draft pool from publishing a chunk whose drafter K/V was not stored."""
+        if self._ctx_reuse_addressable:
+            self._ctx_kv_manager.mark_unwritten_prefix(req_id, float("inf"))
 
     def _assign_slot(self, req_id: int, reset: bool = False, updates: Optional[dict] = None):
         """Get (or refresh) this request's context slot; None when none is free.
@@ -2216,6 +2220,7 @@ class DFlashWorker(SpecWorkerBase):
             if self._assign_slot(req_id, reset=reset, updates=ctx_len_updates) is None:
                 logger.warning("DFlash: no free slots, skipping context store")
                 self._req_ctx_pos.pop(req_id, None)
+                self._withhold_unstored_context(req_id)
                 offset += slen
                 continue
 
@@ -2240,6 +2245,7 @@ class DFlashWorker(SpecWorkerBase):
                 self._req_ctx_pos.pop(req_id, None)
                 ctx_len_updates[slot] = 0
                 self._free_slots.append(slot)
+                self._withhold_unstored_context(req_id)
                 offset += slen
                 continue
             end = cur + slen

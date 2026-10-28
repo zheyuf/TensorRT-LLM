@@ -2085,15 +2085,31 @@ class KvCacheCreator:
             # DSA) cannot express. A zero span asks for no backoff at all, so
             # every backoff-sized path stays a no-op and the pairing is safe.
             return False
+        if (self._is_standalone_draft_pool()
+                and not self._standalone_drafter_reads_draft_pool()):
+            # Pairing a pool the drafter never reads would only cap the target.
+            return False
         return True
+
+    def _standalone_drafter_reads_draft_pool(self) -> bool:
+        """Mirrors ``DFlashWorker._lazy_init_ctx_buffers``: FA4 and VANILLA
+        keep the drafter's context in private arenas."""
+        draft_model = getattr(self._model_engine.model, "draft_model", None)
+        backend = getattr(draft_model, "dflash_attention_backend", None)
+        if backend is None:
+            return True
+        if backend == "FA4":
+            return False
+        return backend == "TRTLLM" or bool(
+            getattr(draft_model, "_paged_ctx_cache", False))
 
     def _draft_tokens_per_block(self) -> int:
         """Page size of the separate one-model draft KV pool.
 
         The target's, unless the drafter reading the pool cannot address pages
         of that size. A standalone DFlash/DSpark drafter on the TRTLLM backend
-        runs the shared trtllm-gen op set, which accepts only
-        ``FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK``, while the
+        runs the shared trtllm-gen op set, which accepts only the sizes
+        ``dflash_trtllm_supports_page_size`` allows, while the
         target's page size follows the target (MiniMax-M3 MSA and FP4 MLA pin
         128). The drafter validates the page size of the pool it is handed
         (``validate_dflash_trtllm_gen_runtime``) once that pool is carved, so
@@ -2118,8 +2134,15 @@ class KvCacheCreator:
             return tokens_per_block
         from ..attention.backends.fmha.flashinfer_trtllm_gen import \
             FlashInferTrtllmGenFmha
+        from ..speculative.dflash_attention import \
+            dflash_trtllm_supports_page_size
         supported = FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK
-        if tokens_per_block in supported:
+        runs_context_kernel = getattr(draft_model, "runs_trtllm_context_kernel",
+                                      None)
+        has_context_attention = (runs_context_kernel is None
+                                 or runs_context_kernel())
+        if dflash_trtllm_supports_page_size(
+                tokens_per_block, has_context_attention=has_context_attention):
             return tokens_per_block
         smaller = [size for size in supported if size < tokens_per_block]
         draft_tokens_per_block = max(smaller) if smaller else min(supported)
@@ -2481,6 +2504,7 @@ class KvCacheCreator:
             disable_overlap_scheduler=self._disable_overlap_scheduler,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
+            hidden_state_draft_pool=self._is_standalone_draft_pool(),
         )
 
     def _get_target_and_draft_cache_costs(
@@ -2697,6 +2721,24 @@ class KvCacheCreator:
                     total_budget, target_kv_cache_config, draft_kv_cache_config)
             return target_kv_cache_config, draft_kv_cache_config
         target_kv, draft_kv = cache_costs
+
+        if (budget_attr != "max_gpu_total_bytes" and self._joint_kv_cache_reuse
+                and draft_kv.slope == 0 and draft_kv.intercept > 0
+                and draft_kv_cache_config is not None):
+            # Per-token shares would give a window-funded pool no offload tier.
+            # Its GPU funding is the same on every rank, so the tiers agree.
+            draft_budget = min(draft_kv.intercept, total_budget // 2)
+            target_budget = total_budget - draft_budget
+            logger.info(
+                f"Splitting KV cache {budget_attr} for the paired draft pool: "
+                f"total={total_budget / GB:.2f} GiB, "
+                f"target={target_budget / GB:.2f} GiB, "
+                f"draft={draft_budget / GB:.2f} GiB (its GPU funding)")
+            split_target_kv_cache_config = target_kv_cache_config.model_copy()
+            setattr(split_target_kv_cache_config, budget_attr, target_budget)
+            split_draft_kv_cache_config = draft_kv_cache_config.model_copy()
+            setattr(split_draft_kv_cache_config, budget_attr, draft_budget)
+            return split_target_kv_cache_config, split_draft_kv_cache_config
 
         # The fixed (intercept) cost models GPU-resident state such as mamba SSM
         # state; it does not consume host offload memory. When splitting a
@@ -3303,6 +3345,7 @@ def _create_kv_cache_manager(
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False,
+        hidden_state_draft_pool: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
@@ -3476,6 +3519,8 @@ def _create_kv_cache_manager(
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        if hidden_state_draft_pool:
+            manager_extra_kwargs["hidden_state_draft_pool"] = True
         manager_extra_kwargs[
             "disable_overlap_scheduler"] = disable_overlap_scheduler
         # Vocab size also enables multimodal event decoding and its per-block

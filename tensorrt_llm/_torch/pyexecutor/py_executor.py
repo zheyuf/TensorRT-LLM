@@ -161,6 +161,22 @@ class _ADPForwardIntent(IntEnum):
     CONTEXT = 2
 
 
+def _paired_draft_kv_cache_manager(executor):
+    """The paired draft pool, which the V2 scheduler admits together with the
+    target, so an attention-DP pad dummy needs a cache there too; else None."""
+    if getattr(executor, "enable_joint_kv_cache_reuse", False):
+        return executor.draft_kv_cache_manager
+    return None
+
+
+def _free_pad_dummy_kv(executor, dummy_request: LlmRequest) -> None:
+    """Free a pad dummy's KV caches in the target and a paired draft pool."""
+    executor.kv_cache_manager.free_resources(dummy_request)
+    draft_kv_cache_manager = _paired_draft_kv_cache_manager(executor)
+    if draft_kv_cache_manager is not None:
+        draft_kv_cache_manager.free_resources(dummy_request)
+
+
 def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
     return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
 
@@ -4104,7 +4120,7 @@ class PyExecutor:
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
         if spec_resource_manager is not None:
             spec_resource_manager.free_resources(dummy_request)
-        self.kv_cache_manager.free_resources(dummy_request)
+        _free_pad_dummy_kv(self, dummy_request)
         self.active_requests.remove(dummy_request)
 
     def _revert_ctx_alloc(self, dropped_context_requests):
@@ -7902,6 +7918,7 @@ class PyExecutor:
 
         if (not self._enable_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
+            draft_kv_cache_manager = _paired_draft_kv_cache_manager(self)
             try:
                 dummy_requests = self.kv_cache_manager.add_dummy_requests(
                     request_ids=dummy_request_ids,
@@ -7909,6 +7926,7 @@ class PyExecutor:
                     is_gen=self._adp_dummy_is_gen,
                     prepare_resource=True,
                     max_num_draft_tokens=self.max_total_draft_tokens,
+                    draft_kv_cache_manager=draft_kv_cache_manager,
                 )
             except OutOfPagesError:
                 dummy_requests = None
@@ -7938,6 +7956,7 @@ class PyExecutor:
         if has_live_adp_dummy:
             return
 
+        draft_kv_cache_manager = _paired_draft_kv_cache_manager(self)
         try:
             dummy_requests = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
@@ -7945,6 +7964,7 @@ class PyExecutor:
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )
         except OutOfPagesError:
             dummy_requests = None
@@ -7960,7 +7980,7 @@ class PyExecutor:
             try:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
-                self.kv_cache_manager.free_resources(dummy_request)
+                _free_pad_dummy_kv(self, dummy_request)
                 return
 
         assert dummy_request is not None
@@ -8024,6 +8044,7 @@ class PyExecutor:
             return
 
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+        draft_kv_cache_manager = _paired_draft_kv_cache_manager(self)
         try:
             # Degrade to an empty batch rather than propagate: the ranks have
             # yet to agree on can_queue, so a rank-local raise would strand the
@@ -8034,6 +8055,7 @@ class PyExecutor:
                 is_gen=True,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
@@ -8051,7 +8073,7 @@ class PyExecutor:
             try:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
-                self.kv_cache_manager.free_resources(dummy_request)
+                _free_pad_dummy_kv(self, dummy_request)
                 return
 
         dummy_request.is_attention_dp_dummy = True
