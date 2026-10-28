@@ -1494,6 +1494,7 @@ def _page_size_creator(tokens_per_block: int, draft_model) -> KvCacheCreator:
     creator._tokens_per_block = tokens_per_block
     creator._model_engine = Mock(_max_cuda_graph_batch_size=4)
     creator._model_engine.model = SimpleNamespace(draft_model=draft_model)
+    creator._is_disagg = False
     return creator
 
 
@@ -1610,6 +1611,50 @@ class TestDraftPoolPageSize:
         # Standalone DSpark: lookahead 0, so only the page sizes decide.
         creator._speculative_config = DSparkDecodingConfig(max_draft_len=4)
         assert creator._joint_reuse_supported() is expected
+
+    @pytest.mark.parametrize(
+        "is_disagg, opts_in, kill_switch, expected",
+        [
+            # Aggregated serving pairs the pools for the drafter's prefix-cache reuse.
+            (False, True, False, True),
+            # A disaggregated worker that ships the drafter's window keeps the pool unpaired.
+            (True, True, False, False),
+            # Without the window transfer the disaggregated worker pairs as well.
+            (True, True, True, True),
+            (True, False, False, True),
+        ],
+    )
+    def test_disagg_draft_window_keeps_the_pool_unpaired(
+        self, monkeypatch, is_disagg, opts_in, kill_switch, expected
+    ):
+        from tensorrt_llm._torch.disaggregation.draft_kv import (
+            DISABLE_DISAGG_DRAFT_KV_ENV,
+            select_disagg_draft_kv_cache_manager,
+        )
+        from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
+
+        monkeypatch.setenv(DISABLE_DISAGG_DRAFT_KV_ENV, "1" if kill_switch else "0")
+        # MiniMax-M3.1's standalone DSpark drafter runs no context kernel, so its
+        # pool takes the target's 128-token pages and can pair with it.
+        drafter = _dflash_draft_model(True, "TRTLLM")
+        drafter.runs_trtllm_context_kernel = lambda: False
+        creator = _page_size_creator(128, drafter)
+        model = creator._model_engine.model
+        model.runtime_hooks = RuntimeHooks(disagg_draft_kv=opts_in)
+        model.spec_worker = SimpleNamespace(engage_disagg_draft_kv=lambda: None)
+        creator._is_disagg = is_disagg
+        creator._is_kv_cache_manager_v2 = True
+        creator._kv_cache_manager_cls = KVCacheManagerV2
+        creator._speculative_config = DSparkDecodingConfig(max_draft_len=4)
+
+        assert creator._draft_tokens_per_block() == 128
+        paired = creator._joint_reuse_supported()
+        assert paired is expected
+        if is_disagg:
+            # The transceiver's selector accepts the pool the creator carves.
+            select_disagg_draft_kv_cache_manager(
+                model, SimpleNamespace(enable_joint_kv_cache_reuse=paired)
+            )
 
 
 class _StandaloneDrafterConfig:

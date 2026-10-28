@@ -62,32 +62,40 @@ def send_before_draft_ctx_event(environ: Optional[Mapping[str, str]] = None) -> 
     return parse_strict_bool_env(TEST_SEND_BEFORE_EVENT_ENV, environ)
 
 
-def select_disagg_draft_kv_cache_manager(model: object, draft_kv_cache_manager: Optional[object]):
-    """The draft KV cache manager the transceiver should ship, or None for the target-only path.
+def model_ships_disagg_draft_window(model: object) -> bool:
+    """Whether a disaggregated worker of ``model`` ships the drafter's context window.
 
-    ``model`` is the engine's model, whose ``runtime_hooks`` carry the opt-in. A model that opts in
-    must run a drafter whose context lives in the managed pool, unpaired with the target's block
-    reuse; anything else is refused here rather than mid-transfer.
+    ``model`` is the engine's model, whose ``runtime_hooks`` carry the opt-in. The transfer needs a
+    draft pool unpaired with the target's block reuse, so the KV cache creator declines the pairing
+    for such a worker before the pools are carved.
     """
-    if draft_kv_cache_manager is None:
-        return None
     # Imported lazily: the hook module is light, but this module stays importable on its own.
     from tensorrt_llm._torch.pyexecutor.runtime_hooks import runtime_hooks_of
 
     if not runtime_hooks_of(model).disagg_draft_kv:
-        return None
+        return False
     if disagg_draft_kv_disabled():
-        return None
+        return False
+    # A separate draft pool behind a worker without a paged drafter context (e.g. a one-model
+    # Eagle3 layer) has no context window to ship.
     worker = getattr(model, "spec_worker", None)
-    if worker is None or not hasattr(worker, "engage_disagg_draft_kv"):
-        # A separate draft pool behind a worker without a paged drafter context (e.g. a one-model
-        # Eagle3 layer): there is no context window to ship.
+    return worker is not None and hasattr(worker, "engage_disagg_draft_kv")
+
+
+def select_disagg_draft_kv_cache_manager(model: object, draft_kv_cache_manager: Optional[object]):
+    """The draft KV cache manager the transceiver should ship, or None for the target-only path.
+
+    A model that opts in must run a drafter whose context lives in the managed pool, unpaired with
+    the target's block reuse; anything else is refused here rather than mid-transfer.
+    """
+    if draft_kv_cache_manager is None or not model_ships_disagg_draft_window(model):
         return None
     if getattr(draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False):
         raise ValueError(
             "the disagg draft-window transfer requires an unpaired draft KV pool "
-            "(enable_joint_kv_cache_reuse=False, i.e. TRTLLM_DRAFT_KEEP_JOINT_REUSE unset); "
-            f"set {DISABLE_DISAGG_DRAFT_KV_ENV}=1 to serve without it"
+            "(enable_joint_kv_cache_reuse=False), which the KV cache creator keeps for a "
+            f"disaggregated worker that ships the window; set {DISABLE_DISAGG_DRAFT_KV_ENV}=1 "
+            "to serve without it"
         )
     return draft_kv_cache_manager
 

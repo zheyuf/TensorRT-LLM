@@ -44,7 +44,8 @@ from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention.backends import get_sparse_attn_kv_cache_manager
-from ..disaggregation.draft_kv import select_disagg_draft_kv_cache_manager
+from ..disaggregation.draft_kv import (model_ships_disagg_draft_window,
+                                      select_disagg_draft_kv_cache_manager)
 from ..disaggregation.kv_cache_transceiver import (
     AttentionTypeCpp, create_kv_cache_transceiver,
     maybe_enable_fabric_memory_for_python_transceiver)
@@ -2088,6 +2089,11 @@ class KvCacheCreator:
         if (self._is_standalone_draft_pool()
                 and not self._standalone_drafter_reads_draft_pool()):
             # Pairing a pool the drafter never reads would only cap the target.
+            return False
+        if self._is_disagg and model_ships_disagg_draft_window(
+                self._model_engine.model):
+            # The disagg draft-window transfer ships an unpaired draft pool
+            # (select_disagg_draft_kv_cache_manager).
             return False
         return True
 
