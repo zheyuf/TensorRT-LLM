@@ -210,6 +210,8 @@ def test_dflash_write_ctx_len_zero_length_reset_wins_over_a_pending_base() -> No
     worker._ctx_base_host = [0, 8, 1]
     worker._ctx_len = torch.tensor(worker._ctx_len_host)
     worker._ctx_base_pages = torch.tensor(worker._ctx_base_host)
+    worker._ctx_stored_host = [False, True, True]
+    worker._ctx_stored = torch.tensor(worker._ctx_stored_host)
 
     # Slot 1: base recorded, then reset by the overflow check. Slot 2: a
     # continuing chunk with a new base.

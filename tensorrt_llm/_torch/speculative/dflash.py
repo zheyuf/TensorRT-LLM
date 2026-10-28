@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import os
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
@@ -737,6 +737,7 @@ class DFlashSpecMetadata(SpecMetadata):
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
+                    worker._park_ctx(rid, slot)
                     evicted[slot] = 0
                     worker._req_ctx_pos.pop(rid, None)
                     worker._free_slots.append(slot)
@@ -766,14 +767,16 @@ class DFlashSpecMetadata(SpecMetadata):
                             f"DFlash: no free drafter slot for generation request {rid}; "
                             "it shares the dummy slot and will draft poorly."
                         )
-                    elif seeds:
-                        seed = seeds.pop(rid, None)
+                    else:
+                        seed = seeds.pop(rid, None) if seeds else None
                         if seed is not None:
                             ctx_len, ctx_base, prompt_len = seed
                             seeded_lens[slot] = ctx_len
                             seeded_bases[slot] = ctx_base
                             seeded_rids.append(rid)
                             worker._req_ctx_pos[rid] = prompt_len
+                        else:
+                            worker._resume_parked_ctx(rid, slot)
             if seeded_lens and getattr(worker, "_disagg_draft_kv_engaged", False):
                 # A received window lives in the draft pool: the drafter must be pool-bound.
                 worker._check_disagg_draft_ctx_pool_bound()
@@ -918,10 +921,18 @@ class DFlashWorker(SpecWorkerBase):
         # Host shadows of _ctx_len and of each request's prompt progress.
         self._ctx_len_host = None
         self._req_ctx_pos = {}
+        # Per slot: whether this worker stored its request's context, and its host shadow.
+        self._ctx_stored = None
+        self._ctx_stored_host = None
+        # Request id -> read base of a manager-bound slot freed while its request was away.
+        self._parked_ctx_base = OrderedDict()
+        self._parked_ctx_capacity = 0
         # Snapshot for rolling back in-place _ctx_len updates when a forward
         # fails (or after warmup). See _ensure_spec_dec_state_restored.
         self._saved_ctx_len = None
         self._saved_ctx_len_host = None
+        self._saved_ctx_stored = None
+        self._saved_ctx_stored_host = None
         self._saved_req_ctx_pos = None
         self._ctx_len_restore_pending = False
         # Deferred kv_lens_cuda rewind state (see _prepare_kv_for_draft_forward,
@@ -1359,6 +1370,11 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_len_host = [0] * num_slots
         self._ctx_base_pages = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_base_host = [0] * num_slots
+        self._ctx_stored = torch.zeros(num_slots, dtype=torch.bool, device="cuda")
+        self._ctx_stored_host = [False] * num_slots
+        self._parked_ctx_base = OrderedDict()
+        # Finished requests are parked too and never resume; keep a margin past the live ones.
+        self._parked_ctx_capacity = 4 * num_slots
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
         self._batch_to_slot_uploaded = None
 
@@ -2037,34 +2053,61 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_len[self._dummy_slot].zero_()
 
     def _write_ctx_len(
-        self, updates: dict[int, int], base_updates: Optional[dict[int, int]] = None
+        self,
+        updates: dict[int, int],
+        base_updates: Optional[dict[int, int]] = None,
+        stored_updates: Optional[dict[int, bool]] = None,
     ) -> None:
         """Apply slot-to-length (and slot-to-base-page) mappings in one async
         scatter each. A slot reset to length 0 also drops its base pages, and
         that reset wins over a base recorded for the same slot in
         ``base_updates`` (a chunk's base is recorded before the overflow check
-        that may reset the slot)."""
-        if not updates and not base_updates:
+        that may reset the slot). ``_ctx_stored`` follows the length unless
+        ``stored_updates`` sets it."""
+        if not updates and not base_updates and not stored_updates:
             return
         bases = dict(base_updates or {})
         bases.update({slot: 0 for slot, value in updates.items() if value == 0})
+        stored = {slot: value > 0 for slot, value in updates.items()}
+        stored.update(stored_updates or {})
         for slot, value in updates.items():  # Update host side mirror
             self._ctx_len_host[slot] = value
         for slot, value in bases.items():
             self._ctx_base_host[slot] = value
+        for slot, value in stored.items():
+            self._ctx_stored_host[slot] = value
 
         pinned = prefer_pinned()
-        for target, mapping in ((self._ctx_len, updates), (self._ctx_base_pages, bases)):
+        for target, mapping, dtype in (
+            (self._ctx_len, updates, torch.long),
+            (self._ctx_base_pages, bases, torch.long),
+            (self._ctx_stored, stored, torch.bool),
+        ):
             if not mapping:
                 continue
             slots, values = zip(*mapping.items())
             slots_pinned = torch.tensor(slots, dtype=torch.long, pin_memory=pinned)
-            vals_pinned = torch.tensor(values, dtype=torch.long, pin_memory=pinned)
+            vals_pinned = torch.tensor(values, dtype=dtype, pin_memory=pinned)
             target.index_copy_(
                 0,
                 slots_pinned.to(target.device, non_blocking=True),
                 vals_pinned.to(target.device, non_blocking=True),
             )
+
+    def _park_ctx(self, req_id: int, slot: int) -> None:
+        """Keep the read base of a slot whose request left the batch; the manager keeps its pages."""
+        if self._ctx_block_tables is None or not self._ctx_stored_host[slot]:
+            return
+        self._parked_ctx_base[req_id] = self._ctx_base_host[slot]
+        self._parked_ctx_base.move_to_end(req_id)
+        while len(self._parked_ctx_base) > self._parked_ctx_capacity:
+            self._parked_ctx_base.popitem(last=False)
+
+    def _resume_parked_ctx(self, req_id: int, slot: int) -> None:
+        """Point a returning request's new slot at its parked context."""
+        base = self._parked_ctx_base.pop(req_id, None)
+        if base is not None:
+            self._write_ctx_len({}, {slot: base}, {slot: True})
 
     def _restore_ctx_len_host(self) -> None:
         """Roll the host shadows back to their pre-forward snapshot."""
@@ -2072,14 +2115,18 @@ class DFlashWorker(SpecWorkerBase):
             self._ctx_len_host = list(self._saved_ctx_len_host)
         if self._saved_ctx_base_host is not None:
             self._ctx_base_host = list(self._saved_ctx_base_host)
+        if self._saved_ctx_stored_host is not None:
+            self._ctx_stored_host = list(self._saved_ctx_stored_host)
         if self._saved_req_ctx_pos is not None:
             self._req_ctx_pos = dict(self._saved_req_ctx_pos)
 
     def _restore_ctx_len_device(self) -> None:
-        """Roll _ctx_len and _ctx_base_pages back to their pre-forward snapshot."""
+        """Roll _ctx_len, _ctx_base_pages and _ctx_stored back to their pre-forward snapshot."""
         self._ctx_len.copy_(self._saved_ctx_len)
         if self._saved_ctx_base is not None:
             self._ctx_base_pages.copy_(self._saved_ctx_base)
+        if self._saved_ctx_stored is not None:
+            self._ctx_stored.copy_(self._saved_ctx_stored)
 
     def _ctx_alloc_tokens(self, attn_metadata, num_contexts: int) -> List[int]:
         """Tokens addressable through each context row of the block table.
@@ -2164,6 +2211,8 @@ class DFlashWorker(SpecWorkerBase):
             # request id reused after completion, a prefill restarted after
             # preemption -- has to start from a clean slot.
             reset = self._req_ctx_pos.get(req_id) != first_pos
+            # A context chunk (re)stores the context, so nothing parked for this id still applies.
+            self._parked_ctx_base.pop(req_id, None)
             if self._assign_slot(req_id, reset=reset, updates=ctx_len_updates) is None:
                 logger.warning("DFlash: no free slots, skipping context store")
                 self._req_ctx_pos.pop(req_id, None)
@@ -2314,6 +2363,8 @@ class DFlashWorker(SpecWorkerBase):
             self._saved_ctx_len_host = list(self._ctx_len_host)
             self._saved_ctx_base = self._ctx_base_pages.clone()
             self._saved_ctx_base_host = list(self._ctx_base_host)
+            self._saved_ctx_stored = self._ctx_stored.clone()
+            self._saved_ctx_stored_host = list(self._ctx_stored_host)
             self._saved_req_ctx_pos = dict(self._req_ctx_pos)
             self._ctx_len_restore_pending = True
 
@@ -2794,6 +2845,17 @@ class DFlashWorker(SpecWorkerBase):
 
             K_plus_1 = K + 1
 
+            if self._ctx_block_tables is not None:
+                # Stored context sits at target positions, which also resumes a parked one.
+                first_input = (
+                    attn_metadata.num_ctx_tokens
+                    + total_tokens_per_req * self._static_arange(0, num_gens)
+                )
+                self._ctx_len[slots] = torch.where(
+                    self._ctx_stored[slots],
+                    position_ids[first_input].long().clamp(max=self._max_ctx),
+                    self._ctx_len[slots],
+                )
             # A target's one-launch step inputs: the same bonus, positions and noise block as the stock lines below.
             fused_inputs = (
                 self._fused_drafter_inputs(

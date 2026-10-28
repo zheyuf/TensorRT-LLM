@@ -49,10 +49,16 @@ def _worker(lengths):
         _ctx_len_host=list(lengths),
         _ctx_base_pages=torch.zeros(len(lengths), dtype=torch.long, device="cuda"),
         _ctx_base_host=[0] * len(lengths),
+        _ctx_stored=torch.tensor([n > 0 for n in lengths], device="cuda"),
+        _ctx_stored_host=[n > 0 for n in lengths],
+        _ctx_block_tables=None,
+        _parked_ctx_base={},
         _batch_to_slot=torch.zeros(8, dtype=torch.long, device="cuda"),
     )
     w._write_ctx_len = partial(DFlashWorker._write_ctx_len, w)
     w._advance_ctx_len = partial(DFlashWorker._advance_ctx_len, w)
+    w._park_ctx = partial(DFlashWorker._park_ctx, w)
+    w._resume_parked_ctx = partial(DFlashWorker._resume_parked_ctx, w)
     w._assign_slot = lambda rid, *a, **k: None
     return w
 
