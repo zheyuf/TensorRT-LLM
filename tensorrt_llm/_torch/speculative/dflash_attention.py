@@ -168,6 +168,8 @@ def dflash_trtllm_supports_page_size(tokens_per_block: int, *, has_context_atten
         not has_context_attention
         and is_power_of_two
         and tokens_per_block >= _TRTLLM_GEN_DYNAMIC_PAGE_MIN_TOKENS
+        # The dynamic page-size kernels are verified on SM100 and SM103 only.
+        and get_sm_version() in (100, 103)
     )
 
 
@@ -206,7 +208,8 @@ def validate_dflash_trtllm_gen_runtime(
         raise RuntimeError(
             "DFlash TRTLLM attention does not support context-cache page size "
             f"{tokens_per_block}; supported sizes are {supported}, plus powers of two "
-            f">= {_TRTLLM_GEN_DYNAMIC_PAGE_MIN_TOKENS} without the non-causal context kernel."
+            f">= {_TRTLLM_GEN_DYNAMIC_PAGE_MIN_TOKENS} on SM100/SM103 without the non-causal "
+            "context kernel."
         )
     if has_context_attention and head_dim in FlashInferTrtllmGenFmha.UNSUPPORTED_HEAD_SIZES_CONTEXT:
         raise RuntimeError(

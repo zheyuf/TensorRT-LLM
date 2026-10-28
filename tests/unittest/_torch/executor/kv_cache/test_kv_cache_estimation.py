@@ -1514,17 +1514,29 @@ class TestDraftPoolPageSize:
         assert max(size for size in supported if size < 128) == 64
 
     @pytest.mark.parametrize(
-        "tokens_per_block, has_context_attention, expected",
-        [(64, True, True), (128, False, True), (128, True, False), (96, False, False)],
+        "tokens_per_block, has_context_attention, sm_version, expected",
+        [
+            (64, True, 103, True),
+            (128, False, 103, True),
+            (128, False, 107, False),
+            (128, True, 103, False),
+            (96, False, 103, False),
+        ],
     )
-    def test_trtllm_page_size_capability(self, tokens_per_block, has_context_attention, expected):
+    def test_trtllm_page_size_capability(
+        self, tokens_per_block, has_context_attention, sm_version, expected
+    ):
         from tensorrt_llm._torch.speculative.dflash_attention import (
             dflash_trtllm_supports_page_size,
         )
 
-        supported = dflash_trtllm_supports_page_size(
-            tokens_per_block, has_context_attention=has_context_attention
-        )
+        with patch(
+            "tensorrt_llm._torch.speculative.dflash_attention.get_sm_version",
+            return_value=sm_version,
+        ):
+            supported = dflash_trtllm_supports_page_size(
+                tokens_per_block, has_context_attention=has_context_attention
+            )
         assert supported is expected
 
     @pytest.mark.parametrize(
