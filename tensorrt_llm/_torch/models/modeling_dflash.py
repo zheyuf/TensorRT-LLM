@@ -1437,6 +1437,17 @@ class DFlashForCausalLM(nn.Module):
             window_size = swa_window
         return causal, window_size
 
+    def runs_trtllm_context_kernel(self) -> bool:
+        """Whether a draft layer runs TRTLLM's context kernel, i.e. is non-causal and unwindowed."""
+        num_layers = getattr(self.config, "num_hidden_layers", None)
+        if num_layers is None:
+            num_layers = len(self.model.layers)
+        for layer_idx in range(num_layers):
+            causal, window_size = self._resolve_block_attention(layer_idx)
+            if not causal and window_size[0] < 0:
+                return True
+        return False
+
     def _prepare_dflash_trtllm_gen_buffers(
         self,
         dtype: torch.dtype,

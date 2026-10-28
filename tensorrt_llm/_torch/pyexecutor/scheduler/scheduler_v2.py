@@ -1091,24 +1091,43 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
 
-    def _reuse_claim_limit(self, req: LlmRequest) -> int | None:
+    def _plan_paired_claim(self, req: LlmRequest) -> tuple[int | None, bool, int | None]:
         """Pair the two pools on one depth before either claims.
 
         Each probe matches through the D-token lookahead and applies its backoff
         in the same tree walk. Their minimum is therefore the common usable depth:
         ``min(max(m_t-D, 0), max(m_d-D, 0)) == max(min(m_t, m_d)-D, 0)``.
+        A deeper target match is claimed as a fresh mirror when the draft pool needs no
+        page of its own for it, from one window before its branch point if the pool offers.
 
         Doing this up front rather than claim-then-reconcile keeps the mismatch
         path (free the draft pages and re-claim shallower) off the common case.
+
+        Returns ``(claim_limit, fresh_mirror, branch_point)``.
         """
         draft_manager = self._joint_draft_manager
-        if draft_manager is None:
-            return None
         draft_match = draft_manager.probe_context_reuse(req)
         target_match = self.kv_cache_manager.probe_context_reuse(req)
         if draft_match is None or target_match is None:
-            return None
-        return min(draft_match, target_match)
+            return None, False, None
+        paired = min(draft_match, target_match)
+        fresh = min(target_match, draft_manager.fresh_mirror_claim_limit(req))
+        if fresh <= paired:
+            return paired, False, None
+        branch_claim, branch_point = draft_manager.branch_point_claim(req, target_match)
+        if branch_point and branch_claim > paired:
+            return branch_claim, True, branch_point
+        return fresh, True, None
+
+    def _start_fresh_mirror(self, req: LlmRequest, unwritten_end: int) -> bool:
+        """Create the draft cache of ``req`` with nothing reused, below a target claim."""
+        draft_manager = self._joint_draft_manager
+        if draft_manager.prepare_context_cache(req, 0) is None:
+            self._free_kv_caches(req)
+            return False
+        if unwritten_end > 0:
+            draft_manager.mark_unwritten_prefix(req.py_request_id, unwritten_end)
+        return True
 
     def _admit_unpaired_draft(self, req: LlmRequest) -> bool:
         """Create and resume an unpaired draft mirror as part of admitting *req*.
@@ -1159,40 +1178,60 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._suspend_request(req)
             return False
 
-        # Both pools claim the depth paired above, so they normally agree first
-        # time; the target claim still caps to the draft's in case an eviction
-        # landed between the probe and the claim.
-        draft_reuse = draft_manager.prepare_context_cache(req, self._reuse_claim_limit(req))
-        if draft_reuse is None:
-            self._free_kv_caches(req)
-            return False
-        common_reuse = self.kv_cache_manager.prepare_context_cache(req, draft_reuse)
-        if common_reuse is None:
-            self._free_kv_caches(req)
-            return False
-
-        # A served prefix is held in both pools even when their reuse policies
-        # commit different depths. Compare the effective prefixes before freeing it.
-        served_prefix = req.py_served_prefix_end
-        if max(draft_reuse, served_prefix) != max(common_reuse, served_prefix):
-            # The shorter re-claim can itself fall short, so drop straight to
-            # no reuse rather than iterate against an eviction we do not own.
-            draft_manager.free_resources(req)
-            draft_reuse = draft_manager.prepare_context_cache(req, common_reuse)
-            if draft_reuse != common_reuse:
+        claim_limit, fresh_mirror, branch_point = self._plan_paired_claim(req)
+        if fresh_mirror:
+            # The target claims alone; the draft pool reuses nothing below it.
+            common_reuse = self.kv_cache_manager.prepare_context_cache(req, claim_limit)
+            if common_reuse is None:
                 self._free_kv_caches(req)
-                common_reuse = self.kv_cache_manager.prepare_context_cache(req, 0)
-                draft_reuse = draft_manager.prepare_context_cache(req, 0)
-                if common_reuse is None or draft_reuse is None:
-                    self._free_kv_caches(req)
-                    return False
-                # An empty key stream cannot match; anything else means the
-                # two page tables describe different prefixes.
-                if common_reuse != 0 or draft_reuse != 0:
-                    raise RuntimeError(
-                        f"Could not establish a common no-reuse fallback for request "
-                        f"{req.py_request_id}: target={common_reuse}, draft={draft_reuse}"
-                    )
+                return False
+            if not self._start_fresh_mirror(req, common_reuse):
+                return False
+            if branch_point is not None:
+                # common_reuse <= claim_limit, so the whole window at the branch point is recomputed.
+                draft_manager.mark_branch_point(req.py_request_id, branch_point)
+        else:
+            # Both pools claim the depth paired above, so they normally agree
+            # first time; the target claim still caps to the draft's in case an
+            # eviction landed between the probe and the claim.
+            draft_reuse = draft_manager.prepare_context_cache(req, claim_limit)
+            if draft_reuse is None:
+                self._free_kv_caches(req)
+                return False
+            common_reuse = self.kv_cache_manager.prepare_context_cache(req, draft_reuse)
+            if common_reuse is None:
+                self._free_kv_caches(req)
+                return False
+
+            # A served prefix is held in both pools even when their reuse policies
+            # commit different depths. Compare the effective prefixes before freeing it.
+            served_prefix = req.py_served_prefix_end
+            if max(draft_reuse, served_prefix) != max(common_reuse, served_prefix):
+                draft_manager.free_resources(req)
+                if 0 < common_reuse <= draft_manager.fresh_mirror_claim_limit(req):
+                    # The target's shorter claim needs no draft page at all.
+                    if not self._start_fresh_mirror(req, common_reuse):
+                        return False
+                else:
+                    # The shorter re-claim can itself fall short, so drop straight
+                    # to no reuse rather than iterate against an eviction we do
+                    # not own.
+                    draft_reuse = draft_manager.prepare_context_cache(req, common_reuse)
+                    if draft_reuse != common_reuse:
+                        self._free_kv_caches(req)
+                        common_reuse = self.kv_cache_manager.prepare_context_cache(req, 0)
+                        draft_reuse = draft_manager.prepare_context_cache(req, 0)
+                        if common_reuse is None or draft_reuse is None:
+                            self._free_kv_caches(req)
+                            return False
+                        # An empty key stream cannot match; anything else means
+                        # the two page tables describe different prefixes.
+                        if common_reuse != 0 or draft_reuse != 0:
+                            raise RuntimeError(
+                                f"Could not establish a common no-reuse fallback for "
+                                f"request {req.py_request_id}: target={common_reuse}, "
+                                f"draft={draft_reuse}"
+                            )
 
         # No enable_block_reuse guard: reaching here means a paired draft pool
         # exists, and KvCacheCreator only pairs when block reuse is on.
