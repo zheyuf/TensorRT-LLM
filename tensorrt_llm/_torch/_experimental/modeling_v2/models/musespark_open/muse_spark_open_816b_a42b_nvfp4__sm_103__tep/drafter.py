@@ -73,6 +73,7 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
                 plan.param("windowed_commit_parallel", "MIN_REQUESTS") if parallel else None
             ),
             declined=plan.declined,
+            paged_commit=plan.enabled("paged_context_commit"),
         )
     verify_fold = plan.enabled("verify_fold")
     path_walk_tail = plan.enabled("path_walk_tail")
