@@ -1281,8 +1281,6 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
     * ``DENSE_ARENA_LEVERS`` need a dense full-length arena.
     * ``windowed_commit_parallel`` runs inside the windowed commit of an architecture of
       ``WINDOWED_COMMIT_SMS``, so it needs a windowed arena there.
-    * A paged arena leaves out ``incremental_block_offsets``: the step-input stager
-      declines the block-table copy while a draft KV cache manager is attached.
     * ``TRTLLM_KV_DEFER_CLOSE=1`` leaves out ``step_loop_on_execution_stream``, which is
       not validated with the deferred close.
     """
@@ -1319,10 +1317,6 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
             "it needs a windowed drafter context arena on an architecture whose commit "
             f"compacts (sm{', sm'.join(str(sm) for sm in sorted(WINDOWED_COMMIT_SMS))}); this "
             f"is a {arena.value} arena on sm{deployment.sm}"
-        )
-    if arena is _levers.Arena.PAGED and "incremental_block_offsets" in served:
-        exclusions["incremental_block_offsets"] = (
-            "the step-input stager declines the block-table copy over a paged drafter context"
         )
     if deployment.facts.kv_defer_close and "step_loop_on_execution_stream" in served:
         exclusions["step_loop_on_execution_stream"] = (
