@@ -87,6 +87,7 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             path_walk_tail,
             preamble=plan.enabled("drafter_preamble_from_commit"),
             declined=plan.declined,
+            rejection=plan.enabled("rejection_fold"),
         )
     if plan.enabled("drafter_hops"):
         from .kernels.drafter_hops import hops as _drafter_hops
